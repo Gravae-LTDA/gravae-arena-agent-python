@@ -1777,7 +1777,7 @@ def get_phoenix_status_with_credentials(api_key, group_key):
     return status
 
 
-def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=5, hours_back=48):
+def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=5, hours_back=168):
     """Get monitors with events using provided Shinobi credentials"""
     import urllib.request
     from datetime import datetime, timedelta
@@ -1785,7 +1785,7 @@ def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=
 
     monitors_with_events = []
 
-    # Calculate time range (last 48 hours by default)
+    # Calculate time range (last 7 days by default)
     end_time = datetime.utcnow()
     start_time = end_time - timedelta(hours=hours_back)
     start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -1852,8 +1852,8 @@ def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=
         return {"monitors": [], "error": str(e)}
 
 
-def get_shinobi_monitor_events(limit_per_monitor=5, hours_back=48):
-    """Get last N events per monitor from Shinobi API (last 48 hours by default)"""
+def get_shinobi_monitor_events(limit_per_monitor=5, hours_back=168):
+    """Get last N events per monitor from Shinobi API (last 7 days by default)"""
     import urllib.request
     from datetime import datetime, timedelta
     from urllib.parse import urlencode
@@ -1868,7 +1868,7 @@ def get_shinobi_monitor_events(limit_per_monitor=5, hours_back=48):
         print("[Events] No Shinobi credentials in CONFIG")
         return {"monitors": [], "error": "No Shinobi credentials configured"}
 
-    # Calculate time range (last 48 hours by default)
+    # Calculate time range (last 7 days by default)
     end_time = datetime.utcnow()
     start_time = end_time - timedelta(hours=hours_back)
     start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S")
