@@ -25,7 +25,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 PORT = 8888
-VERSION = "2.8.2"
+VERSION = "2.8.3"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
@@ -43,6 +43,17 @@ def load_config():
             return json.load(f)
     except:
         return {}
+
+def save_config():
+    """Save CONFIG to file"""
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(CONFIG, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"[Config] Failed to save config: {e}")
+        return False
 
 CONFIG = load_config()
 
@@ -1785,6 +1796,14 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "error": "groupKey, email and password required"}, 400)
                 return
             result = setup_shinobi_account(data['groupKey'], data['email'], data['password'])
+            # Save shinobi credentials to config if successful
+            if result.get('success') and result.get('apiKey') and result.get('groupKey'):
+                CONFIG['shinobiApiKey'] = result['apiKey']
+                CONFIG['shinobiGroupKey'] = result['groupKey']
+                if result.get('userId'):
+                    CONFIG['shinobiUserId'] = result['userId']
+                save_config()
+                print(f"[Shinobi Setup] Saved credentials to config: apiKey={result['apiKey'][:8]}..., groupKey={result['groupKey']}")
             self._send_json({**result, "deviceId": CONFIG.get('deviceId'), "deviceSerial": get_device_serial()})
 
         elif path == '/shinobi/cleanup':

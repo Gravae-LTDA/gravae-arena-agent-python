@@ -114,7 +114,7 @@ journalctl -u gravae-buttons -f
 
 ## Versão
 
-- Agent: 2.8.2
+- Agent: 2.8.3
 - Phoenix: 1.0.0
 
 ## Requisitos
