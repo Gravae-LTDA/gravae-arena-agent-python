@@ -30,8 +30,8 @@ CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
 AGENT_PATH = "/opt/gravae-agent"
-GITHUB_REPO = "gravae/gravae-arena-agent-python"
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/gravae/gravae-arena-agent-python/main"
+GITHUB_REPO = "Gravae-LTDA/gravae-arena-agent-python"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/Gravae-LTDA/gravae-arena-agent-python/main"
 
 # Terminal session storage
 terminal_sessions = {}
