@@ -1829,9 +1829,12 @@ def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=
                 events = json.loads(response.read().decode())
 
                 if isinstance(events, list):
-                    # Sort by time descending (most recent first) and take limit
+                    # Sort by time descending (most recent first)
                     sorted_events = sorted(events, key=lambda e: e.get("time", "") if isinstance(e, dict) else "", reverse=True)
-                    for event in sorted_events[:limit_per_monitor]:
+                    added_count = 0
+                    for event in sorted_events:
+                        if added_count >= limit_per_monitor:
+                            break
                         if not isinstance(event, dict):
                             continue
                         # Handle details being either a dict or a string
@@ -1847,13 +1850,18 @@ def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=
                                         event_details[k.strip()] = v.strip()
                             except:
                                 event_details = {"raw": event_details}
+                        # Skip dashboard events - only show real button presses
+                        plug = event_details.get("plug", "")
+                        if plug.lower() == "dashboard":
+                            continue
                         monitor_data["events"].append({
                             "time": event.get("time", ""),
                             "reason": event_details.get("reason", ""),
                             "confidence": event_details.get("confidence", ""),
-                            "plug": event_details.get("plug", ""),
+                            "plug": plug,
                             "type": "shinobi_event"
                         })
+                        added_count += 1
             except Exception as e:
                 print(f"[Events] Failed to get events for monitor {mid}: {e}")
 
@@ -1925,9 +1933,12 @@ def get_shinobi_monitor_events(limit_per_monitor=5, hours_back=168):
                 events = json.loads(response.read().decode())
 
                 if isinstance(events, list):
-                    # Sort by time descending (most recent first) and take limit
+                    # Sort by time descending (most recent first)
                     sorted_events = sorted(events, key=lambda e: e.get("time", "") if isinstance(e, dict) else "", reverse=True)
-                    for event in sorted_events[:limit_per_monitor]:
+                    added_count = 0
+                    for event in sorted_events:
+                        if added_count >= limit_per_monitor:
+                            break
                         if not isinstance(event, dict):
                             continue
                         # Handle details being either a dict or a string
@@ -1943,13 +1954,18 @@ def get_shinobi_monitor_events(limit_per_monitor=5, hours_back=168):
                                         event_details[k.strip()] = v.strip()
                             except:
                                 event_details = {"raw": event_details}
+                        # Skip dashboard events - only show real button presses
+                        plug = event_details.get("plug", "")
+                        if plug.lower() == "dashboard":
+                            continue
                         monitor_data["events"].append({
                             "time": event.get("time", ""),
                             "reason": event_details.get("reason", ""),
                             "confidence": event_details.get("confidence", ""),
-                            "plug": event_details.get("plug", ""),
+                            "plug": plug,
                             "type": "shinobi_event"
                         })
+                        added_count += 1
             except Exception as e:
                 print(f"[Events] Failed to get events for monitor {mid}: {e}")
 
