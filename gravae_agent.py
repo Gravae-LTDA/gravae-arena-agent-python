@@ -2297,11 +2297,13 @@ class AgentHandler(BaseHTTPRequestHandler):
                                 lines.append(line)
                         content = '\n'.join(lines).encode('utf-8')
 
-                    self._send_cors_headers()
                     self.send_response(200)
                     self.send_header('Content-Type', content_type)
                     self.send_header('Content-Length', len(content))
                     self.send_header('Cache-Control', 'no-cache')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+                    self.send_header('Access-Control-Allow-Headers', '*')
                     self.end_headers()
                     self.wfile.write(content)
             except Exception as e:
