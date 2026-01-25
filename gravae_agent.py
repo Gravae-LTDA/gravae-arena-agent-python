@@ -25,7 +25,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 PORT = 8888
-VERSION = "2.8.3"
+VERSION = "2.8.4"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
@@ -407,6 +407,7 @@ def _perform_update_direct():
     global update_status
     try:
         import urllib.request
+        import tempfile
 
         files_to_update = [
             ("gravae_agent.py", f"{GITHUB_RAW_URL}/gravae_agent.py"),
@@ -420,8 +421,6 @@ def _perform_update_direct():
             update_status = {"status": "downloading", "progress": progress, "message": f"Baixando {filename}...", "error": None}
 
             try:
-                # Download to temp file first
-                temp_path = f"/tmp/{filename}"
                 target_path = os.path.join(AGENT_PATH, filename)
 
                 req = urllib.request.Request(url)
@@ -433,13 +432,20 @@ def _perform_update_direct():
                 if not content.startswith(b'#!/usr/bin/env python3') and not content.startswith(b'#'):
                     raise Exception(f"Invalid content for {filename}")
 
-                # Write to temp
-                with open(temp_path, 'wb') as f:
+                # Write to unique temp file (avoids permission issues)
+                with tempfile.NamedTemporaryFile(mode='wb', suffix=f'_{filename}', delete=False) as f:
+                    temp_path = f.name
                     f.write(content)
 
                 # Copy to target with sudo
                 subprocess.run(['sudo', 'cp', temp_path, target_path], check=True)
                 subprocess.run(['sudo', 'chmod', '+x', target_path], check=True)
+
+                # Cleanup temp file
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
 
                 print(f"[Update] Downloaded and installed {filename}")
 
