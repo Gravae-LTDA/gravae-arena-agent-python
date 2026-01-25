@@ -25,7 +25,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 PORT = 8888
-VERSION = "2.8.6"
+VERSION = "2.8.7"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
@@ -2269,6 +2269,43 @@ class AgentHandler(BaseHTTPRequestHandler):
 
         if path == '/update/version':
             self._send_json({"version": VERSION})
+            return
+
+        # HLS proxy - forward requests to local Shinobi
+        if path.startswith('/shinobi/hls/'):
+            hls_path = path[len('/shinobi/hls/'):]
+            shinobi_url = f"http://localhost:8080/{hls_path}"
+            try:
+                import urllib.request
+                req = urllib.request.Request(shinobi_url)
+                req.add_header('User-Agent', 'GravaeAgent/1.0')
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    content = resp.read()
+                    content_type = resp.headers.get('Content-Type', 'application/octet-stream')
+
+                    # If it's an m3u8 playlist, rewrite segment URLs to go through our proxy
+                    if hls_path.endswith('.m3u8') or 'mpegurl' in content_type.lower():
+                        text = content.decode('utf-8')
+                        base_path = '/'.join(hls_path.split('/')[:-1])
+                        lines = []
+                        for line in text.split('\n'):
+                            stripped = line.strip()
+                            if stripped and not stripped.startswith('#'):
+                                # This is a segment filename, rewrite it
+                                lines.append(f"/shinobi/hls/{base_path}/{stripped}")
+                            else:
+                                lines.append(line)
+                        content = '\n'.join(lines).encode('utf-8')
+
+                    self._send_cors_headers()
+                    self.send_response(200)
+                    self.send_header('Content-Type', content_type)
+                    self.send_header('Content-Length', len(content))
+                    self.send_header('Cache-Control', 'no-cache')
+                    self.end_headers()
+                    self.wfile.write(content)
+            except Exception as e:
+                self._send_json({"error": f"HLS proxy error: {str(e)}"}, 502)
             return
 
         routes = {
