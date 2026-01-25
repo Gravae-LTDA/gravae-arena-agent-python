@@ -25,7 +25,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 PORT = 8888
-VERSION = "2.8.5"
+VERSION = "2.8.6"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
@@ -1777,11 +1777,19 @@ def get_phoenix_status_with_credentials(api_key, group_key):
     return status
 
 
-def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=5):
+def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=5, hours_back=48):
     """Get monitors with events using provided Shinobi credentials"""
     import urllib.request
+    from datetime import datetime, timedelta
+    from urllib.parse import urlencode
 
     monitors_with_events = []
+
+    # Calculate time range (last 48 hours by default)
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(hours=hours_back)
+    start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S")
+    end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S")
 
     try:
         # Get all monitors
@@ -1794,7 +1802,7 @@ def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=
         if not isinstance(monitors, list):
             return {"monitors": [], "error": "Invalid monitors response"}
 
-        # For each monitor, get events
+        # For each monitor, get events from last 48 hours
         for monitor in monitors[:20]:
             mid = monitor.get("mid", "")
             mname = monitor.get("name", mid)
@@ -1810,16 +1818,20 @@ def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=
                 "events": []
             }
 
-            # Get events for this monitor
+            # Get events for this monitor with time range
             try:
-                events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}"
+                # Shinobi events API with date range
+                params = urlencode({"start": start_str, "end": end_str})
+                events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}?{params}"
                 req = urllib.request.Request(events_url)
                 req.add_header("Accept", "application/json")
-                response = urllib.request.urlopen(req, timeout=5)
+                response = urllib.request.urlopen(req, timeout=10)
                 events = json.loads(response.read().decode())
 
                 if isinstance(events, list):
-                    for event in events[:limit_per_monitor]:
+                    # Sort by time descending (most recent first) and take limit
+                    sorted_events = sorted(events, key=lambda e: e.get("time", ""), reverse=True)
+                    for event in sorted_events[:limit_per_monitor]:
                         event_details = event.get("details", {})
                         monitor_data["events"].append({
                             "time": event.get("time", ""),
@@ -1840,9 +1852,11 @@ def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=
         return {"monitors": [], "error": str(e)}
 
 
-def get_shinobi_monitor_events(limit_per_monitor=5):
-    """Get last N events per monitor from Shinobi API"""
+def get_shinobi_monitor_events(limit_per_monitor=5, hours_back=48):
+    """Get last N events per monitor from Shinobi API (last 48 hours by default)"""
     import urllib.request
+    from datetime import datetime, timedelta
+    from urllib.parse import urlencode
 
     monitors_with_events = []
 
@@ -1853,6 +1867,12 @@ def get_shinobi_monitor_events(limit_per_monitor=5):
     if not api_key or not group_key:
         print("[Events] No Shinobi credentials in CONFIG")
         return {"monitors": [], "error": "No Shinobi credentials configured"}
+
+    # Calculate time range (last 48 hours by default)
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(hours=hours_back)
+    start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S")
+    end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S")
 
     try:
         # Get all monitors
@@ -1865,7 +1885,7 @@ def get_shinobi_monitor_events(limit_per_monitor=5):
         if not isinstance(monitors, list):
             return {"monitors": [], "error": "Invalid monitors response"}
 
-        # For each monitor, get events
+        # For each monitor, get events from last 48 hours
         for monitor in monitors[:20]:  # Limit to 20 monitors
             mid = monitor.get("mid", "")
             mname = monitor.get("name", mid)
@@ -1881,27 +1901,25 @@ def get_shinobi_monitor_events(limit_per_monitor=5):
                 "events": []
             }
 
-            # Get events for this monitor
+            # Get events for this monitor with time range
             try:
-                events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}"
+                params = urlencode({"start": start_str, "end": end_str})
+                events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}?{params}"
                 req = urllib.request.Request(events_url)
                 req.add_header("Accept", "application/json")
-                response = urllib.request.urlopen(req, timeout=5)
+                response = urllib.request.urlopen(req, timeout=10)
                 events = json.loads(response.read().decode())
 
                 if isinstance(events, list):
-                    # Get last N events (button presses = recording events)
-                    for event in events[:limit_per_monitor]:
+                    # Sort by time descending (most recent first) and take limit
+                    sorted_events = sorted(events, key=lambda e: e.get("time", ""), reverse=True)
+                    for event in sorted_events[:limit_per_monitor]:
                         event_details = event.get("details", {})
-                        event_reason = event_details.get("reason", "")
-                        event_confidence = event_details.get("confidence", "")
-                        event_plug = event_details.get("plug", "")
-
                         monitor_data["events"].append({
                             "time": event.get("time", ""),
-                            "reason": event_reason,
-                            "confidence": event_confidence,
-                            "plug": event_plug,  # Button/trigger name
+                            "reason": event_details.get("reason", ""),
+                            "confidence": event_details.get("confidence", ""),
+                            "plug": event_details.get("plug", ""),
                             "type": "shinobi_event"
                         })
             except Exception as e:
