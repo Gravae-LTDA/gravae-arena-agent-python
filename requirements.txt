@@ -1,0 +1,13 @@
+# Gravae Arena Agent - Python Dependencies
+# Most dependencies are from Python standard library
+
+# No external dependencies required!
+# The agent uses only standard library modules:
+# - http.server
+# - json
+# - socket
+# - subprocess
+# - threading
+# - sqlite3
+# - logging
+# - urllib.request
