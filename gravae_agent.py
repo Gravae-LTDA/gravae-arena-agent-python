@@ -1830,9 +1830,23 @@ def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=
 
                 if isinstance(events, list):
                     # Sort by time descending (most recent first) and take limit
-                    sorted_events = sorted(events, key=lambda e: e.get("time", ""), reverse=True)
+                    sorted_events = sorted(events, key=lambda e: e.get("time", "") if isinstance(e, dict) else "", reverse=True)
                     for event in sorted_events[:limit_per_monitor]:
+                        if not isinstance(event, dict):
+                            continue
+                        # Handle details being either a dict or a string
                         event_details = event.get("details", {})
+                        if isinstance(event_details, str):
+                            # Parse string format like "{plug:Quadra1,name:stairs,reason:motion}"
+                            try:
+                                details_str = event_details.strip("{}")
+                                event_details = {}
+                                for pair in details_str.split(","):
+                                    if ":" in pair:
+                                        k, v = pair.split(":", 1)
+                                        event_details[k.strip()] = v.strip()
+                            except:
+                                event_details = {"raw": event_details}
                         monitor_data["events"].append({
                             "time": event.get("time", ""),
                             "reason": event_details.get("reason", ""),
@@ -1912,9 +1926,23 @@ def get_shinobi_monitor_events(limit_per_monitor=5, hours_back=168):
 
                 if isinstance(events, list):
                     # Sort by time descending (most recent first) and take limit
-                    sorted_events = sorted(events, key=lambda e: e.get("time", ""), reverse=True)
+                    sorted_events = sorted(events, key=lambda e: e.get("time", "") if isinstance(e, dict) else "", reverse=True)
                     for event in sorted_events[:limit_per_monitor]:
+                        if not isinstance(event, dict):
+                            continue
+                        # Handle details being either a dict or a string
                         event_details = event.get("details", {})
+                        if isinstance(event_details, str):
+                            # Parse string format like "{plug:Quadra1,name:stairs,reason:motion}"
+                            try:
+                                details_str = event_details.strip("{}")
+                                event_details = {}
+                                for pair in details_str.split(","):
+                                    if ":" in pair:
+                                        k, v = pair.split(":", 1)
+                                        event_details[k.strip()] = v.strip()
+                            except:
+                                event_details = {"raw": event_details}
                         monitor_data["events"].append({
                             "time": event.get("time", ""),
                             "reason": event_details.get("reason", ""),
