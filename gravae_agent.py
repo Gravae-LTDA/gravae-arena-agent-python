@@ -25,7 +25,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 PORT = 8888
-VERSION = "2.8.4"
+VERSION = "2.8.5"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
@@ -1512,32 +1512,50 @@ def get_phoenix_status():
     except:
         status["connectivity"] = False
 
-    # Get Shinobi monitors status
+    # Get Shinobi monitors status - check CONFIG first (more reliable)
     try:
-        shinobi_conf = get_shinobi_config()
-        if shinobi_conf:
-            api_key = shinobi_conf.get("apiKey") or CONFIG.get("shinobiApiKey")
-            group_key = shinobi_conf.get("groupKey") or CONFIG.get("shinobiGroupKey")
+        api_key = CONFIG.get("shinobiApiKey")
+        group_key = CONFIG.get("shinobiGroupKey")
 
-            if api_key and group_key:
-                monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
-                import urllib.request
-                req = urllib.request.Request(monitors_url)
-                req.add_header("Accept", "application/json")
-                response = urllib.request.urlopen(req, timeout=5)
-                monitors_data = json.loads(response.read().decode())
+        # Fallback to shinobi_conf if not in CONFIG
+        if not api_key or not group_key:
+            shinobi_conf = get_shinobi_config()
+            if shinobi_conf:
+                api_key = api_key or shinobi_conf.get("apiKey")
+                group_key = group_key or shinobi_conf.get("groupKey")
 
-                if isinstance(monitors_data, list):
-                    for m in monitors_data[:20]:  # Limit to 20 monitors
-                        status["monitors"].append({
-                            "mid": m.get("mid", ""),
-                            "name": m.get("name", m.get("mid", "")),
-                            "mode": m.get("mode", "unknown"),
-                            "status": m.get("status", "unknown"),
-                            "type": m.get("type", "")
-                        })
+        if api_key and group_key:
+            monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+            import urllib.request
+            req = urllib.request.Request(monitors_url)
+            req.add_header("Accept", "application/json")
+            response = urllib.request.urlopen(req, timeout=5)
+            monitors_data = json.loads(response.read().decode())
+
+            if isinstance(monitors_data, list):
+                for m in monitors_data[:20]:  # Limit to 20 monitors
+                    # Get proper status - Shinobi uses these values:
+                    # mode: "start" (recording), "stop" (stopped), "idle" (watching)
+                    # status: "watching", "recording", "died", "connecting", "started"
+                    mode = m.get("mode", "unknown")
+                    shinobi_status = m.get("status", "unknown")
+
+                    # Determine if monitor is online (working) or offline (dead/connecting)
+                    is_offline = shinobi_status in ["died", "connecting", "failed", "error"]
+                    is_stopped = mode == "stop"
+
+                    status["monitors"].append({
+                        "mid": m.get("mid", ""),
+                        "name": m.get("name", m.get("mid", "")),
+                        "mode": mode,
+                        "status": shinobi_status,
+                        "type": m.get("type", ""),
+                        "isOnline": not is_offline and not is_stopped
+                    })
+        else:
+            print(f"[Phoenix] No Shinobi credentials in CONFIG. Keys: {list(CONFIG.keys())}")
     except Exception as e:
-        print(f"Failed to get monitors: {e}")
+        print(f"[Phoenix] Failed to get monitors: {e}")
 
     # Get last log entry for recent activity
     if os.path.exists(PHOENIX_LOG_PATH):
@@ -1640,17 +1658,275 @@ def get_phoenix_logs(lines=100):
     except Exception as e:
         return {"logs": [], "error": str(e)}
 
+def get_phoenix_status_with_credentials(api_key, group_key):
+    """Get Phoenix status with provided Shinobi credentials"""
+    import urllib.request
+
+    status = {
+        "running": False,
+        "version": "1.0.0",
+        "uptime": None,
+        "lastCheck": None,
+        "services": {},
+        "connectivity": True,
+        "resources": {},
+        "monitors": []
+    }
+
+    # Check if Phoenix service is running
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "gravae-phoenix"],
+            capture_output=True, text=True, timeout=5
+        )
+        status["running"] = result.stdout.strip() == "active"
+    except:
+        pass
+
+    # Check all vital services
+    services_to_check = [
+        ("gravae-agent", "gravae-agent"),
+        ("cloudflared", "cloudflared"),
+        ("shinobi", "pm2"),
+        ("gravae-buttons", "gravae-buttons")
+    ]
+
+    for service_name, check_type in services_to_check:
+        try:
+            if check_type == "pm2":
+                result = subprocess.run(
+                    ["pm2", "list", "--no-color"],
+                    capture_output=True, text=True, timeout=10
+                )
+                status["services"][service_name] = "online" in result.stdout.lower()
+            else:
+                result = subprocess.run(
+                    ["systemctl", "is-active", service_name],
+                    capture_output=True, text=True, timeout=5
+                )
+                status["services"][service_name] = result.stdout.strip() == "active"
+        except:
+            status["services"][service_name] = False
+
+    # Get resources
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            status["resources"]["temp"] = round(int(f.read().strip()) / 1000, 1)
+    except:
+        pass
+
+    try:
+        with open("/proc/meminfo", "r") as f:
+            meminfo = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    meminfo[parts[0].rstrip(":")] = int(parts[1])
+            total = meminfo.get("MemTotal", 0)
+            free = meminfo.get("MemFree", 0) + meminfo.get("Buffers", 0) + meminfo.get("Cached", 0)
+            if total > 0:
+                status["resources"]["memory"] = round(((total - free) / total) * 100, 1)
+    except:
+        pass
+
+    try:
+        st = os.statvfs("/")
+        total = st.f_frsize * st.f_blocks
+        free = st.f_frsize * st.f_bavail
+        if total > 0:
+            status["resources"]["disk"] = round(((total - free) / total) * 100, 1)
+    except:
+        pass
+
+    # Check internet connectivity
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "2", "8.8.8.8"],
+            capture_output=True, timeout=5
+        )
+        status["connectivity"] = result.returncode == 0
+    except:
+        status["connectivity"] = False
+
+    # Get Shinobi monitors using provided credentials
+    try:
+        monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+        req = urllib.request.Request(monitors_url)
+        req.add_header("Accept", "application/json")
+        response = urllib.request.urlopen(req, timeout=5)
+        monitors_data = json.loads(response.read().decode())
+
+        if isinstance(monitors_data, list):
+            for m in monitors_data[:20]:
+                mode = m.get("mode", "unknown")
+                shinobi_status = m.get("status", "unknown")
+                is_offline = shinobi_status in ["died", "connecting", "failed", "error"]
+                is_stopped = mode == "stop"
+
+                status["monitors"].append({
+                    "mid": m.get("mid", ""),
+                    "name": m.get("name", m.get("mid", "")),
+                    "mode": mode,
+                    "status": shinobi_status,
+                    "type": m.get("type", ""),
+                    "isOnline": not is_offline and not is_stopped
+                })
+    except Exception as e:
+        print(f"[Phoenix] Failed to get monitors with provided credentials: {e}")
+
+    return status
+
+
+def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=5):
+    """Get monitors with events using provided Shinobi credentials"""
+    import urllib.request
+
+    monitors_with_events = []
+
+    try:
+        # Get all monitors
+        monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+        req = urllib.request.Request(monitors_url)
+        req.add_header("Accept", "application/json")
+        response = urllib.request.urlopen(req, timeout=5)
+        monitors = json.loads(response.read().decode())
+
+        if not isinstance(monitors, list):
+            return {"monitors": [], "error": "Invalid monitors response"}
+
+        # For each monitor, get events
+        for monitor in monitors[:20]:
+            mid = monitor.get("mid", "")
+            mname = monitor.get("name", mid)
+            mode = monitor.get("mode", "unknown")
+            status = monitor.get("status", "unknown")
+
+            monitor_data = {
+                "mid": mid,
+                "name": mname,
+                "mode": mode,
+                "status": status,
+                "isOnline": status not in ["died", "connecting", "failed", "error"] and mode != "stop",
+                "events": []
+            }
+
+            # Get events for this monitor
+            try:
+                events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}"
+                req = urllib.request.Request(events_url)
+                req.add_header("Accept", "application/json")
+                response = urllib.request.urlopen(req, timeout=5)
+                events = json.loads(response.read().decode())
+
+                if isinstance(events, list):
+                    for event in events[:limit_per_monitor]:
+                        event_details = event.get("details", {})
+                        monitor_data["events"].append({
+                            "time": event.get("time", ""),
+                            "reason": event_details.get("reason", ""),
+                            "confidence": event_details.get("confidence", ""),
+                            "plug": event_details.get("plug", ""),
+                            "type": "shinobi_event"
+                        })
+            except Exception as e:
+                print(f"[Events] Failed to get events for monitor {mid}: {e}")
+
+            monitors_with_events.append(monitor_data)
+
+        return {"monitors": monitors_with_events, "total": len(monitors_with_events)}
+
+    except Exception as e:
+        print(f"[Events] Failed to get monitors: {e}")
+        return {"monitors": [], "error": str(e)}
+
+
+def get_shinobi_monitor_events(limit_per_monitor=5):
+    """Get last N events per monitor from Shinobi API"""
+    import urllib.request
+
+    monitors_with_events = []
+
+    # Get credentials from CONFIG first (more reliable)
+    api_key = CONFIG.get("shinobiApiKey")
+    group_key = CONFIG.get("shinobiGroupKey")
+
+    if not api_key or not group_key:
+        print("[Events] No Shinobi credentials in CONFIG")
+        return {"monitors": [], "error": "No Shinobi credentials configured"}
+
+    try:
+        # Get all monitors
+        monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+        req = urllib.request.Request(monitors_url)
+        req.add_header("Accept", "application/json")
+        response = urllib.request.urlopen(req, timeout=5)
+        monitors = json.loads(response.read().decode())
+
+        if not isinstance(monitors, list):
+            return {"monitors": [], "error": "Invalid monitors response"}
+
+        # For each monitor, get events
+        for monitor in monitors[:20]:  # Limit to 20 monitors
+            mid = monitor.get("mid", "")
+            mname = monitor.get("name", mid)
+            mode = monitor.get("mode", "unknown")
+            status = monitor.get("status", "unknown")
+
+            monitor_data = {
+                "mid": mid,
+                "name": mname,
+                "mode": mode,
+                "status": status,
+                "isOnline": status not in ["died", "connecting", "failed", "error"] and mode != "stop",
+                "events": []
+            }
+
+            # Get events for this monitor
+            try:
+                events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}"
+                req = urllib.request.Request(events_url)
+                req.add_header("Accept", "application/json")
+                response = urllib.request.urlopen(req, timeout=5)
+                events = json.loads(response.read().decode())
+
+                if isinstance(events, list):
+                    # Get last N events (button presses = recording events)
+                    for event in events[:limit_per_monitor]:
+                        event_details = event.get("details", {})
+                        event_reason = event_details.get("reason", "")
+                        event_confidence = event_details.get("confidence", "")
+                        event_plug = event_details.get("plug", "")
+
+                        monitor_data["events"].append({
+                            "time": event.get("time", ""),
+                            "reason": event_reason,
+                            "confidence": event_confidence,
+                            "plug": event_plug,  # Button/trigger name
+                            "type": "shinobi_event"
+                        })
+            except Exception as e:
+                print(f"[Events] Failed to get events for monitor {mid}: {e}")
+
+            monitors_with_events.append(monitor_data)
+
+        return {"monitors": monitors_with_events, "total": len(monitors_with_events)}
+
+    except Exception as e:
+        print(f"[Events] Failed to get monitors: {e}")
+        return {"monitors": [], "error": str(e)}
+
+
 def get_button_history():
     """Get recent button press history from Shinobi events or button daemon logs"""
     button_presses = []
 
+    # Get credentials from CONFIG first (more reliable)
+    api_key = CONFIG.get("shinobiApiKey")
+    group_key = CONFIG.get("shinobiGroupKey")
+
     # First, try to get from Shinobi API (events)
     try:
-        shinobi_conf = get_shinobi_config()
-        if shinobi_conf.get("apiKey") and shinobi_conf.get("groupKey"):
-            api_key = shinobi_conf["apiKey"]
-            group_key = shinobi_conf["groupKey"]
-
+        if api_key and group_key:
             # Get monitors first
             monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
             try:
@@ -1673,18 +1949,21 @@ def get_button_history():
 
                         # Filter for recent recording events (these are "button presses")
                         for event in events[:5]:  # Last 5 events per monitor
-                            if event.get("details", {}).get("reason") == "recording":
-                                button_presses.append({
-                                    "monitor": mname,
-                                    "monitorId": mid,
-                                    "timestamp": event.get("time", ""),
-                                    "action": "recording_triggered",
-                                    "type": "shinobi_event"
-                                })
+                            event_details = event.get("details", {})
+                            reason = event_details.get("reason", "")
+                            plug = event_details.get("plug", "")
+
+                            button_presses.append({
+                                "monitor": mname,
+                                "monitorId": mid,
+                                "timestamp": event.get("time", ""),
+                                "action": plug or reason or "recording_triggered",
+                                "type": "shinobi_event"
+                            })
                     except:
                         pass
             except Exception as e:
-                print(f"Failed to get Shinobi events: {e}")
+                print(f"[Buttons] Failed to get Shinobi events: {e}")
     except:
         pass
 
@@ -1869,6 +2148,29 @@ class AgentHandler(BaseHTTPRequestHandler):
             success = mark_phoenix_alerts_synced(alert_ids)
             self._send_json({"success": success})
 
+        elif path == '/phoenix/monitors':
+            # Get monitors with events - accepts optional credentials
+            api_key = data.get('apiKey') or CONFIG.get('shinobiApiKey')
+            group_key = data.get('groupKey') or CONFIG.get('shinobiGroupKey')
+            limit = data.get('limit', 5)
+
+            if api_key and group_key:
+                result = get_shinobi_monitors_with_credentials(api_key, group_key, limit)
+            else:
+                result = get_shinobi_monitor_events(limit)
+            self._send_json(result)
+
+        elif path == '/phoenix/status':
+            # Phoenix status with optional credentials override
+            api_key = data.get('apiKey') or CONFIG.get('shinobiApiKey')
+            group_key = data.get('groupKey') or CONFIG.get('shinobiGroupKey')
+
+            if api_key and group_key:
+                result = get_phoenix_status_with_credentials(api_key, group_key)
+            else:
+                result = get_phoenix_status()
+            self._send_json(result)
+
         else:
             self._send_json({"error": "Not found"}, 404)
 
@@ -1924,7 +2226,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/phoenix/status': get_phoenix_status,
             '/phoenix/alerts': get_phoenix_alerts,
             '/phoenix/logs': get_phoenix_logs,
-            '/phoenix/buttons': get_button_history
+            '/phoenix/buttons': get_button_history,
+            '/phoenix/monitors': get_shinobi_monitor_events,
+            '/shinobi/monitors': get_shinobi_monitor_events
         }
         if path in routes:
             self._send_json(routes[path]())
