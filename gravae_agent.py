@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v2.8.1
+Gravae Arena Agent v2.8.8
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -23,9 +23,10 @@ import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+import urllib.request
 
 PORT = 8888
-VERSION = "2.8.7"
+VERSION = "2.8.8"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
@@ -93,7 +94,7 @@ def get_device_serial():
 def get_device_model():
     try:
         with open("/proc/device-tree/model", "r") as f:
-            return f.read().strip().replace('\x00', '')
+            return f.read().strip().replace('\\x00', '')
     except:
         pass
     return "Unknown"
@@ -254,7 +255,6 @@ class TerminalSession:
     def _read_output(self):
         while self.running:
             try:
-                # Check if child process is still alive
                 if self.pid:
                     try:
                         pid, status = os.waitpid(self.pid, os.WNOHANG)
@@ -376,29 +376,13 @@ def perform_update():
     global update_status
     try:
         update_status = {"status": "downloading", "progress": 10, "message": "Verificando repositorio...", "error": None}
-
-        # Method 1: Git pull (if .git exists)
         if os.path.exists(os.path.join(AGENT_PATH, '.git')):
-            update_status = {"status": "downloading", "progress": 30, "message": "Git fetch...", "error": None}
-
-            fetch_result = subprocess.run(['git', 'fetch', 'origin'], cwd=AGENT_PATH, capture_output=True, text=True)
-            if fetch_result.returncode != 0:
-                print(f"[Update] Git fetch failed, falling back to direct download")
-                return _perform_update_direct()
-
-            update_status = {"status": "downloading", "progress": 50, "message": "Git pull...", "error": None}
-
-            pull_result = subprocess.run(['git', 'pull', 'origin', 'main'], cwd=AGENT_PATH, capture_output=True, text=True)
-            if pull_result.returncode != 0:
-                print(f"[Update] Git pull failed, falling back to direct download")
-                return _perform_update_direct()
-
+            update_status = {"status": "downloading", "progress": 30, "message": "Git pull...", "error": None}
+            subprocess.run(['git', 'fetch', 'origin'], cwd=AGENT_PATH, capture_output=True)
+            subprocess.run(['git', 'pull', 'origin', 'main'], cwd=AGENT_PATH, capture_output=True)
             return _restart_services()
-
-        # Method 2: Direct download from GitHub (no git required)
         else:
             return _perform_update_direct()
-
     except Exception as e:
         update_status = {"status": "error", "progress": 0, "message": "Erro", "error": str(e)}
 
@@ -406,7 +390,6 @@ def _perform_update_direct():
     """Download files directly from GitHub raw"""
     global update_status
     try:
-        import urllib.request
         import tempfile
 
         files_to_update = [
@@ -428,20 +411,16 @@ def _perform_update_direct():
                 response = urllib.request.urlopen(req, timeout=30)
                 content = response.read()
 
-                # Verify we got valid Python content
                 if not content.startswith(b'#!/usr/bin/env python3') and not content.startswith(b'#'):
                     raise Exception(f"Invalid content for {filename}")
 
-                # Write to unique temp file (avoids permission issues)
                 with tempfile.NamedTemporaryFile(mode='wb', suffix=f'_{filename}', delete=False) as f:
                     temp_path = f.name
                     f.write(content)
 
-                # Copy to target with sudo
                 subprocess.run(['sudo', 'cp', temp_path, target_path], check=True)
                 subprocess.run(['sudo', 'chmod', '+x', target_path], check=True)
 
-                # Cleanup temp file
                 try:
                     os.unlink(temp_path)
                 except:
@@ -459,18 +438,81 @@ def _perform_update_direct():
         update_status = {"status": "error", "progress": 0, "message": "Erro no download", "error": str(e)}
 
 def _restart_services():
-    """Restart agent and phoenix services"""
+    """Restart agent and phoenix services, creating systemd services if needed"""
     global update_status
-    update_status = {"status": "installing", "progress": 70, "message": "Reiniciando Agent...", "error": None}
 
-    # Restart agent service
+    update_status = {"status": "installing", "progress": 60, "message": "Configurando Agent service...", "error": None}
+    _ensure_agent_service()
+    subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True)
+    subprocess.run(['sudo', 'systemctl', 'enable', 'gravae-agent'], capture_output=True)
     subprocess.run(['sudo', 'systemctl', 'restart', 'gravae-agent'], capture_output=True)
 
-    # Also restart Phoenix if it exists
-    update_status = {"status": "installing", "progress": 85, "message": "Reiniciando Phoenix...", "error": None}
+    update_status = {"status": "installing", "progress": 80, "message": "Configurando Phoenix service...", "error": None}
+    _ensure_phoenix_service()
+    subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True)
+    subprocess.run(['sudo', 'systemctl', 'enable', 'gravae-phoenix'], capture_output=True)
     subprocess.run(['sudo', 'systemctl', 'restart', 'gravae-phoenix'], capture_output=True)
 
-    update_status = {"status": "completed", "progress": 100, "message": "Atualizado com sucesso!", "error": None}
+    update_status = {"status": "completed", "progress": 100, "message": "Concluido!", "error": None}
+
+def _ensure_agent_service():
+    """Create agent systemd service if it doesn't exist"""
+    service_path = '/etc/systemd/system/gravae-agent.service'
+    if os.path.exists(service_path):
+        return
+
+    service_content = """[Unit]
+Description=Gravae Arena Agent
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/gravae-agent
+ExecStart=/usr/bin/python3 /opt/gravae-agent/gravae_agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+    try:
+        with open('/tmp/gravae-agent.service', 'w') as f:
+            f.write(service_content)
+        subprocess.run(['sudo', 'mv', '/tmp/gravae-agent.service', service_path], check=True)
+        print("[Update] Created gravae-agent.service")
+    except Exception as e:
+        print(f"[Update] Failed to create agent service: {e}")
+
+def _ensure_phoenix_service():
+    """Create phoenix systemd service if it doesn't exist"""
+    service_path = '/etc/systemd/system/gravae-phoenix.service'
+    if os.path.exists(service_path):
+        return
+
+    service_content = """[Unit]
+Description=Gravae Phoenix Daemon
+After=network.target gravae-agent.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/gravae-agent
+ExecStart=/usr/bin/python3 /opt/gravae-agent/phoenix_daemon.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+"""
+    try:
+        with open('/tmp/gravae-phoenix.service', 'w') as f:
+            f.write(service_content)
+        subprocess.run(['sudo', 'mv', '/tmp/gravae-phoenix.service', service_path], check=True)
+        print("[Update] Created gravae-phoenix.service")
+    except Exception as e:
+        print(f"[Update] Failed to create phoenix service: {e}")
 
 def restart_agent():
     try:
@@ -486,14 +528,11 @@ def get_shinobi_super_key():
             with open(path, 'r') as f:
                 data = json.load(f)
                 if data:
-                    # super.json can be an array or object
                     if isinstance(data, list) and len(data) > 0:
-                        # Array format: [{"mail": "...", "tokens": ["key"]}]
                         tokens = data[0].get('tokens', [])
                         if tokens:
                             return tokens[0]
                     elif isinstance(data, dict):
-                        # Object format: {"key": {...}}
                         return list(data.keys())[0]
         except Exception as e:
             print(f"Error reading super.json from {path}: {e}")
@@ -523,7 +562,6 @@ def hash_shinobi_password(password):
 
     conf = get_shinobi_config()
     if not conf:
-        # Fallback to md5 if config not found
         return hashlib.md5(password.encode()).hexdigest()
 
     password_type = conf.get('passwordType', 'md5').lower()
@@ -532,14 +570,11 @@ def hash_shinobi_password(password):
     print(f"[Shinobi] Using password hash type: {password_type}")
 
     if password_type == 'sha512':
-        # SHA512 with salt: sha512(password + salt)
         salted = password + password_salt
         return hashlib.sha512(salted.encode()).hexdigest()
     elif password_type == 'sha256':
-        # SHA256: sha256(password)
         return hashlib.sha256(password.encode()).hexdigest()
     else:
-        # Default MD5
         return hashlib.md5(password.encode()).hexdigest()
 
 def create_api_key_in_db(group_key, user_id):
@@ -551,46 +586,33 @@ def create_api_key_in_db(group_key, user_id):
     if not db_config:
         return None
 
-    # Generate a random API key
     api_key = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(30))
 
-    # Try to connect to MariaDB and insert the API key
     try:
-        import subprocess
-        # All Shinobi API permissions (matching UI permissions)
         details = json.dumps({
-            # Authentication
-            "auth_socket": "1",           # Can Authenticate Websocket
-            # API Keys
-            "api_key_create": "1",        # Can Create API Keys
-            # User Settings
-            "user_change": "1",           # Can Change User Settings
-            "edit_permissions": "1",      # Can Edit Permissions
-            # Monitors
-            "get_monitors": "1",          # Can Get Monitors
-            "edit_monitors": "1",         # Can Edit Monitors
-            "control_monitors": "1",      # Can Control Monitors
-            "monitor_create": "1",        # Monitor create (internal)
-            "monitor_edit": "1",          # Monitor edit (internal)
-            "monitor_delete": "1",        # Monitor delete (internal)
-            # Logs
-            "get_logs": "1",              # Can Get Logs
-            "log_view": "1",              # Log view (internal)
-            # Streams
-            "watch_stream": "1",          # Can View Streams
-            "watch_snapshot": "1",        # Can View Snapshots
-            # Videos
-            "watch_videos": "1",          # Can View Videos
-            "delete_videos": "1",         # Can Delete Videos
-            "video_delete": "1",          # Video delete (internal)
-            # Events/Alarms
-            "view_events": "1",           # Can View Alarms
-            "edit_events": "1",           # Can Edit Alarms
-            "delete_events": "1",         # Delete events (internal)
-            "event_delete": "1"           # Event delete (internal)
+            "auth_socket": "1",
+            "api_key_create": "1",
+            "user_change": "1",
+            "edit_permissions": "1",
+            "get_monitors": "1",
+            "edit_monitors": "1",
+            "control_monitors": "1",
+            "monitor_create": "1",
+            "monitor_edit": "1",
+            "monitor_delete": "1",
+            "get_logs": "1",
+            "log_view": "1",
+            "watch_stream": "1",
+            "watch_snapshot": "1",
+            "watch_videos": "1",
+            "delete_videos": "1",
+            "video_delete": "1",
+            "view_events": "1",
+            "edit_events": "1",
+            "delete_events": "1",
+            "event_delete": "1"
         })
 
-        # Use mysql command line to insert
         sql = f"INSERT INTO API (ke, uid, ip, code, details) VALUES ('{group_key}', '{user_id}', '0.0.0.0', '{api_key}', '{details}') ON DUPLICATE KEY UPDATE code='{api_key}', details='{details}';"
 
         result = subprocess.run([
@@ -615,10 +637,8 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
     if not db_config:
         return {"success": False, "error": "Could not read Shinobi database config"}
 
-    # Hash password using Shinobi's configured algorithm
     pass_hash = hash_shinobi_password(password)
 
-    # User details JSON
     details = json.dumps({
         "factorAuth": "0",
         "size": "10000",
@@ -631,9 +651,6 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
     })
 
     try:
-        import subprocess
-
-        # Check if user already exists with this email
         check_sql = f"SELECT ke, uid FROM Users WHERE mail = '{email}';"
         check_result = subprocess.run([
             'mysql', '-N', '-B',
@@ -645,8 +662,7 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
         ], capture_output=True, text=True, timeout=10)
 
         if check_result.stdout.strip():
-            # User exists - get their ke and uid
-            parts = check_result.stdout.strip().split('\t')
+            parts = check_result.stdout.strip().split('\\t')
             existing_ke = parts[0] if len(parts) > 0 else ''
             existing_uid = parts[1] if len(parts) > 1 else ''
             print(f"[Shinobi DB] User exists: ke={existing_ke}, uid={existing_uid}")
@@ -659,7 +675,6 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
                 }
             return {"success": True, "existed": True, "uid": existing_uid, "ke": existing_ke}
 
-        # Insert new user
         insert_sql = f"INSERT INTO Users (ke, uid, mail, pass, details) VALUES ('{group_key}', '{user_id}', '{email}', '{pass_hash}', '{details}');"
         insert_result = subprocess.run([
             'mysql',
@@ -682,7 +697,6 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
         return {"success": False, "error": str(e)}
 
 def setup_shinobi_account(group_key, email, password):
-    import urllib.request
     import string
     import random
 
@@ -697,20 +711,17 @@ def setup_shinobi_account(group_key, email, password):
 
     user_id = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(6))
 
-    # Step 1: Create user directly in database (more reliable than API)
     print(f"[Shinobi Setup] Creating user in database...")
     db_result = create_shinobi_user_in_db(group_key, user_id, email, password)
 
     if not db_result.get('success'):
         return db_result
 
-    # Get the actual user_id (might be different if user existed)
     actual_uid = db_result.get('uid', user_id)
     account_existed = db_result.get('existed', False)
 
     print(f"[Shinobi Setup] User {'exists' if account_existed else 'created'}: uid={actual_uid}")
 
-    # Step 2: Verify account by logging in (whether created or existing)
     login_url = "http://localhost:8080/?json=true"
     login_data = json.dumps({"mail": email, "pass": password, "machineID": "gravae-agent"}).encode()
 
@@ -731,7 +742,6 @@ def setup_shinobi_account(group_key, email, password):
 
         print(f"[Shinobi Setup] Verified - uid: {verified_user_id}, ke: {verified_group_key}")
 
-        # Check if the group_key matches what we requested
         if verified_group_key and verified_group_key != group_key:
             return {
                 "success": False,
@@ -747,8 +757,6 @@ def setup_shinobi_account(group_key, email, password):
             return {"success": False, "error": f"Account exists but login failed - wrong password? Error: {str(e)}"}
         return {"success": False, "error": f"Login failed after account creation: {str(e)}"}
 
-    # Step 3: Create API key for the verified user
-    # Use verified_user_id instead of the randomly generated one
     api_key = create_api_key_in_db(group_key, verified_user_id)
     if api_key:
         status_msg = "verified (existing)" if account_existed else "created"
@@ -760,7 +768,6 @@ def setup_shinobi_account(group_key, email, password):
             "message": f"Account {status_msg}, API key generated"
         }
 
-    # Step 4: Fallback - Try to create API key via API endpoint
     if session_token:
         api_add_url = f"http://localhost:8080/{session_token}/api/{group_key}/add"
         api_data = json.dumps({
@@ -780,7 +787,6 @@ def setup_shinobi_account(group_key, email, password):
         except Exception as e:
             print(f"[Shinobi Setup] API key creation via endpoint failed: {e}")
 
-        # Last resort: use session token (temporary)
         return {
             "success": True,
             "groupKey": group_key,
@@ -793,13 +799,11 @@ def setup_shinobi_account(group_key, email, password):
 
 def cleanup_shinobi(group_key, email, password):
     """Delete all monitors and API keys for a group, optionally delete user"""
-    import urllib.request
     import urllib.error
 
     if not group_key or not email or not password:
         return {"success": False, "error": "groupKey, email and password required"}
 
-    # Step 1: Login to get session token
     login_url = "http://localhost:8080/?json=true"
     login_data = json.dumps({"mail": email, "pass": password, "machineID": "gravae-agent"}).encode()
 
@@ -824,7 +828,6 @@ def cleanup_shinobi(group_key, email, password):
     deleted_monitors = []
     errors = []
 
-    # Step 2: Get all monitors for this group
     try:
         monitors_url = f"http://localhost:8080/{session_token}/monitor/{group_key}"
         req = urllib.request.Request(monitors_url)
@@ -833,7 +836,6 @@ def cleanup_shinobi(group_key, email, password):
 
         print(f"[Shinobi Cleanup] Found {len(monitors)} monitors to delete")
 
-        # Step 3: Delete each monitor
         for monitor in monitors:
             mid = monitor.get('mid', '')
             if mid:
@@ -848,7 +850,6 @@ def cleanup_shinobi(group_key, email, password):
     except Exception as e:
         errors.append(f"list monitors: {str(e)}")
 
-    # Step 4: Delete API keys from database
     db_config = get_shinobi_db_config()
     user_deleted = False
     if db_config:
@@ -870,7 +871,6 @@ def cleanup_shinobi(group_key, email, password):
         except Exception as e:
             errors.append(f"delete API keys: {str(e)}")
 
-        # Step 5: Delete user from database (match by group_key AND email for safety)
         try:
             sql = f"DELETE FROM Users WHERE ke = '{group_key}' AND mail = '{email}';"
             result = subprocess.run([
@@ -916,7 +916,6 @@ def setup_quick_tunnel():
 
     shinobi_url = agent_url = None
 
-    # Shinobi tunnel (8080)
     try:
         with open('/tmp/cf_shinobi.log', 'w') as log:
             subprocess.Popen(['cloudflared', 'tunnel', '--url', 'http://localhost:8080', '--no-autoupdate'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -924,7 +923,7 @@ def setup_quick_tunnel():
             time.sleep(1)
             try:
                 with open('/tmp/cf_shinobi.log', 'r') as f:
-                    match = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', f.read())
+                    match = re.search(r'https://[a-z0-9-]+\\.trycloudflare\\.com', f.read())
                     if match:
                         shinobi_url = match.group(0)
                         break
@@ -933,7 +932,6 @@ def setup_quick_tunnel():
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-    # Agent tunnel (8888)
     try:
         with open('/tmp/cf_agent.log', 'w') as log:
             subprocess.Popen(['cloudflared', 'tunnel', '--url', 'http://localhost:8888', '--no-autoupdate'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -941,7 +939,7 @@ def setup_quick_tunnel():
             time.sleep(1)
             try:
                 with open('/tmp/cf_agent.log', 'r') as f:
-                    match = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', f.read())
+                    match = re.search(r'https://[a-z0-9-]+\\.trycloudflare\\.com', f.read())
                     if match:
                         agent_url = match.group(0)
                         break
@@ -958,24 +956,20 @@ def run_tunnel_with_token(tunnel_token, tunnel_name='custom-tunnel'):
     if not install_result.get('success'):
         return install_result
 
-    # Stop any existing cloudflared
     subprocess.run(['sudo', 'systemctl', 'stop', 'cloudflared'], capture_output=True)
     subprocess.run(['pkill', '-f', 'cloudflared'], capture_output=True)
     time.sleep(2)
 
     try:
-        # Uninstall old service if exists
         subprocess.run(['sudo', 'cloudflared', 'service', 'uninstall'], capture_output=True)
         time.sleep(1)
 
-        # Install cloudflared as a systemd service with the token
         result = subprocess.run(
             ['sudo', 'cloudflared', 'service', 'install', tunnel_token],
             capture_output=True, text=True
         )
 
         if result.returncode != 0:
-            # If service install failed, try running manually in background
             log_path = f'/tmp/cf_{tunnel_name}.log'
             with open(log_path, 'w') as log:
                 subprocess.Popen(
@@ -988,7 +982,6 @@ def run_tunnel_with_token(tunnel_token, tunnel_name='custom-tunnel'):
                 return {"success": False, "error": "Tunnel failed to start"}
             return {"success": True, "method": "manual", "log": log_path}
         else:
-            # Wait for service to start
             time.sleep(3)
             status = subprocess.run(['systemctl', 'is-active', 'cloudflared'], capture_output=True, text=True)
             if status.stdout.strip() != 'active':
@@ -998,24 +991,20 @@ def run_tunnel_with_token(tunnel_token, tunnel_name='custom-tunnel'):
         return {"success": False, "error": str(e)}
 
 def setup_named_tunnel(tunnel_token, shinobi_hostname, agent_hostname):
-    # Stop any existing cloudflared
     subprocess.run(['sudo', 'systemctl', 'stop', 'cloudflared'], capture_output=True)
     subprocess.run(['pkill', '-f', 'cloudflared'], capture_output=True)
     time.sleep(2)
 
     try:
-        # Uninstall old service if exists
         subprocess.run(['sudo', 'cloudflared', 'service', 'uninstall'], capture_output=True)
         time.sleep(1)
 
-        # Install cloudflared as a systemd service with the token
         result = subprocess.run(
             ['sudo', 'cloudflared', 'service', 'install', tunnel_token],
             capture_output=True, text=True
         )
 
         if result.returncode != 0:
-            # If service install failed, try running manually
             with open('/tmp/cf_named.log', 'w') as log:
                 subprocess.Popen(['cloudflared', 'tunnel', 'run', '--token', tunnel_token], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             time.sleep(5)
@@ -1023,7 +1012,6 @@ def setup_named_tunnel(tunnel_token, shinobi_hostname, agent_hostname):
             if pgrep.returncode != 0:
                 return {"success": False, "error": "Tunnel failed to start"}
         else:
-            # Wait for service to start
             time.sleep(3)
             status = subprocess.run(['systemctl', 'is-active', 'cloudflared'], capture_output=True, text=True)
             if status.stdout.strip() != 'active':
@@ -1054,22 +1042,18 @@ def get_cloudflared_info():
         "configPath": None
     }
 
-    # Check if cloudflared is installed
     result = subprocess.run(['which', 'cloudflared'], capture_output=True, text=True)
     info["installed"] = result.returncode == 0
 
     if not info["installed"]:
         return info
 
-    # Check if running as service
     status = subprocess.run(['systemctl', 'is-active', 'cloudflared'], capture_output=True, text=True)
     info["serviceActive"] = status.stdout.strip() == 'active'
 
-    # Check if any cloudflared process is running
     pgrep = subprocess.run(['pgrep', '-f', 'cloudflared'], capture_output=True)
     info["running"] = pgrep.returncode == 0
 
-    # Try to find tunnel config
     config_paths = [
         '/etc/cloudflared/config.yml',
         '/root/.cloudflared/config.yml',
@@ -1084,7 +1068,6 @@ def get_cloudflared_info():
             try:
                 with open(path, 'r') as f:
                     content = f.read()
-                    # Try to parse YAML manually (basic)
                     for line in content.splitlines():
                         if 'tunnel:' in line:
                             parts = line.split(':')
@@ -1100,14 +1083,11 @@ def get_cloudflared_info():
                 pass
             break
 
-    # Try to get tunnel info from service file
     try:
         result = subprocess.run(['systemctl', 'cat', 'cloudflared'], capture_output=True, text=True)
         if result.returncode == 0:
-            # Look for token in ExecStart
             for line in result.stdout.splitlines():
                 if '--token' in line or 'tunnel run' in line:
-                    # Token found, tunnel is configured via Cloudflare API
                     info["configuredViaApi"] = True
                     break
     except:
@@ -1128,7 +1108,6 @@ def get_shinobi_info():
         "monitorCount": 0
     }
 
-    # Check common Shinobi paths
     shinobi_paths = ['/home/Shinobi', '/opt/shinobi']
     for path in shinobi_paths:
         if os.path.exists(path):
@@ -1139,7 +1118,6 @@ def get_shinobi_info():
     if not info["installed"]:
         return info
 
-    # Check if Shinobi is running - first check port 8080 (most reliable)
     try:
         netstat = subprocess.run(['ss', '-tlnp'], capture_output=True, text=True)
         if ':8080' in netstat.stdout:
@@ -1147,7 +1125,6 @@ def get_shinobi_info():
     except:
         pass
 
-    # Also try pm2 (might need full path or run as specific user)
     if not info["running"]:
         pm2_paths = ['/usr/bin/pm2', '/usr/local/bin/pm2', 'pm2']
         for pm2_path in pm2_paths:
@@ -1164,7 +1141,6 @@ def get_shinobi_info():
             except:
                 continue
 
-    # Try to read Shinobi config
     conf_path = os.path.join(info["path"] or '/home/Shinobi', 'conf.json')
     if os.path.exists(conf_path):
         try:
@@ -1174,7 +1150,6 @@ def get_shinobi_info():
         except:
             pass
 
-    # Try to get monitors from database
     db_config = get_shinobi_db_config()
     if db_config:
         try:
@@ -1190,7 +1165,7 @@ def get_shinobi_info():
 
             if result.returncode == 0 and result.stdout.strip():
                 for line in result.stdout.strip().splitlines():
-                    parts = line.split('\t')
+                    parts = line.split('\\t')
                     if len(parts) >= 2:
                         monitor = {"mid": parts[0], "name": parts[1]}
                         if len(parts) >= 3:
@@ -1202,7 +1177,6 @@ def get_shinobi_info():
         except Exception as e:
             print(f"Error getting monitors: {e}")
 
-    # Try to get API key from database
     if db_config and info["groupKey"]:
         try:
             sql = f"SELECT code FROM API WHERE ke = '{info['groupKey']}' LIMIT 1;"
@@ -1254,20 +1228,16 @@ def check_button_daemon_deps():
     """Check if dependencies for button daemon are available"""
     issues = []
 
-    # Check Node.js
     result = subprocess.run(['which', 'node'], capture_output=True)
     if result.returncode != 0:
         issues.append("Node.js nao esta instalado")
 
-    # Check if pigpio or onoff might be available
     gpio_info = get_gpio_info()
     if gpio_info.get('is_pi5'):
-        # Pi 5 needs onoff
         onoff_check = subprocess.run(['npm', 'list', '-g', 'onoff'], capture_output=True)
         if onoff_check.returncode != 0:
             issues.append("Biblioteca 'onoff' nao instalada (npm install -g onoff)")
     else:
-        # Pi 1-4 needs pigpio daemon
         pigpiod_check = subprocess.run(['pgrep', 'pigpiod'], capture_output=True)
         if pigpiod_check.returncode != 0:
             issues.append("pigpiod nao esta rodando (sudo pigpiod)")
@@ -1276,7 +1246,6 @@ def check_button_daemon_deps():
 
 def deploy_button_daemon(script_content):
     try:
-        # Check dependencies first
         dep_issues = check_button_daemon_deps()
         if dep_issues:
             return {
@@ -1285,13 +1254,11 @@ def deploy_button_daemon(script_content):
                 "dependencies": dep_issues
             }
 
-        # Create directory and write script
         os.makedirs(os.path.dirname(BUTTON_DAEMON_PATH), exist_ok=True)
         with open(BUTTON_DAEMON_PATH, 'w') as f:
             f.write(script_content)
         os.chmod(BUTTON_DAEMON_PATH, 0o755)
 
-        # Restart service (don't use check=True to capture error)
         restart_result = subprocess.run(
             ['systemctl', 'restart', 'gravae-buttons'],
             capture_output=True,
@@ -1299,7 +1266,6 @@ def deploy_button_daemon(script_content):
         )
 
         if restart_result.returncode != 0:
-            # Get more details from journalctl
             journal = subprocess.run(
                 ['journalctl', '-u', 'gravae-buttons', '-n', '10', '--no-pager'],
                 capture_output=True,
@@ -1314,7 +1280,6 @@ def deploy_button_daemon(script_content):
 
         time.sleep(2)
 
-        # Check if service is active
         status_result = subprocess.run(
             ['systemctl', 'is-active', 'gravae-buttons'],
             capture_output=True,
@@ -1323,7 +1288,6 @@ def deploy_button_daemon(script_content):
         is_active = status_result.stdout.strip() == 'active'
 
         if not is_active:
-            # Get journal logs for debugging
             journal = subprocess.run(
                 ['journalctl', '-u', 'gravae-buttons', '-n', '10', '--no-pager'],
                 capture_output=True,
@@ -1353,7 +1317,6 @@ def cleanup_arena(options=None):
     }
     errors = []
 
-    # 1. Stop and clean button daemon
     if options.get('buttons', True):
         try:
             subprocess.run(['systemctl', 'stop', 'gravae-buttons'], capture_output=True)
@@ -1365,7 +1328,6 @@ def cleanup_arena(options=None):
             errors.append(f"buttons: {str(e)}")
             results["buttons"] = "error"
 
-    # 2. Remove logs
     if options.get('logs', True):
         try:
             log_dir = os.path.dirname(BUTTON_DAEMON_PATH) + '/logs'
@@ -1377,11 +1339,9 @@ def cleanup_arena(options=None):
             errors.append(f"logs: {str(e)}")
             results["logs"] = "error"
 
-    # 3. Stop Cloudflare tunnel
     if options.get('tunnel', True):
         try:
             subprocess.run(['pkill', '-f', 'cloudflared'], capture_output=True)
-            # Remove tunnel logs
             for f in ['/tmp/cf_shinobi.log', '/tmp/cf_agent.log', '/tmp/cf_named.log']:
                 if os.path.exists(f):
                     os.remove(f)
@@ -1390,13 +1350,11 @@ def cleanup_arena(options=None):
             errors.append(f"tunnel: {str(e)}")
             results["tunnel"] = "error"
 
-    # 4. Clear device config (keep deviceId but remove arena-specific data)
     if options.get('config', True):
         try:
             if os.path.exists(CONFIG_PATH):
                 with open(CONFIG_PATH, 'r') as f:
                     config = json.load(f)
-                # Keep only device identification
                 clean_config = {
                     "deviceId": config.get("deviceId"),
                     "arenaType": config.get("arenaType"),
@@ -1433,7 +1391,6 @@ def get_phoenix_status():
         "monitors": []
     }
 
-    # Check if Phoenix service is running
     try:
         result = subprocess.run(
             ["systemctl", "is-active", "gravae-phoenix"],
@@ -1443,7 +1400,6 @@ def get_phoenix_status():
     except:
         pass
 
-    # Check all vital services
     services_to_check = [
         ("gravae-agent", "gravae-agent"),
         ("cloudflared", "cloudflared"),
@@ -1454,7 +1410,6 @@ def get_phoenix_status():
     for service_name, check_type in services_to_check:
         try:
             if check_type == "pm2":
-                # Check pm2 process
                 result = subprocess.run(
                     ["pm2", "list", "--no-color"],
                     capture_output=True, text=True, timeout=10
@@ -1469,16 +1424,13 @@ def get_phoenix_status():
         except:
             status["services"][service_name] = False
 
-    # Get resources
     try:
-        # Temperature
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
             status["resources"]["temp"] = round(int(f.read().strip()) / 1000, 1)
     except:
         pass
 
     try:
-        # Memory
         with open("/proc/meminfo", "r") as f:
             meminfo = {}
             for line in f:
@@ -1493,7 +1445,6 @@ def get_phoenix_status():
         pass
 
     try:
-        # Disk
         st = os.statvfs("/")
         total = st.f_frsize * st.f_blocks
         free = st.f_frsize * st.f_bavail
@@ -1502,7 +1453,6 @@ def get_phoenix_status():
     except:
         pass
 
-    # Check internet connectivity
     try:
         result = subprocess.run(
             ["ping", "-c", "1", "-W", "2", "8.8.8.8"],
@@ -1512,52 +1462,31 @@ def get_phoenix_status():
     except:
         status["connectivity"] = False
 
-    # Get Shinobi monitors status - check CONFIG first (more reliable)
     try:
-        api_key = CONFIG.get("shinobiApiKey")
-        group_key = CONFIG.get("shinobiGroupKey")
+        shinobi_conf = get_shinobi_config()
+        if shinobi_conf:
+            api_key = shinobi_conf.get("apiKey") or CONFIG.get("shinobiApiKey")
+            group_key = shinobi_conf.get("groupKey") or CONFIG.get("shinobiGroupKey")
 
-        # Fallback to shinobi_conf if not in CONFIG
-        if not api_key or not group_key:
-            shinobi_conf = get_shinobi_config()
-            if shinobi_conf:
-                api_key = api_key or shinobi_conf.get("apiKey")
-                group_key = group_key or shinobi_conf.get("groupKey")
+            if api_key and group_key:
+                monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+                req = urllib.request.Request(monitors_url)
+                req.add_header("Accept", "application/json")
+                response = urllib.request.urlopen(req, timeout=5)
+                monitors_data = json.loads(response.read().decode())
 
-        if api_key and group_key:
-            monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
-            import urllib.request
-            req = urllib.request.Request(monitors_url)
-            req.add_header("Accept", "application/json")
-            response = urllib.request.urlopen(req, timeout=5)
-            monitors_data = json.loads(response.read().decode())
-
-            if isinstance(monitors_data, list):
-                for m in monitors_data[:20]:  # Limit to 20 monitors
-                    # Get proper status - Shinobi uses these values:
-                    # mode: "start" (recording), "stop" (stopped), "idle" (watching)
-                    # status: "watching", "recording", "died", "connecting", "started"
-                    mode = m.get("mode", "unknown")
-                    shinobi_status = m.get("status", "unknown")
-
-                    # Determine if monitor is online (working) or offline (dead/connecting)
-                    is_offline = shinobi_status in ["died", "connecting", "failed", "error"]
-                    is_stopped = mode == "stop"
-
-                    status["monitors"].append({
-                        "mid": m.get("mid", ""),
-                        "name": m.get("name", m.get("mid", "")),
-                        "mode": mode,
-                        "status": shinobi_status,
-                        "type": m.get("type", ""),
-                        "isOnline": not is_offline and not is_stopped
-                    })
-        else:
-            print(f"[Phoenix] No Shinobi credentials in CONFIG. Keys: {list(CONFIG.keys())}")
+                if isinstance(monitors_data, list):
+                    for m in monitors_data[:20]:
+                        status["monitors"].append({
+                            "mid": m.get("mid", ""),
+                            "name": m.get("name", m.get("mid", "")),
+                            "mode": m.get("mode", "unknown"),
+                            "status": m.get("status", "unknown"),
+                            "type": m.get("type", "")
+                        })
     except Exception as e:
-        print(f"[Phoenix] Failed to get monitors: {e}")
+        print(f"Failed to get monitors: {e}")
 
-    # Get last log entry for recent activity
     if os.path.exists(PHOENIX_LOG_PATH):
         try:
             with open(PHOENIX_LOG_PATH, "r") as f:
@@ -1607,7 +1536,6 @@ def get_phoenix_alerts(limit=50, pending_only=True):
                 "details": json.loads(row[5]) if row[5] else None
             })
 
-        # Get total count
         cursor.execute("SELECT COUNT(*) FROM alerts WHERE synced = 0")
         total = cursor.fetchone()[0]
 
@@ -1658,378 +1586,48 @@ def get_phoenix_logs(lines=100):
     except Exception as e:
         return {"logs": [], "error": str(e)}
 
-def get_phoenix_status_with_credentials(api_key, group_key):
-    """Get Phoenix status with provided Shinobi credentials"""
-    import urllib.request
-
-    status = {
-        "running": False,
-        "version": "1.0.0",
-        "uptime": None,
-        "lastCheck": None,
-        "services": {},
-        "connectivity": True,
-        "resources": {},
-        "monitors": []
-    }
-
-    # Check if Phoenix service is running
-    try:
-        result = subprocess.run(
-            ["systemctl", "is-active", "gravae-phoenix"],
-            capture_output=True, text=True, timeout=5
-        )
-        status["running"] = result.stdout.strip() == "active"
-    except:
-        pass
-
-    # Check all vital services
-    services_to_check = [
-        ("gravae-agent", "gravae-agent"),
-        ("cloudflared", "cloudflared"),
-        ("shinobi", "pm2"),
-        ("gravae-buttons", "gravae-buttons")
-    ]
-
-    for service_name, check_type in services_to_check:
-        try:
-            if check_type == "pm2":
-                result = subprocess.run(
-                    ["pm2", "list", "--no-color"],
-                    capture_output=True, text=True, timeout=10
-                )
-                status["services"][service_name] = "online" in result.stdout.lower()
-            else:
-                result = subprocess.run(
-                    ["systemctl", "is-active", service_name],
-                    capture_output=True, text=True, timeout=5
-                )
-                status["services"][service_name] = result.stdout.strip() == "active"
-        except:
-            status["services"][service_name] = False
-
-    # Get resources
-    try:
-        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
-            status["resources"]["temp"] = round(int(f.read().strip()) / 1000, 1)
-    except:
-        pass
-
-    try:
-        with open("/proc/meminfo", "r") as f:
-            meminfo = {}
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 2:
-                    meminfo[parts[0].rstrip(":")] = int(parts[1])
-            total = meminfo.get("MemTotal", 0)
-            free = meminfo.get("MemFree", 0) + meminfo.get("Buffers", 0) + meminfo.get("Cached", 0)
-            if total > 0:
-                status["resources"]["memory"] = round(((total - free) / total) * 100, 1)
-    except:
-        pass
-
-    try:
-        st = os.statvfs("/")
-        total = st.f_frsize * st.f_blocks
-        free = st.f_frsize * st.f_bavail
-        if total > 0:
-            status["resources"]["disk"] = round(((total - free) / total) * 100, 1)
-    except:
-        pass
-
-    # Check internet connectivity
-    try:
-        result = subprocess.run(
-            ["ping", "-c", "1", "-W", "2", "8.8.8.8"],
-            capture_output=True, timeout=5
-        )
-        status["connectivity"] = result.returncode == 0
-    except:
-        status["connectivity"] = False
-
-    # Get Shinobi monitors using provided credentials
-    try:
-        monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
-        req = urllib.request.Request(monitors_url)
-        req.add_header("Accept", "application/json")
-        response = urllib.request.urlopen(req, timeout=5)
-        monitors_data = json.loads(response.read().decode())
-
-        if isinstance(monitors_data, list):
-            for m in monitors_data[:20]:
-                mode = m.get("mode", "unknown")
-                shinobi_status = m.get("status", "unknown")
-                is_offline = shinobi_status in ["died", "connecting", "failed", "error"]
-                is_stopped = mode == "stop"
-
-                status["monitors"].append({
-                    "mid": m.get("mid", ""),
-                    "name": m.get("name", m.get("mid", "")),
-                    "mode": mode,
-                    "status": shinobi_status,
-                    "type": m.get("type", ""),
-                    "isOnline": not is_offline and not is_stopped
-                })
-    except Exception as e:
-        print(f"[Phoenix] Failed to get monitors with provided credentials: {e}")
-
-    return status
-
-
-def get_shinobi_monitors_with_credentials(api_key, group_key, limit_per_monitor=5, hours_back=168):
-    """Get monitors with events using provided Shinobi credentials"""
-    import urllib.request
-    from datetime import datetime, timedelta
-    from urllib.parse import urlencode
-
-    monitors_with_events = []
-
-    # Calculate time range (last 7 days by default)
-    end_time = datetime.utcnow()
-    start_time = end_time - timedelta(hours=hours_back)
-    start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S")
-    end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S")
-
-    try:
-        # Get all monitors
-        monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
-        req = urllib.request.Request(monitors_url)
-        req.add_header("Accept", "application/json")
-        response = urllib.request.urlopen(req, timeout=5)
-        monitors = json.loads(response.read().decode())
-
-        if not isinstance(monitors, list):
-            return {"monitors": [], "error": "Invalid monitors response"}
-
-        # For each monitor, get events from last 48 hours
-        for monitor in monitors[:20]:
-            mid = monitor.get("mid", "")
-            mname = monitor.get("name", mid)
-            mode = monitor.get("mode", "unknown")
-            status = monitor.get("status", "unknown")
-
-            monitor_data = {
-                "mid": mid,
-                "name": mname,
-                "mode": mode,
-                "status": status,
-                "isOnline": status not in ["died", "connecting", "failed", "error"] and mode != "stop",
-                "events": []
-            }
-
-            # Get events for this monitor with time range
-            try:
-                # Shinobi events API with date range
-                params = urlencode({"start": start_str, "end": end_str})
-                events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}?{params}"
-                req = urllib.request.Request(events_url)
-                req.add_header("Accept", "application/json")
-                response = urllib.request.urlopen(req, timeout=10)
-                events = json.loads(response.read().decode())
-
-                if isinstance(events, list):
-                    # Sort by time descending (most recent first)
-                    sorted_events = sorted(events, key=lambda e: e.get("time", "") if isinstance(e, dict) else "", reverse=True)
-                    added_count = 0
-                    for event in sorted_events:
-                        if added_count >= limit_per_monitor:
-                            break
-                        if not isinstance(event, dict):
-                            continue
-                        # Handle details being either a dict or a string
-                        event_details = event.get("details", {})
-                        if isinstance(event_details, str):
-                            # Parse string format like "{plug:Quadra1,name:stairs,reason:motion}"
-                            try:
-                                details_str = event_details.strip("{}")
-                                event_details = {}
-                                for pair in details_str.split(","):
-                                    if ":" in pair:
-                                        k, v = pair.split(":", 1)
-                                        event_details[k.strip()] = v.strip()
-                            except:
-                                event_details = {"raw": event_details}
-                        # Skip dashboard events - only show real button presses
-                        plug = event_details.get("plug", "")
-                        if plug.lower() == "dashboard":
-                            continue
-                        monitor_data["events"].append({
-                            "time": event.get("time", ""),
-                            "reason": event_details.get("reason", ""),
-                            "confidence": event_details.get("confidence", ""),
-                            "plug": plug,
-                            "type": "shinobi_event"
-                        })
-                        added_count += 1
-            except Exception as e:
-                print(f"[Events] Failed to get events for monitor {mid}: {e}")
-
-            monitors_with_events.append(monitor_data)
-
-        return {"monitors": monitors_with_events, "total": len(monitors_with_events)}
-
-    except Exception as e:
-        print(f"[Events] Failed to get monitors: {e}")
-        return {"monitors": [], "error": str(e)}
-
-
-def get_shinobi_monitor_events(limit_per_monitor=5, hours_back=168):
-    """Get last N events per monitor from Shinobi API (last 7 days by default)"""
-    import urllib.request
-    from datetime import datetime, timedelta
-    from urllib.parse import urlencode
-
-    monitors_with_events = []
-
-    # Get credentials from CONFIG first (more reliable)
-    api_key = CONFIG.get("shinobiApiKey")
-    group_key = CONFIG.get("shinobiGroupKey")
-
-    if not api_key or not group_key:
-        print("[Events] No Shinobi credentials in CONFIG")
-        return {"monitors": [], "error": "No Shinobi credentials configured"}
-
-    # Calculate time range (last 7 days by default)
-    end_time = datetime.utcnow()
-    start_time = end_time - timedelta(hours=hours_back)
-    start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S")
-    end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S")
-
-    try:
-        # Get all monitors
-        monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
-        req = urllib.request.Request(monitors_url)
-        req.add_header("Accept", "application/json")
-        response = urllib.request.urlopen(req, timeout=5)
-        monitors = json.loads(response.read().decode())
-
-        if not isinstance(monitors, list):
-            return {"monitors": [], "error": "Invalid monitors response"}
-
-        # For each monitor, get events from last 48 hours
-        for monitor in monitors[:20]:  # Limit to 20 monitors
-            mid = monitor.get("mid", "")
-            mname = monitor.get("name", mid)
-            mode = monitor.get("mode", "unknown")
-            status = monitor.get("status", "unknown")
-
-            monitor_data = {
-                "mid": mid,
-                "name": mname,
-                "mode": mode,
-                "status": status,
-                "isOnline": status not in ["died", "connecting", "failed", "error"] and mode != "stop",
-                "events": []
-            }
-
-            # Get events for this monitor with time range
-            try:
-                params = urlencode({"start": start_str, "end": end_str})
-                events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}?{params}"
-                req = urllib.request.Request(events_url)
-                req.add_header("Accept", "application/json")
-                response = urllib.request.urlopen(req, timeout=10)
-                events = json.loads(response.read().decode())
-
-                if isinstance(events, list):
-                    # Sort by time descending (most recent first)
-                    sorted_events = sorted(events, key=lambda e: e.get("time", "") if isinstance(e, dict) else "", reverse=True)
-                    added_count = 0
-                    for event in sorted_events:
-                        if added_count >= limit_per_monitor:
-                            break
-                        if not isinstance(event, dict):
-                            continue
-                        # Handle details being either a dict or a string
-                        event_details = event.get("details", {})
-                        if isinstance(event_details, str):
-                            # Parse string format like "{plug:Quadra1,name:stairs,reason:motion}"
-                            try:
-                                details_str = event_details.strip("{}")
-                                event_details = {}
-                                for pair in details_str.split(","):
-                                    if ":" in pair:
-                                        k, v = pair.split(":", 1)
-                                        event_details[k.strip()] = v.strip()
-                            except:
-                                event_details = {"raw": event_details}
-                        # Skip dashboard events - only show real button presses
-                        plug = event_details.get("plug", "")
-                        if plug.lower() == "dashboard":
-                            continue
-                        monitor_data["events"].append({
-                            "time": event.get("time", ""),
-                            "reason": event_details.get("reason", ""),
-                            "confidence": event_details.get("confidence", ""),
-                            "plug": plug,
-                            "type": "shinobi_event"
-                        })
-                        added_count += 1
-            except Exception as e:
-                print(f"[Events] Failed to get events for monitor {mid}: {e}")
-
-            monitors_with_events.append(monitor_data)
-
-        return {"monitors": monitors_with_events, "total": len(monitors_with_events)}
-
-    except Exception as e:
-        print(f"[Events] Failed to get monitors: {e}")
-        return {"monitors": [], "error": str(e)}
-
-
 def get_button_history():
     """Get recent button press history from Shinobi events or button daemon logs"""
     button_presses = []
 
-    # Get credentials from CONFIG first (more reliable)
-    api_key = CONFIG.get("shinobiApiKey")
-    group_key = CONFIG.get("shinobiGroupKey")
-
-    # First, try to get from Shinobi API (events)
     try:
-        if api_key and group_key:
-            # Get monitors first
+        shinobi_conf = get_shinobi_config()
+        if shinobi_conf.get("apiKey") and shinobi_conf.get("groupKey"):
+            api_key = shinobi_conf["apiKey"]
+            group_key = shinobi_conf["groupKey"]
+
             monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
             try:
-                import urllib.request
                 req = urllib.request.Request(monitors_url)
                 response = urllib.request.urlopen(req, timeout=5)
                 monitors = json.loads(response.read().decode())
 
-                # For each monitor, get recent events
-                for monitor in monitors[:10]:  # Limit to 10 monitors
+                for monitor in monitors[:10]:
                     mid = monitor.get("mid", "")
                     mname = monitor.get("name", mid)
 
-                    # Get events for this monitor (last hour)
                     events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}"
                     try:
                         req = urllib.request.Request(events_url)
                         response = urllib.request.urlopen(req, timeout=5)
                         events = json.loads(response.read().decode())
 
-                        # Filter for recent recording events (these are "button presses")
-                        for event in events[:5]:  # Last 5 events per monitor
-                            event_details = event.get("details", {})
-                            reason = event_details.get("reason", "")
-                            plug = event_details.get("plug", "")
-
-                            button_presses.append({
-                                "monitor": mname,
-                                "monitorId": mid,
-                                "timestamp": event.get("time", ""),
-                                "action": plug or reason or "recording_triggered",
-                                "type": "shinobi_event"
-                            })
+                        for event in events[:5]:
+                            if event.get("details", {}).get("reason") == "recording":
+                                button_presses.append({
+                                    "monitor": mname,
+                                    "monitorId": mid,
+                                    "timestamp": event.get("time", ""),
+                                    "action": "recording_triggered",
+                                    "type": "shinobi_event"
+                                })
                     except:
                         pass
             except Exception as e:
-                print(f"[Buttons] Failed to get Shinobi events: {e}")
+                print(f"Failed to get Shinobi events: {e}")
     except:
         pass
 
-    # Also try to get from button daemon logs
     button_log_paths = [
         "/var/log/gravae/buttons.log",
         "/home/gravae/Documents/Gravae/buttons.log",
@@ -2040,7 +1638,7 @@ def get_button_history():
         if os.path.exists(log_path):
             try:
                 with open(log_path, "r") as f:
-                    lines = f.readlines()[-50:]  # Last 50 lines
+                    lines = f.readlines()[-50:]
                     for line in lines:
                         line = line.strip()
                         if not line:
@@ -2055,7 +1653,6 @@ def get_button_history():
                                     "type": "button_daemon"
                                 })
                         except:
-                            # Try to parse as simple log line
                             if "button" in line.lower() or "pressed" in line.lower():
                                 button_presses.append({
                                     "monitor": "unknown",
@@ -2065,9 +1662,8 @@ def get_button_history():
                                 })
             except:
                 pass
-            break  # Found log file, stop searching
+            break
 
-    # Sort by timestamp (most recent first) and limit
     button_presses.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     return {"buttonPresses": button_presses[:30]}
 
@@ -2098,7 +1694,6 @@ class AgentHandler(BaseHTTPRequestHandler):
         except:
             data = {}
 
-        # Terminal endpoints
         if path == '/terminal/create':
             session_id = create_terminal_session()
             self._send_json({"sessionId": session_id})
@@ -2129,7 +1724,6 @@ class AgentHandler(BaseHTTPRequestHandler):
             success = close_terminal_session(session_id)
             self._send_json({"success": success})
 
-        # Update endpoints
         elif path == '/update/perform':
             threading.Thread(target=perform_update, daemon=True).start()
             self._send_json({"success": True, "message": "Update started"})
@@ -2143,7 +1737,6 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "error": "groupKey, email and password required"}, 400)
                 return
             result = setup_shinobi_account(data['groupKey'], data['email'], data['password'])
-            # Save shinobi credentials to config if successful
             if result.get('success') and result.get('apiKey') and result.get('groupKey'):
                 CONFIG['shinobiApiKey'] = result['apiKey']
                 CONFIG['shinobiGroupKey'] = result['groupKey']
@@ -2170,7 +1763,6 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._send_json({**result, "deviceId": CONFIG.get('deviceId'), "deviceSerial": get_device_serial()})
 
         elif path == '/tunnel/run':
-            # Run a custom tunnel with just a token (config done via Cloudflare API)
             tunnel_token = data.get('tunnelToken')
             tunnel_name = data.get('tunnelName', 'custom-tunnel')
             if not tunnel_token:
@@ -2194,7 +1786,6 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "error": str(e)})
 
         elif path == '/cleanup':
-            # Cleanup arena data from the device
             options = {
                 'buttons': data.get('buttons', True),
                 'logs': data.get('logs', True),
@@ -2205,33 +1796,64 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._send_json(result)
 
         elif path == '/phoenix/alerts/sync':
-            # Mark alerts as synced
             alert_ids = data.get('alertIds', [])
             success = mark_phoenix_alerts_synced(alert_ids)
             self._send_json({"success": success})
 
-        elif path == '/phoenix/monitors':
-            # Get monitors with events - accepts optional credentials
-            api_key = data.get('apiKey') or CONFIG.get('shinobiApiKey')
-            group_key = data.get('groupKey') or CONFIG.get('shinobiGroupKey')
-            limit = data.get('limit', 5)
-
-            if api_key and group_key:
-                result = get_shinobi_monitors_with_credentials(api_key, group_key, limit)
-            else:
-                result = get_shinobi_monitor_events(limit)
-            self._send_json(result)
-
         elif path == '/phoenix/status':
-            # Phoenix status with optional credentials override
+            self._send_json(get_phoenix_status())
+
+        elif path == '/phoenix/monitors':
             api_key = data.get('apiKey') or CONFIG.get('shinobiApiKey')
             group_key = data.get('groupKey') or CONFIG.get('shinobiGroupKey')
 
-            if api_key and group_key:
-                result = get_phoenix_status_with_credentials(api_key, group_key)
-            else:
-                result = get_phoenix_status()
-            self._send_json(result)
+            if not api_key or not group_key:
+                self._send_json({"monitors": [], "error": "No Shinobi credentials available"})
+                return
+
+            try:
+                shinobi_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+                req = urllib.request.Request(shinobi_url, headers={'Accept': 'application/json'})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    monitors_data = json.loads(resp.read().decode())
+
+                monitors = []
+                for m in monitors_data:
+                    mid = m.get('mid', '')
+                    name = m.get('name', mid)
+                    mode = m.get('mode', 'stop')
+                    status = m.get('status', 'unknown')
+
+                    is_online = mode == 'start' and status not in ['died', 'connecting', 'failed', 'error']
+
+                    events = []
+                    try:
+                        events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}?limit=5"
+                        events_req = urllib.request.Request(events_url, headers={'Accept': 'application/json'})
+                        with urllib.request.urlopen(events_req, timeout=5) as events_resp:
+                            events_data = json.loads(events_resp.read().decode())
+                            for ev in (events_data if isinstance(events_data, list) else []):
+                                events.append({
+                                    'time': ev.get('time', ''),
+                                    'reason': ev.get('reason', ''),
+                                    'confidence': ev.get('confidence'),
+                                    'plug': ev.get('plug', '')
+                                })
+                    except:
+                        pass
+
+                    monitors.append({
+                        'mid': mid,
+                        'name': name,
+                        'mode': mode,
+                        'status': status,
+                        'isOnline': is_online,
+                        'events': events
+                    })
+
+                self._send_json({"monitors": monitors})
+            except Exception as e:
+                self._send_json({"monitors": [], "error": str(e)})
 
         else:
             self._send_json({"error": "Not found"}, 404)
@@ -2241,7 +1863,6 @@ class AgentHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
 
-        # Terminal output endpoint
         if path == '/terminal/output':
             session_id = query.get('sessionId', [None])[0]
             session = get_terminal_session(session_id)
@@ -2252,13 +1873,11 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "Session not found"}, 404)
             return
 
-        # Terminal status
         if path == '/terminal/status':
             cleanup_old_sessions()
             self._send_json({"activeSessions": len(terminal_sessions)})
             return
 
-        # Update endpoints
         if path == '/update/check':
             self._send_json(check_for_updates())
             return
@@ -2271,45 +1890,6 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._send_json({"version": VERSION})
             return
 
-        # HLS proxy - forward requests to local Shinobi
-        if path.startswith('/shinobi/hls/'):
-            hls_path = path[len('/shinobi/hls/'):]
-            shinobi_url = f"http://localhost:8080/{hls_path}"
-            try:
-                import urllib.request
-                req = urllib.request.Request(shinobi_url)
-                req.add_header('User-Agent', 'GravaeAgent/1.0')
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    content = resp.read()
-                    content_type = resp.headers.get('Content-Type', 'application/octet-stream')
-
-                    # If it's an m3u8 playlist, rewrite segment URLs to go through our proxy
-                    if hls_path.endswith('.m3u8') or 'mpegurl' in content_type.lower():
-                        text = content.decode('utf-8')
-                        base_path = '/'.join(hls_path.split('/')[:-1])
-                        lines = []
-                        for line in text.split('\n'):
-                            stripped = line.strip()
-                            if stripped and not stripped.startswith('#'):
-                                # This is a segment filename, rewrite it
-                                lines.append(f"/shinobi/hls/{base_path}/{stripped}")
-                            else:
-                                lines.append(line)
-                        content = '\n'.join(lines).encode('utf-8')
-
-                    self.send_response(200)
-                    self.send_header('Content-Type', content_type)
-                    self.send_header('Content-Length', len(content))
-                    self.send_header('Cache-Control', 'no-cache')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
-                    self.send_header('Access-Control-Allow-Headers', '*')
-                    self.end_headers()
-                    self.wfile.write(content)
-            except Exception as e:
-                self._send_json({"error": f"HLS proxy error: {str(e)}"}, 502)
-            return
-
         routes = {
             '/': lambda: {"status": "ok", "agent": "gravae", "version": VERSION, "deviceId": CONFIG.get("deviceId"), "deviceSerial": get_device_serial(), "deviceModel": get_device_model()},
             '/health': lambda: {"status": "ok", "agent": "gravae", "version": VERSION},
@@ -2318,7 +1898,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/system/memory': get_memory_info,
             '/system/cpu': get_cpu_info,
             '/system/disk': get_disk_info,
-             '/system/network': lambda: {"localIp": get_local_ip(), "gateway": get_gateway(), "hostname": get_hostname()},
+            '/system/network': lambda: {"localIp": get_local_ip(), "gateway": get_gateway(), "hostname": get_hostname()},
             '/system/uptime': get_uptime,
             '/hardware/info': lambda: {"model": get_device_model(), "serial": get_device_serial(), "os": get_os_info(), "gpio": get_gpio_info()},
             '/gpio/info': get_gpio_info,
@@ -2327,9 +1907,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/phoenix/status': get_phoenix_status,
             '/phoenix/alerts': get_phoenix_alerts,
             '/phoenix/logs': get_phoenix_logs,
-            '/phoenix/buttons': get_button_history,
-            '/phoenix/monitors': get_shinobi_monitor_events,
-            '/shinobi/monitors': get_shinobi_monitor_events
+            '/phoenix/buttons': get_button_history
         }
         if path in routes:
             self._send_json(routes[path]())
