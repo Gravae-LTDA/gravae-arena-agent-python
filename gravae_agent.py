@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v2.8.8
+Gravae Arena Agent v2.10.0
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.8.8"
+VERSION = "2.10.0"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
@@ -94,7 +94,7 @@ def get_device_serial():
 def get_device_model():
     try:
         with open("/proc/device-tree/model", "r") as f:
-            return f.read().strip().replace('\\x00', '')
+            return f.read().strip().replace('\x00', '')
     except:
         pass
     return "Unknown"
@@ -224,6 +224,344 @@ def get_full_system_info():
         "buttonDaemon": get_button_daemon_status(),
         "version": VERSION
     }
+
+# === Network Management ===
+def get_network_manager_type():
+    """Detect which network manager is being used.
+    - Bullseye: dhcpcd
+    - Bookworm/Trixie: NetworkManager
+    """
+    os_info = get_os_info()
+    codename = os_info.get('version_codename', '').lower()
+
+    # Check if NetworkManager is active (Bookworm/Trixie default)
+    try:
+        result = subprocess.run(['systemctl', 'is-active', 'NetworkManager'],
+                                capture_output=True, text=True, timeout=5)
+        if result.stdout.strip() == 'active':
+            return {'type': 'networkmanager', 'codename': codename, 'service': 'NetworkManager'}
+    except:
+        pass
+
+    # Check if dhcpcd is active (Bullseye default)
+    try:
+        result = subprocess.run(['systemctl', 'is-active', 'dhcpcd'],
+                                capture_output=True, text=True, timeout=5)
+        if result.stdout.strip() == 'active':
+            return {'type': 'dhcpcd', 'codename': codename, 'service': 'dhcpcd'}
+    except:
+        pass
+
+    # Fallback: guess based on codename
+    if codename in ['bookworm', 'trixie']:
+        return {'type': 'networkmanager', 'codename': codename, 'service': 'NetworkManager'}
+    return {'type': 'dhcpcd', 'codename': codename, 'service': 'dhcpcd'}
+
+def get_network_interfaces():
+    """Get all network interfaces with their configuration."""
+    interfaces = []
+
+    try:
+        # Get all interfaces
+        result = subprocess.run(['ip', '-j', 'addr'], capture_output=True, text=True, timeout=10)
+        ip_data = json.loads(result.stdout) if result.stdout else []
+
+        for iface in ip_data:
+            ifname = iface.get('ifname', '')
+            if ifname == 'lo':  # Skip loopback
+                continue
+
+            info = {
+                'name': ifname,
+                'mac': iface.get('address', ''),
+                'state': iface.get('operstate', 'unknown'),
+                'addresses': [],
+                'is_dhcp': False
+            }
+
+            # Get IPv4 addresses
+            for addr_info in iface.get('addr_info', []):
+                if addr_info.get('family') == 'inet':
+                    info['addresses'].append({
+                        'ip': addr_info.get('local', ''),
+                        'prefix': addr_info.get('prefixlen', 24),
+                        'label': addr_info.get('label', ifname)
+                    })
+
+            interfaces.append(info)
+
+        # Get default gateway
+        gateway_result = subprocess.run(['ip', '-j', 'route', 'show', 'default'],
+                                         capture_output=True, text=True, timeout=5)
+        gateway_data = json.loads(gateway_result.stdout) if gateway_result.stdout else []
+
+        default_gateway = None
+        default_dev = None
+        if gateway_data:
+            default_gateway = gateway_data[0].get('gateway')
+            default_dev = gateway_data[0].get('dev')
+
+        # Get DNS servers
+        dns_servers = []
+        try:
+            with open('/etc/resolv.conf', 'r') as f:
+                for line in f:
+                    if line.startswith('nameserver'):
+                        dns_servers.append(line.split()[1])
+        except:
+            pass
+
+        # Check DHCP status for interfaces
+        net_manager = get_network_manager_type()
+
+        if net_manager['type'] == 'networkmanager':
+            # Use nmcli to check DHCP status
+            for iface in interfaces:
+                try:
+                    result = subprocess.run(['nmcli', '-t', '-f', 'IP4.METHOD', 'device', 'show', iface['name']],
+                                           capture_output=True, text=True, timeout=5)
+                    if 'auto' in result.stdout.lower():
+                        iface['is_dhcp'] = True
+                except:
+                    pass
+        else:
+            # Check dhcpcd.conf for static config
+            try:
+                with open('/etc/dhcpcd.conf', 'r') as f:
+                    content = f.read()
+                    for iface in interfaces:
+                        if f'interface {iface["name"]}' in content and 'static ip_address' in content:
+                            iface['is_dhcp'] = False
+                        else:
+                            iface['is_dhcp'] = True
+            except:
+                pass
+
+        return {
+            'interfaces': interfaces,
+            'default_gateway': default_gateway,
+            'default_device': default_dev,
+            'dns_servers': dns_servers,
+            'network_manager': net_manager
+        }
+    except Exception as e:
+        return {'error': str(e), 'interfaces': [], 'network_manager': get_network_manager_type()}
+
+def configure_network_static(interface, ip, prefix, gateway, dns=None):
+    """Configure static IP on an interface.
+    Works with both NetworkManager (Bookworm+) and dhcpcd (Bullseye).
+    """
+    net_manager = get_network_manager_type()
+
+    try:
+        if net_manager['type'] == 'networkmanager':
+            # Use nmcli for NetworkManager
+            commands = [
+                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.method', 'manual'],
+                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.addresses', f'{ip}/{prefix}'],
+                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.gateway', gateway],
+            ]
+
+            if dns:
+                dns_str = ','.join(dns) if isinstance(dns, list) else dns
+                commands.append(['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.dns', dns_str])
+
+            for cmd in commands:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                if result.returncode != 0:
+                    return {'success': False, 'error': f'nmcli error: {result.stderr}'}
+
+            # Apply changes
+            subprocess.run(['sudo', 'nmcli', 'connection', 'down', interface],
+                          capture_output=True, text=True, timeout=10)
+            subprocess.run(['sudo', 'nmcli', 'connection', 'up', interface],
+                          capture_output=True, text=True, timeout=10)
+
+            return {'success': True, 'method': 'networkmanager', 'message': 'Static IP configured'}
+
+        else:
+            # Use dhcpcd.conf for older systems (Bullseye)
+            config_path = '/etc/dhcpcd.conf'
+
+            # Read current config
+            try:
+                with open(config_path, 'r') as f:
+                    lines = f.readlines()
+            except:
+                lines = []
+
+            # Remove existing config for this interface
+            new_lines = []
+            skip_until_next_interface = False
+            for line in lines:
+                if line.strip().startswith('interface '):
+                    skip_until_next_interface = interface in line
+                    if not skip_until_next_interface:
+                        new_lines.append(line)
+                elif skip_until_next_interface and line.strip().startswith('interface '):
+                    skip_until_next_interface = False
+                    new_lines.append(line)
+                elif not skip_until_next_interface:
+                    new_lines.append(line)
+
+            # Add new static config
+            new_lines.append(f'\ninterface {interface}\n')
+            new_lines.append(f'static ip_address={ip}/{prefix}\n')
+            new_lines.append(f'static routers={gateway}\n')
+            if dns:
+                dns_str = ' '.join(dns) if isinstance(dns, list) else dns
+                new_lines.append(f'static domain_name_servers={dns_str}\n')
+
+            # Write config
+            with open('/tmp/dhcpcd.conf.new', 'w') as f:
+                f.writelines(new_lines)
+
+            subprocess.run(['sudo', 'mv', '/tmp/dhcpcd.conf.new', config_path], check=True, timeout=5)
+            subprocess.run(['sudo', 'systemctl', 'restart', 'dhcpcd'], capture_output=True, timeout=30)
+
+            return {'success': True, 'method': 'dhcpcd', 'message': 'Static IP configured, dhcpcd restarted'}
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+def configure_network_dhcp(interface):
+    """Configure interface to use DHCP."""
+    net_manager = get_network_manager_type()
+
+    try:
+        if net_manager['type'] == 'networkmanager':
+            # Use nmcli for NetworkManager
+            commands = [
+                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.method', 'auto'],
+                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.addresses', ''],
+                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.gateway', ''],
+                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.dns', ''],
+            ]
+
+            for cmd in commands:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+            # Apply changes
+            subprocess.run(['sudo', 'nmcli', 'connection', 'down', interface],
+                          capture_output=True, text=True, timeout=10)
+            subprocess.run(['sudo', 'nmcli', 'connection', 'up', interface],
+                          capture_output=True, text=True, timeout=10)
+
+            return {'success': True, 'method': 'networkmanager', 'message': 'DHCP enabled'}
+
+        else:
+            # Remove static config from dhcpcd.conf
+            config_path = '/etc/dhcpcd.conf'
+
+            try:
+                with open(config_path, 'r') as f:
+                    lines = f.readlines()
+            except:
+                return {'success': True, 'method': 'dhcpcd', 'message': 'No config to remove'}
+
+            # Remove config for this interface
+            new_lines = []
+            skip_until_next_interface = False
+            for line in lines:
+                if line.strip().startswith('interface '):
+                    skip_until_next_interface = interface in line
+                    if not skip_until_next_interface:
+                        new_lines.append(line)
+                elif skip_until_next_interface and line.strip().startswith('interface '):
+                    skip_until_next_interface = False
+                    new_lines.append(line)
+                elif not skip_until_next_interface:
+                    new_lines.append(line)
+
+            with open('/tmp/dhcpcd.conf.new', 'w') as f:
+                f.writelines(new_lines)
+
+            subprocess.run(['sudo', 'mv', '/tmp/dhcpcd.conf.new', config_path], check=True, timeout=5)
+            subprocess.run(['sudo', 'systemctl', 'restart', 'dhcpcd'], capture_output=True, timeout=30)
+
+            return {'success': True, 'method': 'dhcpcd', 'message': 'DHCP enabled, dhcpcd restarted'}
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+def add_network_alias(interface, ip, prefix, label=None):
+    """Add an IP alias to an interface (like eth0:1).
+    This adds a secondary IP address to access another subnet.
+    Example: sudo ip addr add 192.168.0.1/24 dev eth0 label eth0:1
+    """
+    try:
+        # Determine label
+        if not label:
+            # Find next available label (eth0:1, eth0:2, etc.)
+            result = subprocess.run(['ip', '-j', 'addr', 'show', interface],
+                                   capture_output=True, text=True, timeout=5)
+            addr_data = json.loads(result.stdout) if result.stdout else []
+
+            existing_labels = []
+            for iface in addr_data:
+                for addr in iface.get('addr_info', []):
+                    if addr.get('label'):
+                        existing_labels.append(addr['label'])
+
+            # Find next available number
+            num = 1
+            while f'{interface}:{num}' in existing_labels:
+                num += 1
+            label = f'{interface}:{num}'
+
+        # Add the IP alias
+        cmd = ['sudo', 'ip', 'addr', 'add', f'{ip}/{prefix}', 'dev', interface, 'label', label]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+        if result.returncode != 0:
+            if 'RTNETLINK answers: File exists' in result.stderr:
+                return {'success': False, 'error': 'This IP address is already configured'}
+            return {'success': False, 'error': result.stderr}
+
+        # Make it persistent based on network manager type
+        net_manager = get_network_manager_type()
+        persistent_note = ""
+
+        if net_manager['type'] == 'networkmanager':
+            # For NetworkManager, we could add a secondary IP, but manual ip addr is simpler
+            persistent_note = "Note: This alias is temporary. To make it permanent, add it via nmcli or /etc/network/interfaces.d/"
+        else:
+            # For dhcpcd, add to config
+            config_path = '/etc/dhcpcd.conf'
+            try:
+                with open(config_path, 'a') as f:
+                    f.write(f'\n# IP alias for {label}\n')
+                    f.write(f'interface {interface}\n')
+                    f.write(f'static ip_address={ip}/{prefix}\n')
+                persistent_note = "Alias added to dhcpcd.conf for persistence"
+            except:
+                persistent_note = "Note: Could not make alias persistent in dhcpcd.conf"
+
+        return {
+            'success': True,
+            'label': label,
+            'ip': ip,
+            'prefix': prefix,
+            'message': f'IP alias {label} added with address {ip}/{prefix}',
+            'persistent_note': persistent_note
+        }
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+def remove_network_alias(interface, ip, prefix):
+    """Remove an IP alias from an interface."""
+    try:
+        cmd = ['sudo', 'ip', 'addr', 'del', f'{ip}/{prefix}', 'dev', interface]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+        if result.returncode != 0:
+            return {'success': False, 'error': result.stderr}
+
+        return {'success': True, 'message': f'IP alias {ip}/{prefix} removed from {interface}'}
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
 
 # === Terminal Management ===
 class TerminalSession:
@@ -662,7 +1000,7 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
         ], capture_output=True, text=True, timeout=10)
 
         if check_result.stdout.strip():
-            parts = check_result.stdout.strip().split('\\t')
+            parts = check_result.stdout.strip().split('\t')
             existing_ke = parts[0] if len(parts) > 0 else ''
             existing_uid = parts[1] if len(parts) > 1 else ''
             print(f"[Shinobi DB] User exists: ke={existing_ke}, uid={existing_uid}")
@@ -903,7 +1241,13 @@ def install_cloudflared():
     if result.returncode != 0:
         try:
             arch = subprocess.run(['dpkg', '--print-architecture'], capture_output=True, text=True).stdout.strip()
-            url = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm.deb' if arch in ['armhf', 'arm64'] else 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb'
+            # Select correct package for architecture
+            if arch == 'arm64':
+                url = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb'
+            elif arch == 'armhf':
+                url = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm.deb'
+            else:
+                url = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb'
             subprocess.run(['curl', '-L', '--output', '/tmp/cloudflared.deb', url], check=True)
             subprocess.run(['sudo', 'dpkg', '-i', '/tmp/cloudflared.deb'], check=True)
         except Exception as e:
@@ -923,7 +1267,7 @@ def setup_quick_tunnel():
             time.sleep(1)
             try:
                 with open('/tmp/cf_shinobi.log', 'r') as f:
-                    match = re.search(r'https://[a-z0-9-]+\\.trycloudflare\\.com', f.read())
+                    match = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', f.read())
                     if match:
                         shinobi_url = match.group(0)
                         break
@@ -939,7 +1283,7 @@ def setup_quick_tunnel():
             time.sleep(1)
             try:
                 with open('/tmp/cf_agent.log', 'r') as f:
-                    match = re.search(r'https://[a-z0-9-]+\\.trycloudflare\\.com', f.read())
+                    match = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', f.read())
                     if match:
                         agent_url = match.group(0)
                         break
@@ -1165,7 +1509,7 @@ def get_shinobi_info():
 
             if result.returncode == 0 and result.stdout.strip():
                 for line in result.stdout.strip().splitlines():
-                    parts = line.split('\\t')
+                    parts = line.split('\t')
                     if len(parts) >= 2:
                         monitor = {"mid": parts[0], "name": parts[1]}
                         if len(parts) >= 3:
@@ -1314,8 +1658,18 @@ def cleanup_arena(options=None):
         "logs": None,
         "tunnel": None,
         "config": None,
+        "phoenix": None,
     }
     errors = []
+
+    # Always stop Phoenix first to prevent reboots during cleanup
+    try:
+        subprocess.run(['systemctl', 'stop', 'gravae-phoenix'], capture_output=True)
+        subprocess.run(['systemctl', 'disable', 'gravae-phoenix'], capture_output=True)
+        results["phoenix"] = "stopped"
+    except Exception as e:
+        errors.append(f"phoenix: {str(e)}")
+        results["phoenix"] = "error"
 
     if options.get('buttons', True):
         try:
@@ -1502,6 +1856,113 @@ def get_phoenix_status():
             pass
 
     return status
+
+def phoenix_disable():
+    """Disable Phoenix daemon - emergency kill switch
+
+    This will:
+    1. Create the kill switch file to prevent reboots
+    2. Stop the Phoenix service
+    3. Disable the service from starting on boot
+    """
+    result = {
+        "success": True,
+        "killSwitch": False,
+        "serviceStopped": False,
+        "serviceDisabled": False,
+        "errors": []
+    }
+
+    # 1. Create kill switch file
+    try:
+        os.makedirs("/etc/gravae", exist_ok=True)
+        with open("/etc/gravae/no_reboot", "w") as f:
+            f.write(f"Phoenix disabled via agent at {datetime.now().isoformat()}\n")
+        result["killSwitch"] = True
+    except Exception as e:
+        result["errors"].append(f"Failed to create kill switch: {e}")
+        result["success"] = False
+
+    # 2. Stop the service
+    try:
+        subprocess.run(["sudo", "systemctl", "stop", "gravae-phoenix"],
+                      capture_output=True, timeout=10)
+        # Also kill any running process
+        subprocess.run(["sudo", "pkill", "-9", "-f", "phoenix_daemon.py"],
+                      capture_output=True, timeout=5)
+        result["serviceStopped"] = True
+    except Exception as e:
+        result["errors"].append(f"Failed to stop service: {e}")
+
+    # 3. Disable the service
+    try:
+        subprocess.run(["sudo", "systemctl", "disable", "gravae-phoenix"],
+                      capture_output=True, timeout=10)
+        result["serviceDisabled"] = True
+    except Exception as e:
+        result["errors"].append(f"Failed to disable service: {e}")
+
+    # Verify it's stopped
+    try:
+        check = subprocess.run(["systemctl", "is-active", "gravae-phoenix"],
+                              capture_output=True, text=True, timeout=5)
+        result["status"] = check.stdout.strip()
+    except:
+        result["status"] = "unknown"
+
+    return result
+
+def phoenix_enable():
+    """Re-enable Phoenix daemon
+
+    This will:
+    1. Remove the kill switch file
+    2. Enable the service
+    3. Start the Phoenix service
+    """
+    result = {
+        "success": True,
+        "killSwitchRemoved": False,
+        "serviceEnabled": False,
+        "serviceStarted": False,
+        "errors": []
+    }
+
+    # 1. Remove kill switch file
+    try:
+        if os.path.exists("/etc/gravae/no_reboot"):
+            os.remove("/etc/gravae/no_reboot")
+        result["killSwitchRemoved"] = True
+    except Exception as e:
+        result["errors"].append(f"Failed to remove kill switch: {e}")
+
+    # 2. Enable the service
+    try:
+        subprocess.run(["sudo", "systemctl", "enable", "gravae-phoenix"],
+                      capture_output=True, timeout=10)
+        result["serviceEnabled"] = True
+    except Exception as e:
+        result["errors"].append(f"Failed to enable service: {e}")
+        result["success"] = False
+
+    # 3. Start the service
+    try:
+        subprocess.run(["sudo", "systemctl", "start", "gravae-phoenix"],
+                      capture_output=True, timeout=10)
+        result["serviceStarted"] = True
+    except Exception as e:
+        result["errors"].append(f"Failed to start service: {e}")
+        result["success"] = False
+
+    # Verify it's running
+    try:
+        check = subprocess.run(["systemctl", "is-active", "gravae-phoenix"],
+                              capture_output=True, text=True, timeout=5)
+        result["status"] = check.stdout.strip()
+    except:
+        result["status"] = "unknown"
+
+    return result
 
 def get_phoenix_alerts(limit=50, pending_only=True):
     """Get Phoenix alerts from database"""
@@ -1753,6 +2214,16 @@ class AgentHandler(BaseHTTPRequestHandler):
             result = cleanup_shinobi(data['groupKey'], data['email'], data['password'])
             self._send_json(result)
 
+        elif path == '/phoenix/disable':
+            # Emergency endpoint to disable Phoenix daemon and prevent reboots
+            result = phoenix_disable()
+            self._send_json(result)
+
+        elif path == '/phoenix/enable':
+            # Re-enable Phoenix daemon after emergency disable
+            result = phoenix_enable()
+            self._send_json(result)
+
         elif path == '/tunnel/setup':
             result = setup_cloudflare_tunnel(
                 tunnel_type=data.get('type', 'quick'),
@@ -1784,6 +2255,27 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": True, "status": get_button_daemon_status()})
             except Exception as e:
                 self._send_json({"success": False, "error": str(e)})
+
+        elif path == '/config/update':
+            # Update config with tunnel hostnames (for emergency SSH access, etc.)
+            updated = []
+            if data.get('shinobiHostname'):
+                CONFIG['shinobiHostname'] = data['shinobiHostname']
+                updated.append('shinobiHostname')
+            if data.get('agentHostname'):
+                CONFIG['agentHostname'] = data['agentHostname']
+                updated.append('agentHostname')
+            if data.get('sshHostname'):
+                CONFIG['sshHostname'] = data['sshHostname']
+                updated.append('sshHostname')
+            if data.get('tunnelId'):
+                CONFIG['tunnelId'] = data['tunnelId']
+                updated.append('tunnelId')
+            if updated:
+                save_config()
+                self._send_json({"success": True, "updated": updated, "config": CONFIG})
+            else:
+                self._send_json({"success": False, "error": "No fields to update"}, 400)
 
         elif path == '/cleanup':
             options = {
@@ -1855,6 +2347,53 @@ class AgentHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"monitors": [], "error": str(e)})
 
+        elif path == '/network/configure':
+            # Configure static IP or DHCP
+            action = data.get('action')  # 'static' or 'dhcp'
+            interface = data.get('interface', 'eth0')
+
+            if action == 'static':
+                ip = data.get('ip')
+                prefix = data.get('prefix', 24)
+                gateway = data.get('gateway')
+                dns = data.get('dns')
+
+                if not ip or not gateway:
+                    self._send_json({"success": False, "error": "ip and gateway are required"}, 400)
+                    return
+
+                result = configure_network_static(interface, ip, prefix, gateway, dns)
+                self._send_json(result)
+
+            elif action == 'dhcp':
+                result = configure_network_dhcp(interface)
+                self._send_json(result)
+
+            else:
+                self._send_json({"success": False, "error": "action must be 'static' or 'dhcp'"}, 400)
+
+        elif path == '/network/alias':
+            # Add or remove IP alias
+            action = data.get('action', 'add')  # 'add' or 'remove'
+            interface = data.get('interface', 'eth0')
+            ip = data.get('ip')
+            prefix = data.get('prefix', 24)
+            label = data.get('label')  # Optional, like eth0:1
+
+            if not ip:
+                self._send_json({"success": False, "error": "ip is required"}, 400)
+                return
+
+            if action == 'add':
+                result = add_network_alias(interface, ip, prefix, label)
+            elif action == 'remove':
+                result = remove_network_alias(interface, ip, prefix)
+            else:
+                self._send_json({"success": False, "error": "action must be 'add' or 'remove'"}, 400)
+                return
+
+            self._send_json(result)
+
         else:
             self._send_json({"error": "Not found"}, 404)
 
@@ -1900,6 +2439,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/system/disk': get_disk_info,
             '/system/network': lambda: {"localIp": get_local_ip(), "gateway": get_gateway(), "hostname": get_hostname()},
             '/system/uptime': get_uptime,
+            '/network/info': get_network_interfaces,
             '/hardware/info': lambda: {"model": get_device_model(), "serial": get_device_serial(), "os": get_os_info(), "gpio": get_gpio_info()},
             '/gpio/info': get_gpio_info,
             '/buttons/status': get_button_daemon_status,
@@ -1924,3 +2464,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
