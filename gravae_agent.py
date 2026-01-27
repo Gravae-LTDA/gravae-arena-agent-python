@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v2.10.1
+Gravae Arena Agent v${AGENT_VERSION}
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.10.1"
+VERSION = "${AGENT_VERSION}"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
