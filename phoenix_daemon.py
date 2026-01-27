@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phoenix Daemon v1.0.0
+Phoenix Daemon v1.2.0
 Self-healing module for Gravae Arena Agent
 
 Features:
@@ -26,7 +26,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -34,9 +34,14 @@ NETWORK_BACKUP_DIR = LOG_DIR / "network_backup"
 CONFIG_PATH = Path("/etc/gravae/device.json")
 DHCPCD_CONF = Path("/etc/dhcpcd.conf")
 
+# Kill switch - if this file exists, Phoenix will NOT reboot the system
+# This is a safety mechanism to prevent boot loops
+KILL_SWITCH_PATH = Path("/etc/gravae/no_reboot")
+
 # Timing configuration (in seconds)
-CHECK_INTERVAL = 60  # Check every minute
-CONNECTIVITY_CHECK_INTERVAL = 30  # Check connectivity every 30s
+# NOTE: Intervals increased to reduce CPU usage on Raspberry Pi
+CHECK_INTERVAL = 120  # Check every 2 minutes (was 60s)
+CONNECTIVITY_CHECK_INTERVAL = 60  # Check connectivity every minute (was 30s)
 SERVICE_RESTART_MAX_ATTEMPTS = 3
 SERVICE_RESTART_COOLDOWN = 300  # 5 minutes between restart attempts
 
@@ -45,6 +50,9 @@ ESCALATION_RESTART_CLOUDFLARED = 30
 ESCALATION_RESTART_NETWORKING = 120  # 2 hours
 ESCALATION_REBOOT = 240  # 4 hours
 ESCALATION_TRY_DHCP = 480  # 8 hours
+
+# Minimum uptime before allowing reboot (prevents boot loops)
+MIN_UPTIME_FOR_REBOOT = 600  # 10 minutes - system must be up at least this long before Phoenix can reboot
 
 # Connectivity check targets
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
@@ -407,7 +415,7 @@ class ShinobiMonitorWatcher:
             ], capture_output=True, text=True, timeout=10)
 
             if result.returncode == 0 and result.stdout.strip():
-                parts = result.stdout.strip().split("\t")
+                parts = result.stdout.strip().split("\\t")
                 if len(parts) >= 2:
                     self.shinobi_config = {
                         "groupKey": parts[0],
@@ -575,6 +583,53 @@ class ConnectivitySentinel:
             return False
 
     def reboot_system(self):
+        # Safety check 1: Kill switch file
+        if KILL_SWITCH_PATH.exists():
+            log.warning("Reboot blocked: kill switch file exists (/etc/gravae/no_reboot)")
+            alerts.add(
+                "reboot_blocked",
+                "warning",
+                "System reboot was blocked by kill switch",
+                {"reason": "kill_switch", "offline_minutes": self.get_offline_minutes()}
+            )
+            return
+
+        # Safety check 2: Minimum uptime (prevents boot loops)
+        try:
+            with open("/proc/uptime", "r") as f:
+                uptime_seconds = float(f.read().split()[0])
+            if uptime_seconds < MIN_UPTIME_FOR_REBOOT:
+                log.warning(f"Reboot blocked: system uptime ({uptime_seconds:.0f}s) < minimum ({MIN_UPTIME_FOR_REBOOT}s)")
+                alerts.add(
+                    "reboot_blocked",
+                    "warning",
+                    f"System reboot blocked - uptime too short ({uptime_seconds:.0f}s)",
+                    {"reason": "min_uptime", "uptime": uptime_seconds}
+                )
+                return
+        except Exception as e:
+            log.error(f"Could not check uptime: {e}")
+
+        # Safety check 3: Max reboots per day (check last_will timestamps)
+        try:
+            last_will_path = LOG_DIR / "last_will.json"
+            if last_will_path.exists():
+                with open(last_will_path, "r") as f:
+                    last_will = json.load(f)
+                last_reboot = datetime.fromisoformat(last_will.get("timestamp", "2000-01-01"))
+                time_since_last = (datetime.now() - last_reboot).total_seconds() / 60
+                if time_since_last < 30:  # Less than 30 minutes since last reboot attempt
+                    log.warning(f"Reboot blocked: last reboot was {time_since_last:.0f} minutes ago (boot loop protection)")
+                    alerts.add(
+                        "reboot_blocked",
+                        "critical",
+                        "System reboot blocked - possible boot loop detected",
+                        {"reason": "boot_loop_protection", "minutes_since_last": time_since_last}
+                    )
+                    return
+        except Exception as e:
+            log.debug(f"Could not check last reboot: {e}")
+
         log.warning("Escalation: Rebooting system")
         alerts.add(
             "system_reboot",
@@ -714,7 +769,7 @@ class NetworkRecovery:
                 else:
                     new_content.append(line)
 
-            DHCPCD_CONF.write_text("\n".join(new_content))
+            DHCPCD_CONF.write_text("\\n".join(new_content))
 
             # Restart networking
             subprocess.run(["systemctl", "restart", "dhcpcd"], timeout=30)
@@ -826,10 +881,10 @@ class ResourceMonitor:
         temp = self.get_temperature()
         if temp:
             if temp >= TEMP_CRITICAL:
-                issues.append(("temperature", "critical", f"CPU temperature critical: {temp}C"))
-                alerts.add("temperature_critical", "critical", f"CPU temperature: {temp}C")
+                issues.append(("temperature", "critical", f"CPU temperature critical: {temp}°C"))
+                alerts.add("temperature_critical", "critical", f"CPU temperature: {temp}°C")
             elif temp >= TEMP_WARNING:
-                issues.append(("temperature", "warning", f"CPU temperature high: {temp}C"))
+                issues.append(("temperature", "warning", f"CPU temperature high: {temp}°C"))
 
         # Disk
         disk = self.get_disk_usage()
@@ -1019,8 +1074,8 @@ class PhoenixDaemon:
 
                     last_connectivity_check = now
 
-                # Shinobi monitor check (every 2 minutes, only when online)
-                if now - last_monitor_check >= 120 and self.connectivity.is_online:
+                # Shinobi monitor check (every 5 minutes, only when online)
+                if now - last_monitor_check >= 300 and self.connectivity.is_online:
                     try:
                         watcher = self._get_shinobi_watcher()
                         watcher.check_monitors()
@@ -1061,7 +1116,7 @@ class PhoenixDaemon:
             except Exception as e:
                 log.error(f"Phoenix loop error: {e}")
 
-            time.sleep(10)  # Main loop sleep
+            time.sleep(30)  # Main loop sleep (increased from 10s to reduce CPU)
 
         log.info("Phoenix Daemon stopped")
 
