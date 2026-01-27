@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phoenix Daemon v1.2.0
+Phoenix Daemon v1.3.0
 Self-healing module for Gravae Arena Agent
 
 Features:
@@ -26,7 +26,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -232,6 +232,17 @@ class ServiceGuardian:
             pass
         return False
 
+    def check_legacy_button_process(self):
+        """Check if legacy botao.py is running (for older arenas)"""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "botao.py"],
+                capture_output=True, text=True, timeout=5
+            )
+            return result.returncode == 0 and result.stdout.strip() != ""
+        except:
+            return False
+
     def restart_pm2_process(self, name):
         """Restart a pm2 process"""
         try:
@@ -330,6 +341,12 @@ class ServiceGuardian:
                 is_running = self.check_port(config.get("port", 8080))
                 if not is_running:
                     is_running = self.check_pm2_process(service_name)
+            elif service_name == "gravae-buttons":
+                # Button service - check systemd first, then legacy botao.py
+                is_running = self.check_service_systemd(service_name)
+                if not is_running:
+                    # Check for legacy botao.py process (older arenas)
+                    is_running = self.check_legacy_button_process()
             elif config.get("port"):
                 # Service with port check
                 is_running = self.check_service_systemd(service_name) and self.check_port(config["port"])
