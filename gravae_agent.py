@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v${AGENT_VERSION}
+Gravae Arena Agent v2.10.2
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "${AGENT_VERSION}"
+VERSION = "2.10.2"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
@@ -94,7 +94,7 @@ def get_device_serial():
 def get_device_model():
     try:
         with open("/proc/device-tree/model", "r") as f:
-            return f.read().strip().replace('\\x00', '')
+            return f.read().strip().replace('\x00', '')
     except:
         pass
     return "Unknown"
@@ -405,12 +405,12 @@ def configure_network_static(interface, ip, prefix, gateway, dns=None):
                     new_lines.append(line)
 
             # Add new static config
-            new_lines.append(f'\\ninterface {interface}\\n')
-            new_lines.append(f'static ip_address={ip}/{prefix}\\n')
-            new_lines.append(f'static routers={gateway}\\n')
+            new_lines.append(f'\ninterface {interface}\n')
+            new_lines.append(f'static ip_address={ip}/{prefix}\n')
+            new_lines.append(f'static routers={gateway}\n')
             if dns:
                 dns_str = ' '.join(dns) if isinstance(dns, list) else dns
-                new_lines.append(f'static domain_name_servers={dns_str}\\n')
+                new_lines.append(f'static domain_name_servers={dns_str}\n')
 
             # Write config
             with open('/tmp/dhcpcd.conf.new', 'w') as f:
@@ -530,9 +530,9 @@ def add_network_alias(interface, ip, prefix, label=None):
             config_path = '/etc/dhcpcd.conf'
             try:
                 with open(config_path, 'a') as f:
-                    f.write(f'\\n# IP alias for {label}\\n')
-                    f.write(f'interface {interface}\\n')
-                    f.write(f'static ip_address={ip}/{prefix}\\n')
+                    f.write(f'\n# IP alias for {label}\n')
+                    f.write(f'interface {interface}\n')
+                    f.write(f'static ip_address={ip}/{prefix}\n')
                 persistent_note = "Alias added to dhcpcd.conf for persistence"
             except:
                 persistent_note = "Note: Could not make alias persistent in dhcpcd.conf"
@@ -1000,7 +1000,7 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
         ], capture_output=True, text=True, timeout=10)
 
         if check_result.stdout.strip():
-            parts = check_result.stdout.strip().split('\\t')
+            parts = check_result.stdout.strip().split('\t')
             existing_ke = parts[0] if len(parts) > 0 else ''
             existing_uid = parts[1] if len(parts) > 1 else ''
             print(f"[Shinobi DB] User exists: ke={existing_ke}, uid={existing_uid}")
@@ -1267,7 +1267,7 @@ def setup_quick_tunnel():
             time.sleep(1)
             try:
                 with open('/tmp/cf_shinobi.log', 'r') as f:
-                    match = re.search(r'https://[a-z0-9-]+\\.trycloudflare\\.com', f.read())
+                    match = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', f.read())
                     if match:
                         shinobi_url = match.group(0)
                         break
@@ -1283,7 +1283,7 @@ def setup_quick_tunnel():
             time.sleep(1)
             try:
                 with open('/tmp/cf_agent.log', 'r') as f:
-                    match = re.search(r'https://[a-z0-9-]+\\.trycloudflare\\.com', f.read())
+                    match = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', f.read())
                     if match:
                         agent_url = match.group(0)
                         break
@@ -1509,7 +1509,7 @@ def get_shinobi_info():
 
             if result.returncode == 0 and result.stdout.strip():
                 for line in result.stdout.strip().splitlines():
-                    parts = line.split('\\t')
+                    parts = line.split('\t')
                     if len(parts) >= 2:
                         monitor = {"mid": parts[0], "name": parts[1]}
                         if len(parts) >= 3:
@@ -1877,7 +1877,7 @@ def phoenix_disable():
     try:
         os.makedirs("/etc/gravae", exist_ok=True)
         with open("/etc/gravae/no_reboot", "w") as f:
-            f.write(f"Phoenix disabled via agent at {datetime.now().isoformat()}\\n")
+            f.write(f"Phoenix disabled via agent at {datetime.now().isoformat()}\n")
         result["killSwitch"] = True
     except Exception as e:
         result["errors"].append(f"Failed to create kill switch: {e}")
