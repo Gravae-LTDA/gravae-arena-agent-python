@@ -1738,7 +1738,7 @@ def get_phoenix_status():
     """Get Phoenix daemon status with full system info"""
     status = {
         "running": False,
-        "version": "1.0.0",
+        "version": "unknown",
         "uptime": None,
         "lastCheck": None,
         "services": {},
@@ -1753,6 +1753,19 @@ def get_phoenix_status():
             capture_output=True, text=True, timeout=5
         )
         status["running"] = result.stdout.strip() == "active"
+    except:
+        pass
+
+    # Read actual Phoenix version from script file
+    phoenix_script = os.path.join(AGENT_PATH, "phoenix_daemon.py")
+    try:
+        if os.path.exists(phoenix_script):
+            with open(phoenix_script, "r") as f:
+                for line in f:
+                    if line.strip().startswith("VERSION"):
+                        ver = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        status["version"] = ver
+                        break
     except:
         pass
 
