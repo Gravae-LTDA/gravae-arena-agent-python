@@ -47,9 +47,9 @@ SERVICE_RESTART_COOLDOWN = 300  # 5 minutes between restart attempts
 
 # Escalation thresholds (in minutes)
 ESCALATION_RESTART_CLOUDFLARED = 30
-ESCALATION_RESTART_NETWORKING = 120  # 2 hours
-ESCALATION_REBOOT = 240  # 4 hours
-ESCALATION_TRY_DHCP = 480  # 8 hours
+ESCALATION_RESTART_NETWORKING = 60   # 1 hour
+ESCALATION_TRY_DHCP_STATIC = 120    # 2 hours (only when static IP - common modem change scenario)
+ESCALATION_REBOOT = 240             # 4 hours
 
 # Minimum uptime before allowing reboot (prevents boot loops)
 MIN_UPTIME_FOR_REBOOT = 600  # 10 minutes - system must be up at least this long before Phoenix can reboot
@@ -784,13 +784,17 @@ class ConnectivitySentinel:
         offline_minutes = self.get_offline_minutes()
 
         # Escalation logic
-        if offline_minutes >= ESCALATION_TRY_DHCP and self.escalation_level < 4:
-            self.escalation_level = 4
-            # This will be handled by NetworkRecovery
+        # When static IP: cloudflared(30m) → networking(1h) → DHCP(2h) → reboot(4h)
+        # When DHCP:      cloudflared(30m) → networking(1h) → reboot(4h)
+        is_static = NetworkRecovery().is_static_ip()
 
-        elif offline_minutes >= ESCALATION_REBOOT and self.escalation_level < 3:
-            self.escalation_level = 3
+        if offline_minutes >= ESCALATION_REBOOT and self.escalation_level < 4:
+            self.escalation_level = 4
             self.reboot_system()
+
+        elif is_static and offline_minutes >= ESCALATION_TRY_DHCP_STATIC and self.escalation_level < 3:
+            self.escalation_level = 3
+            # DHCP fallback handled by NetworkRecovery in main loop
 
         elif offline_minutes >= ESCALATION_RESTART_NETWORKING and self.escalation_level < 2:
             self.escalation_level = 2
@@ -1200,8 +1204,8 @@ class PhoenixDaemon:
                 if now - last_connectivity_check >= CONNECTIVITY_CHECK_INTERVAL:
                     is_online = self.connectivity.update()
 
-                    # Check if we need to try DHCP recovery
-                    if not is_online and self.connectivity.escalation_level >= 4:
+                    # Check if we need to try DHCP recovery (level 3 = DHCP for static IP)
+                    if not is_online and self.connectivity.escalation_level >= 3:
                         self.network_recovery.attempt_recovery(self.connectivity)
 
                     last_connectivity_check = now
