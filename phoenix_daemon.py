@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phoenix Daemon v1.3.0
+Phoenix Daemon v1.4.0
 Self-healing module for Gravae Arena Agent
 
 Features:
@@ -26,7 +26,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -611,7 +611,7 @@ class ConnectivitySentinel:
             )
             return
 
-        # Safety check 2: Minimum uptime (prevents boot loops)
+        # Safety check 2: Minimum uptime of 10 minutes (prevents boot loops)
         try:
             with open("/proc/uptime", "r") as f:
                 uptime_seconds = float(f.read().split()[0])
@@ -625,9 +625,11 @@ class ConnectivitySentinel:
                 )
                 return
         except Exception as e:
-            log.error(f"Could not check uptime: {e}")
+            # If we can't check uptime, block the reboot to be safe
+            log.error(f"Could not check uptime, blocking reboot: {e}")
+            return
 
-        # Safety check 3: Max reboots per day (check last_will timestamps)
+        # Safety check 3: Minimum 10 minutes between reboots
         try:
             last_will_path = LOG_DIR / "last_will.json"
             if last_will_path.exists():
@@ -635,17 +637,41 @@ class ConnectivitySentinel:
                     last_will = json.load(f)
                 last_reboot = datetime.fromisoformat(last_will.get("timestamp", "2000-01-01"))
                 time_since_last = (datetime.now() - last_reboot).total_seconds() / 60
-                if time_since_last < 30:  # Less than 30 minutes since last reboot attempt
-                    log.warning(f"Reboot blocked: last reboot was {time_since_last:.0f} minutes ago (boot loop protection)")
+                if time_since_last < 10:
+                    log.warning(f"Reboot blocked: last reboot was {time_since_last:.0f} minutes ago (minimum 10 min)")
                     alerts.add(
                         "reboot_blocked",
                         "critical",
-                        "System reboot blocked - possible boot loop detected",
+                        "System reboot blocked - minimum 10 min between reboots",
                         {"reason": "boot_loop_protection", "minutes_since_last": time_since_last}
                     )
                     return
         except Exception as e:
             log.debug(f"Could not check last reboot: {e}")
+
+        # Safety check 4: Max 3 reboots per day
+        try:
+            reboot_count_path = LOG_DIR / "reboot_count.json"
+            today = datetime.now().strftime("%Y-%m-%d")
+            reboot_count = 0
+            if reboot_count_path.exists():
+                with open(reboot_count_path, "r") as f:
+                    data = json.load(f)
+                if data.get("date") == today:
+                    reboot_count = data.get("count", 0)
+            if reboot_count >= 3:
+                log.warning(f"Reboot blocked: already rebooted {reboot_count} times today (max 3)")
+                alerts.add(
+                    "reboot_blocked",
+                    "critical",
+                    f"System reboot blocked - max daily reboots reached ({reboot_count}/3)",
+                    {"reason": "max_daily_reboots", "count": reboot_count}
+                )
+                return
+            with open(reboot_count_path, "w") as f:
+                json.dump({"date": today, "count": reboot_count + 1}, f)
+        except Exception as e:
+            log.debug(f"Could not check reboot count: {e}")
 
         log.warning("Escalation: Rebooting system")
         alerts.add(
@@ -1052,14 +1078,46 @@ class PhoenixDaemon:
         self.running = False
         self.watchdog.disable()
 
+    def _is_setup_complete(self):
+        """Check if the system is fully set up before enabling critical features.
+        Without cloudflared configured, the watchdog would cause boot loops
+        since Phoenix can't maintain connectivity checks."""
+        try:
+            if not CONFIG_PATH.exists():
+                log.warning("Setup incomplete: device.json not found")
+                return False
+
+            config = json.loads(CONFIG_PATH.read_text())
+            if not config.get("tunnelId"):
+                log.warning("Setup incomplete: no tunnelId in device.json")
+                return False
+
+            result = subprocess.run(
+                ["systemctl", "list-unit-files", "cloudflared.service"],
+                capture_output=True, text=True, timeout=10
+            )
+            if "cloudflared.service" not in result.stdout:
+                log.warning("Setup incomplete: cloudflared service not installed")
+                return False
+
+            return True
+        except Exception as e:
+            log.warning(f"Setup check failed: {e}")
+            return False
+
     def run(self):
         log.info(f"Phoenix Daemon v{VERSION} starting")
 
         # Check if we just rebooted
         check_boot_report()
 
-        # Enable hardware watchdog
-        self.watchdog.enable()
+        # Only enable hardware watchdog if system is fully set up
+        # This prevents boot loops when cloudflared isn't configured yet
+        if self._is_setup_complete():
+            self.watchdog.enable()
+        else:
+            log.warning("Hardware watchdog DISABLED - system setup incomplete. "
+                       "Watchdog will be enabled once cloudflared is configured.")
 
         last_service_check = 0
         last_connectivity_check = 0
@@ -1118,6 +1176,12 @@ class PhoenixDaemon:
                     }
                     self.heartbeat.send(status)
                     last_heartbeat = now
+
+                # Try to enable watchdog if not yet enabled (setup may have completed)
+                if not self.watchdog.enabled and now - last_resource_check >= 300:
+                    if self._is_setup_complete():
+                        log.info("System setup now complete - enabling hardware watchdog")
+                        self.watchdog.enable()
 
                 # Alert cleanup (daily)
                 if now - last_alert_cleanup >= 86400:
