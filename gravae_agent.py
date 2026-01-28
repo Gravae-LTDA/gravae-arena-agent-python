@@ -776,20 +776,22 @@ def _perform_update_direct():
         update_status = {"status": "error", "progress": 0, "message": "Erro no download", "error": str(e)}
 
 def _restart_services():
-    """Restart agent and phoenix services, creating systemd services if needed"""
+    """Restart phoenix first, then agent (agent restart kills this process)"""
     global update_status
 
-    update_status = {"status": "installing", "progress": 60, "message": "Configurando Agent service...", "error": None}
-    _ensure_agent_service()
-    subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True)
-    subprocess.run(['sudo', 'systemctl', 'enable', 'gravae-agent'], capture_output=True)
-    subprocess.run(['sudo', 'systemctl', 'restart', 'gravae-agent'], capture_output=True)
-
-    update_status = {"status": "installing", "progress": 80, "message": "Configurando Phoenix service...", "error": None}
+    # Restart Phoenix FIRST (before agent, because agent restart kills this process)
+    update_status = {"status": "installing", "progress": 60, "message": "Configurando Phoenix service...", "error": None}
     _ensure_phoenix_service()
     subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True)
     subprocess.run(['sudo', 'systemctl', 'enable', 'gravae-phoenix'], capture_output=True)
     subprocess.run(['sudo', 'systemctl', 'restart', 'gravae-phoenix'], capture_output=True)
+
+    # Restart Agent LAST (this kills our process, so it must be the final step)
+    update_status = {"status": "installing", "progress": 90, "message": "Reiniciando Agent...", "error": None}
+    _ensure_agent_service()
+    subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True)
+    subprocess.run(['sudo', 'systemctl', 'enable', 'gravae-agent'], capture_output=True)
+    subprocess.run(['sudo', 'systemctl', 'restart', 'gravae-agent'], capture_output=True)
 
     update_status = {"status": "completed", "progress": 100, "message": "Concluido!", "error": None}
 
