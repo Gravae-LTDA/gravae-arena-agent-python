@@ -1083,6 +1083,18 @@ class PhoenixDaemon:
         Without cloudflared configured, the watchdog would cause boot loops
         since Phoenix can't maintain connectivity checks."""
         try:
+            # Check if cloudflared is actively running (strongest signal)
+            try:
+                result = subprocess.run(
+                    ["systemctl", "is-active", "cloudflared"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.stdout.strip() == "active":
+                    return True
+            except:
+                pass
+
+            # Fallback: check config + service file
             if not CONFIG_PATH.exists():
                 log.warning("Setup incomplete: device.json not found")
                 return False
