@@ -519,6 +519,8 @@ class ShinobiMonitorWatcher:
                     )
 
 # === Connectivity Sentinel ===
+ESCALATION_STATE_PATH = LOG_DIR / "escalation_state.json"
+
 class ConnectivitySentinel:
     def __init__(self):
         self.is_online = True
@@ -526,6 +528,47 @@ class ConnectivitySentinel:
         self.last_successful_ping = datetime.now()
         self.escalation_level = 0  # 0=none, 1=cloudflared, 2=networking, 3=reboot, 4=dhcp
         self.actions_taken = []
+        self._load_persisted_state()
+
+    def _load_persisted_state(self):
+        """Load escalation state from disk (survives reboots).
+        If we rebooted due to connectivity loss and internet is still down,
+        we skip straight to level 3+ to avoid rebooting again."""
+        try:
+            if ESCALATION_STATE_PATH.exists():
+                data = json.loads(ESCALATION_STATE_PATH.read_text())
+                saved_level = data.get("escalation_level", 0)
+                saved_time = data.get("offline_since")
+                if saved_level >= 3:
+                    # We already rebooted for connectivity - don't reboot again
+                    self.escalation_level = saved_level
+                    if saved_time:
+                        self.offline_since = datetime.fromisoformat(saved_time)
+                    self.is_online = False
+                    log.info(f"Restored escalation state: level={saved_level}, "
+                            f"offline_since={saved_time} - reboot will NOT repeat")
+        except Exception as e:
+            log.debug(f"Could not load escalation state: {e}")
+
+    def _persist_state(self):
+        """Save escalation state to disk before reboot or periodically."""
+        try:
+            data = {
+                "escalation_level": self.escalation_level,
+                "offline_since": self.offline_since.isoformat() if self.offline_since else None,
+                "timestamp": datetime.now().isoformat()
+            }
+            ESCALATION_STATE_PATH.write_text(json.dumps(data))
+        except Exception as e:
+            log.debug(f"Could not save escalation state: {e}")
+
+    def _clear_persisted_state(self):
+        """Clear persisted state when connectivity is restored."""
+        try:
+            if ESCALATION_STATE_PATH.exists():
+                ESCALATION_STATE_PATH.unlink()
+        except Exception as e:
+            log.debug(f"Could not clear escalation state: {e}")
 
     def ping(self, host):
         try:
@@ -684,8 +727,9 @@ class ConnectivitySentinel:
             }
         )
 
-        # Save state before reboot
+        # Save state before reboot (so we don't reboot again on next boot)
         self._save_last_will()
+        self._persist_state()
 
         try:
             subprocess.run(["reboot"], timeout=10)
@@ -728,6 +772,7 @@ class ConnectivitySentinel:
             self.last_successful_ping = datetime.now()
             self.escalation_level = 0
             self.actions_taken = []
+            self._clear_persisted_state()
             return True
 
         # We're offline
