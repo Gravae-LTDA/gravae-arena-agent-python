@@ -6,7 +6,7 @@ Agent de monitoramento e controle para Raspberry Pi nas arenas Gravae/Replayme.
 
 ### gravae_agent.py
 - **Sistema**: Monitoramento de CPU, memória, disco, temperatura
-- **Shinobi**: Configuração de conta, API keys, monitores
+- **Shinobi**: Configuração de conta, API keys, monitores, FTP events (alarm input)
 - **Cloudflare Tunnel**: Setup de tunnels (quick ou named)
 - **Terminal**: Acesso remoto via PTY
 - **Buttons**: Deploy e controle do button daemon
@@ -75,7 +75,7 @@ sudo systemctl start gravae-agent gravae-phoenix
 ### POST
 | Endpoint | Body | Descrição |
 |----------|------|-----------|
-| `/shinobi/setup` | `{groupKey, email, password}` | Configurar conta Shinobi |
+| `/shinobi/setup` | `{groupKey, email, password, hasAlarmInput?}` | Configurar conta Shinobi (com FTP events opcional) |
 | `/shinobi/cleanup` | `{groupKey, email, password}` | Limpar conta Shinobi |
 | `/tunnel/setup` | `{type, tunnelToken?, ...}` | Configurar tunnel |
 | `/tunnel/run` | `{tunnelToken, tunnelName?}` | Rodar tunnel com token |
@@ -114,8 +114,8 @@ journalctl -u gravae-buttons -f
 
 ## Versão
 
-- Agent: 2.8.4
-- Phoenix: 1.0.0
+- Agent: 2.10.2
+- Phoenix: 1.4.0
 
 ## Requisitos
 
