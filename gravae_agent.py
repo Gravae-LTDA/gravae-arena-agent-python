@@ -1036,6 +1036,78 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
         print(f"[Shinobi DB] Exception: {e}")
         return {"success": False, "error": str(e)}
 
+def setup_ftp_events():
+    """Install ftp-srv and enable FTP event server in Shinobi for alarm input cameras."""
+    shinobi_dir = "/home/Shinobi"
+    print("[FTP Events] Installing ftp-srv@4.6.2...")
+    try:
+        result = subprocess.run(['npm', 'install', 'ftp-srv@4.6.2'],
+            cwd=shinobi_dir, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            print(f"[FTP Events] npm install failed: {result.stderr}")
+            return {"success": False, "error": f"npm install ftp-srv failed: {result.stderr}"}
+        print("[FTP Events] ftp-srv installed successfully")
+    except Exception as e:
+        print(f"[FTP Events] npm install exception: {e}")
+        return {"success": False, "error": str(e)}
+
+    print("[FTP Events] Modifying conf.json...")
+    try:
+        result = subprocess.run(['node', 'tools/modifyConfiguration.js',
+            'addToConfig={"dropInEventServer":true,"ftpServer":true}'],
+            cwd=shinobi_dir, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            print(f"[FTP Events] modifyConfiguration failed: {result.stderr}")
+            return {"success": False, "error": f"modifyConfiguration failed: {result.stderr}"}
+        print("[FTP Events] conf.json updated")
+    except Exception as e:
+        print(f"[FTP Events] modifyConfiguration exception: {e}")
+        return {"success": False, "error": str(e)}
+
+    print("[FTP Events] Restarting Shinobi...")
+    try:
+        subprocess.run(['pm2', 'restart', 'camera'],
+            capture_output=True, text=True, timeout=30)
+        # Wait for Shinobi to come back up
+        for i in range(30):
+            time.sleep(2)
+            try:
+                req = urllib.request.Request("http://localhost:8080/", method='GET')
+                urllib.request.urlopen(req, timeout=5)
+                print(f"[FTP Events] Shinobi is back up after {(i+1)*2}s")
+                break
+            except:
+                pass
+        else:
+            print("[FTP Events] Warning: Shinobi did not respond after 60s")
+        # Restart button service if it was running
+        try:
+            status = subprocess.run(['systemctl', 'is-active', 'gravae-buttons'],
+                capture_output=True, text=True, timeout=5)
+            if status.stdout.strip() in ('active', 'failed', 'inactive'):
+                subprocess.run(['systemctl', 'restart', 'gravae-buttons'],
+                    capture_output=True, text=True, timeout=15)
+                print("[FTP Events] Restarted gravae-buttons service")
+        except:
+            pass
+        # Also check legacy botao.py
+        try:
+            pgrep = subprocess.run(['pgrep', '-f', 'botao.py'],
+                capture_output=True, text=True, timeout=5)
+            if pgrep.returncode != 0:
+                # botao.py was not running, try to restart it
+                botao_path = '/home/Gravae/botao.py'
+                if os.path.exists(botao_path):
+                    subprocess.Popen(['python3', botao_path],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print("[FTP Events] Restarted legacy botao.py")
+        except:
+            pass
+    except Exception as e:
+        print(f"[FTP Events] pm2 restart exception: {e}")
+
+    return {"success": True}
+
 def setup_shinobi_account(group_key, email, password):
     import string
     import random
@@ -2220,6 +2292,13 @@ class AgentHandler(BaseHTTPRequestHandler):
                     CONFIG['shinobiUserId'] = result['userId']
                 save_config()
                 print(f"[Shinobi Setup] Saved credentials to config: apiKey={result['apiKey'][:8]}..., groupKey={result['groupKey']}")
+            if result.get('success') and data.get('hasAlarmInput'):
+                print("[Shinobi Setup] hasAlarmInput=True, setting up FTP events...")
+                ftp_result = setup_ftp_events()
+                if not ftp_result.get('success'):
+                    result['ftpWarning'] = ftp_result.get('error', 'FTP setup failed')
+                else:
+                    result['ftpEnabled'] = True
             self._send_json({**result, "deviceId": CONFIG.get('deviceId'), "deviceSerial": get_device_serial()})
 
         elif path == '/shinobi/cleanup':
