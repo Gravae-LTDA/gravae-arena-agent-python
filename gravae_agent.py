@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v2.10.5
+Gravae Arena Agent v2.10.6
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.10.5"
+VERSION = "2.10.6"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -129,18 +129,24 @@ def get_gpio_info():
     is_trixie = codename == 'trixie'
 
     if is_pi5:
+        # Pi 5: onoff npm module works with character device
         recommended = "onoff"
         pigpio_works = False
     elif is_trixie or is_bookworm:
-        recommended = "pigpio"
-        pigpio_works = True
+        # Trixie/Bookworm: sysfs GPIO deprecated, npm modules broken
+        # Use gpiomon bash script with libgpiod
+        recommended = "gpiomon"
+        pigpio_works = False
     else:
+        # Bullseye and older: pigpio works reliably
         recommended = "pigpio"
         pigpio_works = True
 
     return {
         "model": get_device_model(),
         "is_pi5": is_pi5,
+        "is_bookworm": is_bookworm,
+        "is_trixie": is_trixie,
         "os_codename": codename,
         "recommended_lib": recommended,
         "pigpio_compatible": pigpio_works
@@ -1703,19 +1709,28 @@ def get_full_discovery():
 def check_button_daemon_deps():
     """Check if dependencies for button daemon are available"""
     issues = []
-
-    result = subprocess.run(['which', 'node'], capture_output=True)
-    if result.returncode != 0:
-        issues.append("Node.js nao esta instalado")
-
-    # Check if GPIO npm module is available locally (not globally)
     gpio_info = get_gpio_info()
+    recommended = gpio_info.get('recommended_lib', 'pigpio')
     daemon_dir = os.path.dirname(_get_button_daemon_path())
-    if gpio_info.get('is_pi5'):
+
+    if recommended == 'gpiomon':
+        # Trixie/Bookworm: check for gpiomon (libgpiod)
+        result = subprocess.run(['which', 'gpiomon'], capture_output=True)
+        if result.returncode != 0:
+            issues.append("gpiomon nao instalado (sudo apt install gpiod)")
+    elif recommended == 'onoff':
+        # Pi 5: check for Node.js and onoff
+        result = subprocess.run(['which', 'node'], capture_output=True)
+        if result.returncode != 0:
+            issues.append("Node.js nao esta instalado")
         onoff_path = os.path.join(daemon_dir, 'node_modules', 'onoff')
         if not os.path.exists(onoff_path):
             issues.append("Biblioteca 'onoff' nao instalada (npm install onoff)")
     else:
+        # Bullseye: check for Node.js and pigpio
+        result = subprocess.run(['which', 'node'], capture_output=True)
+        if result.returncode != 0:
+            issues.append("Node.js nao esta instalado")
         # pigpio npm module does direct hardware access - pigpiod must be STOPPED
         pigpiod_check = subprocess.run(['pgrep', 'pigpiod'], capture_output=True)
         if pigpiod_check.returncode == 0:
@@ -1740,17 +1755,27 @@ def deploy_button_daemon(script_content):
         daemon_dir = os.path.dirname(_get_button_daemon_path())
         os.makedirs(daemon_dir, exist_ok=True)
 
-        # Ensure pigpio npm module is installed (may have failed during background install)
         gpio_info = get_gpio_info()
-        if not gpio_info.get('is_pi5'):
+        recommended = gpio_info.get('recommended_lib', 'pigpio')
+
+        # Determine script path based on type
+        if recommended == 'gpiomon':
+            # Bash script for gpiomon
+            script_path = os.path.join(daemon_dir, 'button-daemon.sh')
+            exec_cmd = script_path
+        else:
+            # Node.js script
+            script_path = _get_button_daemon_path()
+            exec_cmd = f"/usr/bin/node {script_path}"
+
+        # Install npm dependencies if needed (for Node.js scripts)
+        if recommended == 'pigpio':
             pigpio_path = os.path.join(daemon_dir, 'node_modules', 'pigpio')
             if not os.path.exists(pigpio_path):
                 print("[Buttons] pigpio npm module missing, installing...")
-                # Init package.json if needed
                 pkg_json = os.path.join(daemon_dir, 'package.json')
                 if not os.path.exists(pkg_json):
                     subprocess.run(['npm', 'init', '-y'], cwd=daemon_dir, capture_output=True, timeout=10)
-                # Force IPv4 - some Pis have broken IPv6 which causes node-gyp ETIMEDOUT
                 env = os.environ.copy()
                 env['NODE_OPTIONS'] = '--dns-result-order=ipv4first'
                 subprocess.run(['npm', 'config', 'set', 'prefer-ip-version', '4'],
@@ -1766,10 +1791,58 @@ def deploy_button_daemon(script_content):
                         "details": install_result.stderr
                     }
                 print("[Buttons] pigpio npm module installed")
+        elif recommended == 'onoff':
+            onoff_path = os.path.join(daemon_dir, 'node_modules', 'onoff')
+            if not os.path.exists(onoff_path):
+                print("[Buttons] onoff npm module missing, installing...")
+                pkg_json = os.path.join(daemon_dir, 'package.json')
+                if not os.path.exists(pkg_json):
+                    subprocess.run(['npm', 'init', '-y'], cwd=daemon_dir, capture_output=True, timeout=10)
+                install_result = subprocess.run(
+                    ['npm', 'install', 'onoff'],
+                    cwd=daemon_dir, capture_output=True, text=True, timeout=120
+                )
+                if install_result.returncode != 0:
+                    return {
+                        "success": False,
+                        "error": f"Falha ao instalar onoff npm: {install_result.stderr[:200]}",
+                        "details": install_result.stderr
+                    }
+                print("[Buttons] onoff npm module installed")
 
-        with open(_get_button_daemon_path(), 'w') as f:
+        # Write the script
+        with open(script_path, 'w') as f:
             f.write(script_content)
-        os.chmod(_get_button_daemon_path(), 0o755)
+        os.chmod(script_path, 0o755)
+
+        # Update systemd service to use correct exec command
+        # Only kill pigpiod for pigpio (npm library), not needed for gpiomon or onoff
+        exec_start_pre = ""
+        if recommended == 'pigpio':
+            exec_start_pre = 'ExecStartPre=/bin/bash -c "killall pigpiod 2>/dev/null; rm -f /var/run/pigpio.pid; true"\\n'
+
+        daemon_type = "gpiomon" if recommended == 'gpiomon' else "nodejs"
+        service_content = f"""[Unit]
+Description=Gravae Button Daemon ({daemon_type})
+After=network.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+{exec_start_pre}ExecStart={exec_cmd}
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=5
+User=root
+WorkingDirectory={daemon_dir}
+
+[Install]
+WantedBy=multi-user.target
+"""
+        with open('/etc/systemd/system/gravae-buttons.service', 'w') as f:
+            f.write(service_content)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
 
         restart_result = subprocess.run(
             ['systemctl', 'restart', 'gravae-buttons'],
