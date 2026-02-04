@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v2.10.2
+Gravae Arena Agent v2.10.5
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -26,10 +26,9 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.10.2"
+VERSION = "2.10.5"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
-BUTTON_DAEMON_PATH = "/home/Gravae/Documents/Gravae/button-daemon.js"
 AGENT_PATH = "/opt/gravae-agent"
 GITHUB_REPO = "Gravae-LTDA/gravae-arena-agent-python"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/Gravae-LTDA/gravae-arena-agent-python/main"
@@ -57,6 +56,12 @@ def save_config():
         return False
 
 CONFIG = load_config()
+
+def _get_button_daemon_path():
+    user = CONFIG.get('arenaUser', 'gravae')
+    arena_type = CONFIG.get('arenaType', 'gravae')
+    type_name = 'Replayme' if arena_type == 'replayme' else 'Gravae'
+    return f'/home/{user}/Documents/{type_name}/button-daemon.js'
 
 def get_local_ip():
     try:
@@ -94,7 +99,7 @@ def get_device_serial():
 def get_device_model():
     try:
         with open("/proc/device-tree/model", "r") as f:
-            return f.read().strip().replace('\x00', '')
+            return f.read().strip().replace('\\x00', '')
     except:
         pass
     return "Unknown"
@@ -405,12 +410,12 @@ def configure_network_static(interface, ip, prefix, gateway, dns=None):
                     new_lines.append(line)
 
             # Add new static config
-            new_lines.append(f'\ninterface {interface}\n')
-            new_lines.append(f'static ip_address={ip}/{prefix}\n')
-            new_lines.append(f'static routers={gateway}\n')
+            new_lines.append(f'\\ninterface {interface}\\n')
+            new_lines.append(f'static ip_address={ip}/{prefix}\\n')
+            new_lines.append(f'static routers={gateway}\\n')
             if dns:
                 dns_str = ' '.join(dns) if isinstance(dns, list) else dns
-                new_lines.append(f'static domain_name_servers={dns_str}\n')
+                new_lines.append(f'static domain_name_servers={dns_str}\\n')
 
             # Write config
             with open('/tmp/dhcpcd.conf.new', 'w') as f:
@@ -530,9 +535,9 @@ def add_network_alias(interface, ip, prefix, label=None):
             config_path = '/etc/dhcpcd.conf'
             try:
                 with open(config_path, 'a') as f:
-                    f.write(f'\n# IP alias for {label}\n')
-                    f.write(f'interface {interface}\n')
-                    f.write(f'static ip_address={ip}/{prefix}\n')
+                    f.write(f'\\n# IP alias for {label}\\n')
+                    f.write(f'interface {interface}\\n')
+                    f.write(f'static ip_address={ip}/{prefix}\\n')
                 persistent_note = "Alias added to dhcpcd.conf for persistence"
             except:
                 persistent_note = "Note: Could not make alias persistent in dhcpcd.conf"
@@ -971,6 +976,59 @@ def create_api_key_in_db(group_key, user_id):
 
     return None
 
+def list_shinobi_accounts():
+    """List all Shinobi user accounts from database"""
+    db_config = get_shinobi_db_config()
+    if not db_config:
+        return {"success": False, "error": "Could not read Shinobi database config"}
+
+    try:
+        sql = "SELECT ke, uid, mail FROM Users;"
+        result = subprocess.run([
+            'mysql', '-N', '-B',
+            '-u', db_config.get('user', 'majesticflame'),
+            f"-p{db_config.get('password', '')}",
+            '-h', db_config.get('host', 'localhost'),
+            db_config.get('database', 'ccio'),
+            '-e', sql
+        ], capture_output=True, text=True, timeout=10)
+
+        if result.returncode != 0:
+            return {"success": False, "error": f"DB query failed: {result.stderr.strip()}"}
+
+        accounts = []
+        for line in result.stdout.strip().split('\\n'):
+            if not line.strip():
+                continue
+            parts = line.split('\\t')
+            if len(parts) < 3:
+                continue
+            ke, uid, mail = parts[0], parts[1], parts[2]
+
+            # Get API key for this user
+            api_sql = f"SELECT code FROM API WHERE ke='{ke}' AND uid='{uid}' LIMIT 1;"
+            api_result = subprocess.run([
+                'mysql', '-N', '-B',
+                '-u', db_config.get('user', 'majesticflame'),
+                f"-p{db_config.get('password', '')}",
+                '-h', db_config.get('host', 'localhost'),
+                db_config.get('database', 'ccio'),
+                '-e', api_sql
+            ], capture_output=True, text=True, timeout=10)
+
+            api_key = api_result.stdout.strip() if api_result.returncode == 0 else None
+
+            accounts.append({
+                "groupKey": ke,
+                "userId": uid,
+                "email": mail,
+                "apiKey": api_key if api_key else None
+            })
+
+        return {"success": True, "accounts": accounts}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 def create_shinobi_user_in_db(group_key, user_id, email, password):
     """Create Shinobi user directly in database"""
     db_config = get_shinobi_db_config()
@@ -1002,7 +1060,7 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
         ], capture_output=True, text=True, timeout=10)
 
         if check_result.stdout.strip():
-            parts = check_result.stdout.strip().split('\t')
+            parts = check_result.stdout.strip().split('\\t')
             existing_ke = parts[0] if len(parts) > 0 else ''
             existing_uid = parts[1] if len(parts) > 1 else ''
             print(f"[Shinobi DB] User exists: ke={existing_ke}, uid={existing_uid}")
@@ -1095,7 +1153,7 @@ def setup_ftp_events():
             pgrep = subprocess.run(['pgrep', '-f', 'botao.py'],
                 capture_output=True, text=True, timeout=5)
             if pgrep.returncode != 0:
-                # botao.py was not running, try to restart it
+                # botao.py was running but died, try to restart it
                 botao_path = '/home/Gravae/botao.py'
                 if os.path.exists(botao_path):
                     subprocess.Popen(['python3', botao_path],
@@ -1341,7 +1399,7 @@ def setup_quick_tunnel():
             time.sleep(1)
             try:
                 with open('/tmp/cf_shinobi.log', 'r') as f:
-                    match = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', f.read())
+                    match = re.search(r'https://[a-z0-9-]+\\.trycloudflare\\.com', f.read())
                     if match:
                         shinobi_url = match.group(0)
                         break
@@ -1357,7 +1415,7 @@ def setup_quick_tunnel():
             time.sleep(1)
             try:
                 with open('/tmp/cf_agent.log', 'r') as f:
-                    match = re.search(r'https://[a-z0-9-]+\.trycloudflare\.com', f.read())
+                    match = re.search(r'https://[a-z0-9-]+\\.trycloudflare\\.com', f.read())
                     if match:
                         agent_url = match.group(0)
                         break
@@ -1583,7 +1641,7 @@ def get_shinobi_info():
 
             if result.returncode == 0 and result.stdout.strip():
                 for line in result.stdout.strip().splitlines():
-                    parts = line.split('\t')
+                    parts = line.split('\\t')
                     if len(parts) >= 2:
                         monitor = {"mid": parts[0], "name": parts[1]}
                         if len(parts) >= 3:
@@ -1650,15 +1708,22 @@ def check_button_daemon_deps():
     if result.returncode != 0:
         issues.append("Node.js nao esta instalado")
 
+    # Check if GPIO npm module is available locally (not globally)
     gpio_info = get_gpio_info()
+    daemon_dir = os.path.dirname(_get_button_daemon_path())
     if gpio_info.get('is_pi5'):
-        onoff_check = subprocess.run(['npm', 'list', '-g', 'onoff'], capture_output=True)
-        if onoff_check.returncode != 0:
-            issues.append("Biblioteca 'onoff' nao instalada (npm install -g onoff)")
+        onoff_path = os.path.join(daemon_dir, 'node_modules', 'onoff')
+        if not os.path.exists(onoff_path):
+            issues.append("Biblioteca 'onoff' nao instalada (npm install onoff)")
     else:
+        # pigpio npm module does direct hardware access - pigpiod must be STOPPED
         pigpiod_check = subprocess.run(['pgrep', 'pigpiod'], capture_output=True)
-        if pigpiod_check.returncode != 0:
-            issues.append("pigpiod nao esta rodando (sudo pigpiod)")
+        if pigpiod_check.returncode == 0:
+            subprocess.run(['sudo', 'killall', 'pigpiod'], capture_output=True)
+            subprocess.run(['sudo', 'rm', '-f', '/var/run/pigpio.pid'], capture_output=True)
+        pigpio_path = os.path.join(daemon_dir, 'node_modules', 'pigpio')
+        if not os.path.exists(pigpio_path):
+            issues.append("Biblioteca 'pigpio' nao instalada (npm install pigpio)")
 
     return issues
 
@@ -1672,10 +1737,39 @@ def deploy_button_daemon(script_content):
                 "dependencies": dep_issues
             }
 
-        os.makedirs(os.path.dirname(BUTTON_DAEMON_PATH), exist_ok=True)
-        with open(BUTTON_DAEMON_PATH, 'w') as f:
+        daemon_dir = os.path.dirname(_get_button_daemon_path())
+        os.makedirs(daemon_dir, exist_ok=True)
+
+        # Ensure pigpio npm module is installed (may have failed during background install)
+        gpio_info = get_gpio_info()
+        if not gpio_info.get('is_pi5'):
+            pigpio_path = os.path.join(daemon_dir, 'node_modules', 'pigpio')
+            if not os.path.exists(pigpio_path):
+                print("[Buttons] pigpio npm module missing, installing...")
+                # Init package.json if needed
+                pkg_json = os.path.join(daemon_dir, 'package.json')
+                if not os.path.exists(pkg_json):
+                    subprocess.run(['npm', 'init', '-y'], cwd=daemon_dir, capture_output=True, timeout=10)
+                # Force IPv4 - some Pis have broken IPv6 which causes node-gyp ETIMEDOUT
+                env = os.environ.copy()
+                env['NODE_OPTIONS'] = '--dns-result-order=ipv4first'
+                subprocess.run(['npm', 'config', 'set', 'prefer-ip-version', '4'],
+                    cwd=daemon_dir, capture_output=True, timeout=10)
+                install_result = subprocess.run(
+                    ['npm', 'install', 'pigpio'],
+                    cwd=daemon_dir, capture_output=True, text=True, timeout=120, env=env
+                )
+                if install_result.returncode != 0:
+                    return {
+                        "success": False,
+                        "error": f"Falha ao instalar pigpio npm: {install_result.stderr[:200]}",
+                        "details": install_result.stderr
+                    }
+                print("[Buttons] pigpio npm module installed")
+
+        with open(_get_button_daemon_path(), 'w') as f:
             f.write(script_content)
-        os.chmod(BUTTON_DAEMON_PATH, 0o755)
+        os.chmod(_get_button_daemon_path(), 0o755)
 
         restart_result = subprocess.run(
             ['systemctl', 'restart', 'gravae-buttons'],
@@ -1749,8 +1843,8 @@ def cleanup_arena(options=None):
         try:
             subprocess.run(['systemctl', 'stop', 'gravae-buttons'], capture_output=True)
             subprocess.run(['systemctl', 'disable', 'gravae-buttons'], capture_output=True)
-            if os.path.exists(BUTTON_DAEMON_PATH):
-                os.remove(BUTTON_DAEMON_PATH)
+            if os.path.exists(_get_button_daemon_path()):
+                os.remove(_get_button_daemon_path())
             results["buttons"] = "cleaned"
         except Exception as e:
             errors.append(f"buttons: {str(e)}")
@@ -1758,7 +1852,7 @@ def cleanup_arena(options=None):
 
     if options.get('logs', True):
         try:
-            log_dir = os.path.dirname(BUTTON_DAEMON_PATH) + '/logs'
+            log_dir = os.path.dirname(_get_button_daemon_path()) + '/logs'
             if os.path.exists(log_dir):
                 import shutil
                 shutil.rmtree(log_dir)
@@ -1964,7 +2058,7 @@ def phoenix_disable():
     try:
         os.makedirs("/etc/gravae", exist_ok=True)
         with open("/etc/gravae/no_reboot", "w") as f:
-            f.write(f"Phoenix disabled via agent at {datetime.now().isoformat()}\n")
+            f.write(f"Phoenix disabled via agent at {datetime.now().isoformat()}\\n")
         result["killSwitch"] = True
     except Exception as e:
         result["errors"].append(f"Failed to create kill switch: {e}")
@@ -2276,6 +2370,26 @@ class AgentHandler(BaseHTTPRequestHandler):
             threading.Thread(target=perform_update, daemon=True).start()
             self._send_json({"success": True, "message": "Update started"})
 
+        elif path == '/update/push':
+            # Accept script content directly from platform (bypasses GITHUB_RAW_URL)
+            script = data.get('script', '')
+            filename = data.get('filename', 'gravae_agent.py')
+            if not script:
+                self._send_json({"success": False, "error": "Script content required"}, 400)
+                return
+            try:
+                import tempfile
+                target_path = os.path.join(AGENT_PATH, filename)
+                with tempfile.NamedTemporaryFile(mode='w', suffix=f'_{filename}', delete=False) as f:
+                    temp_path = f.name
+                    f.write(script)
+                subprocess.run(['sudo', 'cp', temp_path, target_path], check=True)
+                subprocess.run(['sudo', 'chmod', '+x', target_path], check=True)
+                os.unlink(temp_path)
+                self._send_json({"success": True, "message": f"{filename} updated"})
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)})
+
         elif path == '/update/restart':
             self._send_json({"success": True, "message": "Restarting..."})
             threading.Thread(target=lambda: (time.sleep(1), restart_agent()), daemon=True).start()
@@ -2541,7 +2655,8 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/phoenix/status': get_phoenix_status,
             '/phoenix/alerts': get_phoenix_alerts,
             '/phoenix/logs': get_phoenix_logs,
-            '/phoenix/buttons': get_button_history
+            '/phoenix/buttons': get_button_history,
+            '/shinobi/accounts': list_shinobi_accounts
         }
         if path in routes:
             self._send_json(routes[path]())
