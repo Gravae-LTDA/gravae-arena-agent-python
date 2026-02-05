@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phoenix Daemon v1.4.0
+Phoenix Daemon v1.5.0
 Self-healing module for Gravae Arena Agent
 
 Features:
@@ -26,7 +26,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -1065,40 +1065,68 @@ def check_boot_report():
 
 # === Hardware Watchdog ===
 class HardwareWatchdog:
+    """Hardware watchdog that pings /dev/watchdog in a dedicated thread.
+
+    CRITICAL: The RPi hardware watchdog has a ~15 second timeout.
+    If /dev/watchdog is opened but not pinged within 15s, the hardware
+    does a hard reset. The ping MUST run in a separate thread because
+    the main Phoenix loop can block for 30+ seconds (service restarts,
+    connectivity checks, sleep intervals).
+    """
     def __init__(self):
         self.enabled = False
         self.device = None
+        self._thread = None
+        self._stop_event = threading.Event()
 
     def enable(self):
-        """Enable hardware watchdog"""
+        """Enable hardware watchdog with dedicated ping thread"""
         try:
-            # Try to open watchdog device
             self.device = open("/dev/watchdog", "w")
             self.enabled = True
-            log.info("Hardware watchdog enabled")
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._ping_loop, daemon=True, name="watchdog-ping"
+            )
+            self._thread.start()
+            log.info("Hardware watchdog enabled (ping thread started)")
             return True
         except Exception as e:
             log.debug(f"Hardware watchdog not available: {e}")
             return False
 
-    def ping(self):
-        """Keep watchdog alive"""
-        if self.enabled and self.device:
+    def _ping_loop(self):
+        """Dedicated thread that pings the watchdog every 5 seconds.
+        Runs as daemon thread so it dies if the main process dies."""
+        while not self._stop_event.is_set():
             try:
-                self.device.write("1")
-                self.device.flush()
-            except:
-                pass
+                if self.device:
+                    self.device.write("1")
+                    self.device.flush()
+            except Exception:
+                log.error("Watchdog ping failed, disabling watchdog")
+                self.enabled = False
+                break
+            self._stop_event.wait(5)  # Ping every 5s (well within 15s timeout)
+
+    def ping(self):
+        """No-op: pinging is now handled by the dedicated thread.
+        Kept for API compatibility."""
+        pass
 
     def disable(self):
         """Disable watchdog (write V to disable)"""
+        self._stop_event.set()
         if self.enabled and self.device:
             try:
                 self.device.write("V")
                 self.device.close()
                 self.enabled = False
+                log.info("Hardware watchdog disabled")
             except:
                 pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
 
 # === Main Phoenix Daemon ===
 class PhoenixDaemon:
