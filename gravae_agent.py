@@ -2010,6 +2010,8 @@ def deploy_button_daemon(script_content):
         # Only kill pigpiod for pigpio (npm library), not needed for gpiomon or onoff
         if recommended == 'pigpio':
             service_lines.append('ExecStartPre=/bin/bash -c "killall pigpiod 2>/dev/null; rm -f /var/run/pigpio.pid; true"')
+            # pigpio uses port 8888 by default which conflicts with gravae-agent
+            service_lines.append("Environment=PIGPIO_PORT=8889")
         service_lines.extend([
             f"ExecStart={exec_cmd}",
             "Restart=on-failure",
