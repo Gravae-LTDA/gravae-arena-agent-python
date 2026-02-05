@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.10.6"
+VERSION = "2.10.7"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -1172,7 +1172,105 @@ def setup_ftp_events():
 
     return {"success": True}
 
+def ensure_super_admin_token():
+    """Ensure super.json has the correct password hash and a valid token.
+
+    Fixes:
+    - super.json might have md5 hash while Shinobi uses sha256 (or vice versa)
+    - super.json might not have a tokens array
+
+    Returns the super admin token or None.
+    """
+    import string
+    import random
+    import hashlib
+
+    super_paths = ['/home/Shinobi/super.json', '/opt/shinobi/super.json']
+    super_path = None
+    super_data = None
+
+    for path in super_paths:
+        try:
+            with open(path, 'r') as f:
+                super_data = json.load(f)
+                super_path = path
+                break
+        except:
+            continue
+
+    if not super_data or not super_path:
+        print("[Shinobi Super] super.json not found")
+        return None
+
+    # Handle array format: [{"mail": "...", "pass": "...", "tokens": [...]}]
+    if isinstance(super_data, list) and len(super_data) > 0:
+        entry = super_data[0]
+    elif isinstance(super_data, dict):
+        # Old object format - convert to array
+        first_key = list(super_data.keys())[0] if super_data else None
+        if first_key and isinstance(super_data[first_key], dict):
+            entry = super_data[first_key]
+            entry.setdefault('mail', 'admin@shinobi.video')
+        else:
+            entry = {"mail": "admin@shinobi.video", "pass": ""}
+        super_data = [entry]
+    else:
+        print("[Shinobi Super] super.json format not recognized")
+        return None
+
+    modified = False
+
+    # Fix password hash to match Shinobi's configured algorithm
+    conf = get_shinobi_config()
+    if conf:
+        password_type = conf.get('passwordType', 'md5').lower()
+        current_hash = entry.get('pass', '')
+        # Default super admin password is "admin"
+        expected_hashes = {
+            'md5': hashlib.md5(b'admin').hexdigest(),
+            'sha256': hashlib.sha256(b'admin').hexdigest(),
+        }
+        correct_hash = expected_hashes.get(password_type, expected_hashes['md5'])
+
+        # If the current hash matches any known "admin" hash but not the correct one, fix it
+        if current_hash in expected_hashes.values() and current_hash != correct_hash:
+            print(f"[Shinobi Super] Fixing password hash from {password_type} (was wrong type)")
+            entry['pass'] = correct_hash
+            modified = True
+
+    # Ensure tokens array exists with at least one token
+    tokens = entry.get('tokens', [])
+    if isinstance(tokens, dict):
+        tokens = list(tokens.keys())
+    if not tokens:
+        token = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(40))
+        entry['tokens'] = [token]
+        modified = True
+        print(f"[Shinobi Super] Generated super admin token")
+    else:
+        token = tokens[0] if isinstance(tokens, list) else list(tokens)[0]
+
+    if modified:
+        try:
+            with open(super_path, 'w') as f:
+                json.dump(super_data, f, indent=2)
+            print(f"[Shinobi Super] Updated {super_path}")
+        except Exception as e:
+            print(f"[Shinobi Super] Failed to write {super_path}: {e}")
+
+    return token
+
+
 def setup_shinobi_account(group_key, email, password):
+    """Setup Shinobi account using the super admin API.
+
+    Flow:
+    1. Ensure super admin token exists in super.json
+    2. Create account via /super/<token>/accounts/registerAdmin (Shinobi recognizes immediately)
+    3. Login as the new user to get a session token
+    4. Create API key via Shinobi's API endpoint (so it shows in UI)
+    5. Fallback to DB direct if API methods fail
+    """
     import string
     import random
 
@@ -1185,71 +1283,132 @@ def setup_shinobi_account(group_key, email, password):
     if not password:
         return {"success": False, "error": "Password is required"}
 
-    user_id = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(6))
+    # Step 1: Ensure super admin token
+    super_token = ensure_super_admin_token()
+    if not super_token:
+        super_token = get_shinobi_super_key()
+    print(f"[Shinobi Setup] Super token: {'found' if super_token else 'NOT FOUND'}")
 
-    print(f"[Shinobi Setup] Creating user in database...")
-    db_result = create_shinobi_user_in_db(group_key, user_id, email, password)
+    # Step 2: Create account via super admin API (preferred - immediate recognition)
+    account_existed = False
+    actual_uid = None
 
-    if not db_result.get('success'):
-        return db_result
+    if super_token:
+        register_url = f"http://localhost:8080/super/{super_token}/accounts/registerAdmin"
+        register_data = json.dumps({
+            "mail": email,
+            "pass": password,
+            "pass_again": password,
+            "ke": group_key,
+            "details": {
+                "factorAuth": "0",
+                "size": "10000",
+                "days": "5",
+                "event_days": "10",
+                "log_days": "10",
+                "max_camera": "20",
+                "permissions": "all",
+                "use_admin": "1"
+            }
+        }).encode()
 
-    actual_uid = db_result.get('uid', user_id)
-    account_existed = db_result.get('existed', False)
+        try:
+            req = urllib.request.Request(register_url, data=register_data, headers={'Content-Type': 'application/json'})
+            response = urllib.request.urlopen(req, timeout=30)
+            result = json.loads(response.read().decode())
+            print(f"[Shinobi Setup] registerAdmin response: ok={result.get('ok')}, msg={result.get('msg', '')}")
 
-    print(f"[Shinobi Setup] User {'exists' if account_existed else 'created'}: uid={actual_uid}")
+            if result.get('ok'):
+                user_info = result.get('user', {})
+                actual_uid = user_info.get('uid', '')
+                print(f"[Shinobi Setup] Account created via super API: uid={actual_uid}")
+            elif 'already exists' in str(result.get('msg', '')).lower() or 'in use' in str(result.get('msg', '')).lower():
+                account_existed = True
+                print(f"[Shinobi Setup] Account already exists (email in use)")
+            elif 'key exists' in str(result.get('msg', '')).lower():
+                account_existed = True
+                print(f"[Shinobi Setup] Account already exists (group key in use)")
+            else:
+                print(f"[Shinobi Setup] registerAdmin failed: {result.get('msg')}")
+        except Exception as e:
+            print(f"[Shinobi Setup] registerAdmin exception: {e}")
 
+    # Fallback: create via DB if super API failed and account doesn't exist
+    if not actual_uid and not account_existed:
+        print(f"[Shinobi Setup] Falling back to DB direct creation...")
+        user_id = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(6))
+        db_result = create_shinobi_user_in_db(group_key, user_id, email, password)
+        if not db_result.get('success'):
+            return db_result
+        actual_uid = db_result.get('uid', user_id)
+        account_existed = db_result.get('existed', False)
+
+    # Step 3: Login as user (with retry for newly created accounts)
     login_url = "http://localhost:8080/?json=true"
     login_data = json.dumps({"mail": email, "pass": password, "machineID": "gravae-agent"}).encode()
 
     verified_user_id = None
     verified_group_key = None
     session_token = None
+    login_error = None
 
-    try:
-        req = urllib.request.Request(login_url, data=login_data, headers={'Content-Type': 'application/json'})
-        response = urllib.request.urlopen(req, timeout=30)
-        result = json.loads(response.read().decode())
-        print(f"[Shinobi Setup] Login response keys: {list(result.keys())}")
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                time.sleep(2)
+                print(f"[Shinobi Setup] Login retry {attempt + 1}/3...")
 
-        user_data = result.get('$user', {})
-        verified_user_id = user_data.get('uid', '')
-        verified_group_key = user_data.get('ke', '')
-        session_token = user_data.get('auth_token', '')
+            req = urllib.request.Request(login_url, data=login_data, headers={'Content-Type': 'application/json'})
+            response = urllib.request.urlopen(req, timeout=30)
+            result = json.loads(response.read().decode())
 
-        print(f"[Shinobi Setup] Verified - uid: {verified_user_id}, ke: {verified_group_key}")
+            if not result.get('ok', True):
+                login_error = "Login returned ok=false"
+                continue
 
-        if verified_group_key and verified_group_key != group_key:
-            return {
-                "success": False,
-                "error": f"Account exists with different group_key ({verified_group_key}). Please use group_key '{verified_group_key}' or create account with different email.",
-                "existingGroupKey": verified_group_key
-            }
+            user_data = result.get('$user', {})
+            verified_user_id = user_data.get('uid', '')
+            verified_group_key = user_data.get('ke', '')
+            session_token = user_data.get('auth_token', '')
 
-        if not verified_user_id:
-            return {"success": False, "error": "Login succeeded but could not get user ID"}
+            if verified_user_id:
+                print(f"[Shinobi Setup] Login OK - uid: {verified_user_id}, ke: {verified_group_key}")
+                break
+            else:
+                login_error = "Login response missing user ID"
 
-    except Exception as e:
+        except Exception as e:
+            login_error = str(e)
+            print(f"[Shinobi Setup] Login attempt {attempt + 1} failed: {e}")
+
+    if not verified_user_id:
         if account_existed:
-            return {"success": False, "error": f"Account exists but login failed - wrong password? Error: {str(e)}"}
-        return {"success": False, "error": f"Login failed after account creation: {str(e)}"}
+            return {"success": False, "error": f"Account exists but login failed - wrong password? Error: {login_error}"}
+        return {"success": False, "error": f"Login failed after account creation: {login_error}"}
 
-    api_key = create_api_key_in_db(group_key, verified_user_id)
-    if api_key:
-        status_msg = "verified (existing)" if account_existed else "created"
+    if verified_group_key and verified_group_key != group_key:
         return {
-            "success": True,
-            "groupKey": group_key,
-            "apiKey": api_key,
-            "userId": verified_user_id,
-            "message": f"Account {status_msg}, API key generated"
+            "success": False,
+            "error": f"Account exists with different group_key ({verified_group_key}). Use '{verified_group_key}' or different email.",
+            "existingGroupKey": verified_group_key
         }
 
+    # Step 4: Create API key via Shinobi's API (shows in UI)
+    api_key = None
+
     if session_token:
-        api_add_url = f"http://localhost:8080/{session_token}/api/{group_key}/add"
+        api_add_url = f"http://localhost:8080/{session_token}/api/{verified_group_key}/add"
         api_data = json.dumps({
             "data": {
                 "ip": "0.0.0.0",
-                "details": {"auth_socket": "1", "get_monitors": "1", "control_monitors": "1", "get_logs": "1", "watch_stream": "1", "watch_snapshot": "1", "watch_videos": "1", "delete_videos": "1", "view_monitor": "1", "edit_monitor": "1", "view_events": "1", "delete_events": "1", "monitor_create": "1", "monitor_edit": "1", "monitor_delete": "1", "video_delete": "1", "event_delete": "1", "log_view": "1"}
+                "details": {
+                    "auth_socket": "1", "get_monitors": "1", "control_monitors": "1",
+                    "get_logs": "1", "watch_stream": "1", "watch_snapshot": "1",
+                    "watch_videos": "1", "delete_videos": "1", "view_monitor": "1",
+                    "edit_monitor": "1", "view_events": "1", "delete_events": "1",
+                    "monitor_create": "1", "monitor_edit": "1", "monitor_delete": "1",
+                    "video_delete": "1", "event_delete": "1", "log_view": "1"
+                }
             }
         }).encode()
 
@@ -1259,15 +1418,36 @@ def setup_shinobi_account(group_key, email, password):
             result = json.loads(response.read().decode())
             api_key = result.get('api', {}).get('code', '') or result.get('key', '') or result.get('code', '')
             if api_key:
-                return {"success": True, "groupKey": group_key, "apiKey": api_key, "userId": verified_user_id}
+                print(f"[Shinobi Setup] API key created via Shinobi API: {api_key[:8]}...")
         except Exception as e:
-            print(f"[Shinobi Setup] API key creation via endpoint failed: {e}")
+            print(f"[Shinobi Setup] API key via Shinobi API failed: {e}")
 
+    # Fallback: create API key directly in DB
+    if not api_key:
+        print("[Shinobi Setup] Falling back to DB API key creation...")
+        api_key = create_api_key_in_db(verified_group_key, verified_user_id)
+        if api_key:
+            print(f"[Shinobi Setup] API key created via DB: {api_key[:8]}...")
+
+    if api_key:
+        status_msg = "verified (existing)" if account_existed else "created"
         return {
             "success": True,
-            "groupKey": group_key,
+            "groupKey": verified_group_key or group_key,
+            "apiKey": api_key,
+            "userId": verified_user_id,
+            "superToken": super_token,
+            "message": f"Account {status_msg}, API key generated"
+        }
+
+    # Last resort: use session token as temporary API key
+    if session_token:
+        return {
+            "success": True,
+            "groupKey": verified_group_key or group_key,
             "apiKey": session_token,
             "userId": verified_user_id,
+            "superToken": super_token,
             "warning": "Using session token (temporary, expires in 15min)"
         }
 
