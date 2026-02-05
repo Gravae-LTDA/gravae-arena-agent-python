@@ -1816,30 +1816,33 @@ def deploy_button_daemon(script_content):
         os.chmod(script_path, 0o755)
 
         # Update systemd service to use correct exec command
-        # Only kill pigpiod for pigpio (npm library), not needed for gpiomon or onoff
-        exec_start_pre = ""
-        if recommended == 'pigpio':
-            exec_start_pre = 'ExecStartPre=/bin/bash -c "killall pigpiod 2>/dev/null; rm -f /var/run/pigpio.pid; true"\\n'
-
         daemon_type = "gpiomon" if recommended == 'gpiomon' else "nodejs"
-        service_content = f"""[Unit]
-Description=Gravae Button Daemon ({daemon_type})
-After=network.target
-StartLimitIntervalSec=120
-StartLimitBurst=5
-
-[Service]
-Type=simple
-{exec_start_pre}ExecStart={exec_cmd}
-Restart=on-failure
-RestartSec=15
-TimeoutStopSec=5
-User=root
-WorkingDirectory={daemon_dir}
-
-[Install]
-WantedBy=multi-user.target
-"""
+        service_lines = [
+            "[Unit]",
+            f"Description=Gravae Button Daemon ({daemon_type})",
+            "After=network.target",
+            "StartLimitIntervalSec=120",
+            "StartLimitBurst=5",
+            "",
+            "[Service]",
+            "Type=simple",
+        ]
+        # Only kill pigpiod for pigpio (npm library), not needed for gpiomon or onoff
+        if recommended == 'pigpio':
+            service_lines.append('ExecStartPre=/bin/bash -c "killall pigpiod 2>/dev/null; rm -f /var/run/pigpio.pid; true"')
+        service_lines.extend([
+            f"ExecStart={exec_cmd}",
+            "Restart=on-failure",
+            "RestartSec=15",
+            "TimeoutStopSec=5",
+            "User=root",
+            f"WorkingDirectory={daemon_dir}",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+            "",
+        ])
+        service_content = "\n".join(service_lines)
         with open('/etc/systemd/system/gravae-buttons.service', 'w') as f:
             f.write(service_content)
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
