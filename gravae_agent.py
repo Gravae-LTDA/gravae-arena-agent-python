@@ -1003,10 +1003,10 @@ def list_shinobi_accounts():
             return {"success": False, "error": f"DB query failed: {result.stderr.strip()}"}
 
         accounts = []
-        for line in result.stdout.strip().split('\\n'):
+        for line in result.stdout.strip().split('\n'):
             if not line.strip():
                 continue
-            parts = line.split('\\t')
+            parts = line.split('\t')
             if len(parts) < 3:
                 continue
             ke, uid, mail = parts[0], parts[1], parts[2]
@@ -1066,7 +1066,7 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
         ], capture_output=True, text=True, timeout=10)
 
         if check_result.stdout.strip():
-            parts = check_result.stdout.strip().split('\\t')
+            parts = check_result.stdout.strip().split('\t')
             existing_ke = parts[0] if len(parts) > 0 else ''
             existing_uid = parts[1] if len(parts) > 1 else ''
             print(f"[Shinobi DB] User exists: ke={existing_ke}, uid={existing_uid}")
@@ -1827,7 +1827,7 @@ def get_shinobi_info():
 
             if result.returncode == 0 and result.stdout.strip():
                 for line in result.stdout.strip().splitlines():
-                    parts = line.split('\\t')
+                    parts = line.split('\t')
                     if len(parts) >= 2:
                         monitor = {"mid": parts[0], "name": parts[1]}
                         if len(parts) >= 3:
