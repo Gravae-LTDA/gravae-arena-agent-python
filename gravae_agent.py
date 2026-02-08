@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v2.10.6
+Gravae Arena Agent v2.10.8
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.10.7"
+VERSION = "2.10.8"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -726,14 +726,29 @@ def perform_update():
     try:
         update_status = {"status": "downloading", "progress": 10, "message": "Verificando repositorio...", "error": None}
         if os.path.exists(os.path.join(AGENT_PATH, '.git')):
-            update_status = {"status": "downloading", "progress": 30, "message": "Git pull...", "error": None}
-            subprocess.run(['git', 'fetch', 'origin'], cwd=AGENT_PATH, capture_output=True)
-            subprocess.run(['git', 'pull', 'origin', 'main'], cwd=AGENT_PATH, capture_output=True)
-            return _restart_services()
+            update_status = {"status": "downloading", "progress": 20, "message": "Git pull...", "error": None}
+            subprocess.run(['git', 'reset', '--hard', 'HEAD'], cwd=AGENT_PATH, capture_output=True, timeout=10)
+            subprocess.run(['git', 'clean', '-fd'], cwd=AGENT_PATH, capture_output=True, timeout=10)
+            fetch_result = subprocess.run(['git', 'fetch', 'origin'], cwd=AGENT_PATH, capture_output=True, text=True, timeout=30)
+            pull_result = subprocess.run(['git', 'pull', 'origin', 'main'], cwd=AGENT_PATH, capture_output=True, text=True, timeout=30)
+            print(f"[Update] git fetch rc={fetch_result.returncode} git pull rc={pull_result.returncode}")
+            print(f"[Update] pull stdout: {pull_result.stdout.strip()}")
+            if pull_result.stderr.strip():
+                print(f"[Update] pull stderr: {pull_result.stderr.strip()}")
+            if pull_result.returncode == 0:
+                return _restart_services()
+            else:
+                print(f"[Update] Git pull failed, falling back to direct download")
+                update_status = {"status": "downloading", "progress": 25, "message": "Git falhou, baixando direto...", "error": None}
+                return _perform_update_direct()
         else:
             return _perform_update_direct()
     except Exception as e:
-        update_status = {"status": "error", "progress": 0, "message": "Erro", "error": str(e)}
+        print(f"[Update] Error: {e}, falling back to direct download")
+        try:
+            return _perform_update_direct()
+        except Exception as e2:
+            update_status = {"status": "error", "progress": 0, "message": "Erro", "error": str(e2)}
 
 def _perform_update_direct():
     """Download files directly from GitHub raw"""
@@ -2567,6 +2582,86 @@ def get_button_history():
     button_presses.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     return {"buttonPresses": button_presses[:30]}
 
+# === Camera Discovery ===
+def discover_cameras():
+    """Discover Hikvision (SADP) and Dahua/Intelbras cameras on the local network."""
+    from xml.etree import ElementTree
+
+    results = []
+    seen = set()
+
+    # Hikvision SADP - multicast 239.255.255.250:37020
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.settimeout(5)
+        s.bind(('', 37020))
+        mreq = struct.pack('4sL', socket.inet_aton('239.255.255.250'), socket.INADDR_ANY)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        probe = '<?xml version="1.0" encoding="utf-8"?><Probe><Uuid>' + str(uuid.uuid4()) + '</Uuid><Types>inquiry</Types></Probe>'
+        s.sendto(probe.encode(), ('239.255.255.250', 37020))
+        while True:
+            try:
+                data, addr = s.recvfrom(4096)
+                root = ElementTree.fromstring(data.decode(errors='ignore'))
+                ip = root.findtext('IPv4Address', '')
+                if ip and ip not in seen:
+                    seen.add(ip)
+                    results.append({
+                        'ip': ip,
+                        'brand': 'Hikvision',
+                        'model': root.findtext('DeviceDescription', ''),
+                        'mac': root.findtext('MAC', '')
+                    })
+            except socket.timeout:
+                break
+            except:
+                continue
+        s.close()
+    except Exception as e:
+        print(f"[CameraDiscovery] SADP error: {e}")
+
+    # Dahua/Intelbras - broadcast 255.255.255.255:37810
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.settimeout(5)
+        s.bind(('', 0))
+        header = struct.pack('<IIIIII', 0x20000000, 0x03, 0, 0, 0, 0)
+        s.sendto(header, ('255.255.255.255', 37810))
+        while True:
+            try:
+                data, addr = s.recvfrom(4096)
+                ip = addr[0]
+                if ip not in seen and not ip.startswith('127.'):
+                    seen.add(ip)
+                    model = ''
+                    mac = ''
+                    try:
+                        payload = data[32:].decode(errors='ignore')
+                        if '{' in payload:
+                            info = json.loads(payload[payload.index('{'):])
+                            model = info.get('DeviceType', '')
+                            mac = info.get('MAC', info.get('Mac', ''))
+                    except:
+                        pass
+                    results.append({
+                        'ip': ip,
+                        'brand': 'Dahua/Intelbras',
+                        'model': model,
+                        'mac': mac
+                    })
+            except socket.timeout:
+                break
+            except:
+                continue
+        s.close()
+    except Exception as e:
+        print(f"[CameraDiscovery] Dahua error: {e}")
+
+    print(f"[CameraDiscovery] Found {len(results)} cameras")
+    return {"success": True, "cameras": results}
+
 # === HTTP Handler ===
 class AgentHandler(BaseHTTPRequestHandler):
     def _send_json(self, data, status=200):
@@ -2914,7 +3009,8 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/phoenix/alerts': get_phoenix_alerts,
             '/phoenix/logs': get_phoenix_logs,
             '/phoenix/buttons': get_button_history,
-            '/shinobi/accounts': list_shinobi_accounts
+            '/shinobi/accounts': list_shinobi_accounts,
+            '/cameras/discover': discover_cameras
         }
         if path in routes:
             self._send_json(routes[path]())
