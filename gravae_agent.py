@@ -2584,7 +2584,7 @@ def get_button_history():
 
 # === Camera Discovery ===
 def discover_cameras():
-    """Discover cameras on the local network using ONVIF WS-Discovery, Hikvision SADP, and Dahua/Intelbras DHIP."""
+    """Discover cameras on the local network using Hikvision SADP, Dahua/Intelbras DHIP, and ONVIF WS-Discovery."""
     import re
     from xml.etree import ElementTree
 
@@ -2601,103 +2601,7 @@ def discover_cameras():
     except:
         pass
 
-    # 1. ONVIF WS-Discovery - multicast 239.255.255.250:3702 (universal standard)
-    try:
-        probe_uuid = str(uuid.uuid4())
-        ws_probe = (
-            '<?xml version="1.0" encoding="utf-8"?>'
-            '<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"'
-            ' xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
-            ' xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery"'
-            ' xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof">'
-            '<soap:Header>'
-            '<wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</wsa:Action>'
-            '<wsa:MessageID>urn:uuid:' + probe_uuid + '</wsa:MessageID>'
-            '<wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>'
-            '</soap:Header>'
-            '<soap:Body>'
-            '<wsd:Probe><wsd:Types>wsdp:Device</wsd:Types></wsd:Probe>'
-            '</soap:Body>'
-            '</soap:Envelope>'
-        )
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
-        s.settimeout(5)
-        s.bind(('', 0))
-        s.sendto(ws_probe.encode(), ('239.255.255.250', 3702))
-        print("[CameraDiscovery] ONVIF WS-Discovery probe sent")
-        while True:
-            try:
-                data, addr = s.recvfrom(65535)
-                ip = addr[0]
-                if ip in seen or ip == local_ip or ip.startswith('127.'):
-                    continue
-                # Parse response to extract XAddrs and determine brand
-                resp = data.decode(errors='ignore')
-                # Extract IP from XAddrs (e.g., http://192.168.1.100/onvif/device_service)
-                xaddrs_match = re.search(r'XAddrs[^>]*>([^<]+)', resp)
-                if xaddrs_match:
-                    xaddrs = xaddrs_match.group(1)
-                    # Extract IPs from URLs in XAddrs
-                    ip_matches = re.findall(r'https?://(\d+\.\d+\.\d+\.\d+)', xaddrs)
-                    for found_ip in ip_matches:
-                        if found_ip not in seen and found_ip != local_ip:
-                            seen.add(found_ip)
-                            # Detect brand from response
-                            brand = 'Unknown'
-                            resp_lower = resp.lower()
-                            if 'hikvision' in resp_lower or 'hikdigital' in resp_lower:
-                                brand = 'Hikvision'
-                            elif 'dahua' in resp_lower:
-                                brand = 'Dahua/Intelbras'
-                            elif 'intelbras' in resp_lower:
-                                brand = 'Intelbras'
-                            elif 'axis' in resp_lower:
-                                brand = 'Axis'
-                            # Extract model from Scopes
-                            model = ''
-                            scopes_match = re.search(r'Scopes[^>]*>([^<]+)', resp)
-                            if scopes_match:
-                                scopes = scopes_match.group(1)
-                                hw_match = re.search(r'hardware/([^\s]+)', scopes)
-                                if hw_match:
-                                    model = hw_match.group(1)
-                                # Also check brand from scopes
-                                if brand == 'Unknown':
-                                    name_match = re.search(r'name/([^\s]+)', scopes)
-                                    if name_match:
-                                        name = name_match.group(1).lower()
-                                        if 'hik' in name:
-                                            brand = 'Hikvision'
-                                        elif 'dahua' in name or 'intelbras' in name:
-                                            brand = 'Dahua/Intelbras'
-                            results.append({
-                                'ip': found_ip,
-                                'brand': brand,
-                                'model': model,
-                                'mac': ''
-                            })
-                elif ip not in seen:
-                    # No XAddrs but got a response - use source IP
-                    seen.add(ip)
-                    results.append({
-                        'ip': ip,
-                        'brand': 'ONVIF Device',
-                        'model': '',
-                        'mac': ''
-                    })
-            except socket.timeout:
-                break
-            except Exception as e:
-                print(f"[CameraDiscovery] ONVIF parse error: {e}")
-                continue
-        s.close()
-        print(f"[CameraDiscovery] ONVIF found {len(results)} devices")
-    except Exception as e:
-        print(f"[CameraDiscovery] ONVIF error: {e}")
-
-    # 2. Hikvision SADP - multicast 239.255.255.250:37020
+    # 1. Hikvision SADP - multicast 239.255.255.250:37020 (runs first for accurate brand)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -2767,6 +2671,94 @@ def discover_cameras():
         s.close()
     except Exception as e:
         print(f"[CameraDiscovery] Dahua error: {e}")
+
+    sadp_dhip_count = len(results)
+
+    # 3. ONVIF WS-Discovery - multicast 239.255.255.250:3702 (catches anything SADP/DHIP missed)
+    try:
+        probe_uuid = str(uuid.uuid4())
+        ws_probe = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"'
+            ' xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+            ' xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery"'
+            ' xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof">'
+            '<soap:Header>'
+            '<wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</wsa:Action>'
+            '<wsa:MessageID>urn:uuid:' + probe_uuid + '</wsa:MessageID>'
+            '<wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>'
+            '</soap:Header>'
+            '<soap:Body>'
+            '<wsd:Probe><wsd:Types>wsdp:Device</wsd:Types></wsd:Probe>'
+            '</soap:Body>'
+            '</soap:Envelope>'
+        )
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+        s.settimeout(5)
+        s.bind(('', 0))
+        s.sendto(ws_probe.encode(), ('239.255.255.250', 3702))
+        print("[CameraDiscovery] ONVIF WS-Discovery probe sent")
+        while True:
+            try:
+                data, addr = s.recvfrom(65535)
+                ip = addr[0]
+                if ip in seen or ip == local_ip or ip.startswith('127.'):
+                    continue
+                resp = data.decode(errors='ignore')
+                xaddrs_match = re.search(r'XAddrs[^>]*>([^<]+)', resp)
+                if xaddrs_match:
+                    xaddrs = xaddrs_match.group(1)
+                    ip_matches = re.findall(r'https?://(\d+\.\d+\.\d+\.\d+)', xaddrs)
+                    for found_ip in ip_matches:
+                        if found_ip not in seen and found_ip != local_ip:
+                            seen.add(found_ip)
+                            # Detect brand - check for Hikvision indicators first
+                            brand = 'IP Camera'
+                            resp_lower = resp.lower()
+                            scopes_text = ''
+                            scopes_match = re.search(r'Scopes[^>]*>([^<]+)', resp)
+                            if scopes_match:
+                                scopes_text = scopes_match.group(1).lower()
+                            all_text = resp_lower + ' ' + scopes_text
+                            # Hikvision check (including OEM like Intelbras-Hikvision)
+                            if 'hikvision' in all_text or 'hikdigital' in all_text or 'hik' in scopes_text:
+                                brand = 'Hikvision'
+                            elif 'dahua' in all_text:
+                                brand = 'Dahua/Intelbras'
+                            elif 'intelbras' in all_text:
+                                brand = 'Intelbras'
+                            elif 'axis' in all_text:
+                                brand = 'Axis'
+                            # Extract model from hardware scope
+                            model = ''
+                            if scopes_match:
+                                hw_match = re.search(r'hardware/([^\s]+)', scopes_match.group(1))
+                                if hw_match:
+                                    model = hw_match.group(1)
+                            results.append({
+                                'ip': found_ip,
+                                'brand': brand,
+                                'model': model,
+                                'mac': ''
+                            })
+                elif ip not in seen:
+                    seen.add(ip)
+                    results.append({
+                        'ip': ip,
+                        'brand': 'IP Camera',
+                        'model': '',
+                        'mac': ''
+                    })
+            except socket.timeout:
+                break
+            except:
+                continue
+        s.close()
+        print(f"[CameraDiscovery] ONVIF found {len(results) - sadp_dhip_count} additional devices")
+    except Exception as e:
+        print(f"[CameraDiscovery] ONVIF error: {e}")
 
     print(f"[CameraDiscovery] Total found: {len(results)} cameras")
     return {"success": True, "cameras": results}
