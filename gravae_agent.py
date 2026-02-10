@@ -2502,9 +2502,10 @@ def get_phoenix_logs(lines=100):
         return {"logs": [], "error": str(e)}
 
 def get_button_history():
-    """Get recent button press history from Shinobi events or button daemon logs"""
+    """Get recent button press history from Shinobi events and button daemon logs"""
     button_presses = []
 
+    # --- Source 1: Shinobi events (motion triggers from button daemon) ---
     try:
         shinobi_conf = get_shinobi_config()
         if shinobi_conf.get("apiKey") and shinobi_conf.get("groupKey"):
@@ -2528,12 +2529,13 @@ def get_button_history():
                         events = json.loads(response.read().decode())
 
                         for event in events[:5]:
-                            if event.get("details", {}).get("reason") == "recording":
+                            reason = (event.get("details") or {}).get("reason", "")
+                            if reason in ("motion", "recording", "object", ""):
                                 button_presses.append({
                                     "monitor": mname,
                                     "monitorId": mid,
                                     "timestamp": event.get("time", ""),
-                                    "action": "recording_triggered",
+                                    "action": reason or "triggered",
                                     "type": "shinobi_event"
                                 })
                     except:
@@ -2543,13 +2545,51 @@ def get_button_history():
     except:
         pass
 
-    button_log_paths = [
+    # --- Source 2: Button daemon detail logs (plain text) ---
+    # The button daemon writes: "2024-02-08 14:30:22 - Cancha 1"
+    # or with arrow format: "2024-02-08 14:30:22 - Btn1 -> [Cancha 1, Cancha 2]"
+    daemon_dir = os.path.dirname(_get_button_daemon_path())
+    detail_log_paths = [
+        os.path.join(daemon_dir, "logs", "button_presses_details.txt"),
+        "/home/Gravae/Documents/Gravae/logs/button_presses_details.txt",
+        "/home/gravae/Documents/Gravae/logs/button_presses_details.txt",
+        "/home/pi/Documents/Gravae/logs/button_presses_details.txt",
+    ]
+
+    for log_path in detail_log_paths:
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r") as f:
+                    lines = f.readlines()[-50:]
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        # Parse plain text format: "2024-02-08 14:30:22 - Cancha 1"
+                        # or: "2024-02-08 14:30:22 - Btn1 -> [Cancha 1, Cancha 2]"
+                        parts = line.split(" - ", 1)
+                        if len(parts) == 2:
+                            timestamp = parts[0].strip()
+                            monitor_part = parts[1].strip()
+                            button_presses.append({
+                                "monitor": monitor_part,
+                                "monitorId": "",
+                                "timestamp": timestamp,
+                                "action": "pressed",
+                                "type": "button_daemon"
+                            })
+            except:
+                pass
+            break
+
+    # --- Source 3: Legacy JSON log files ---
+    legacy_log_paths = [
         "/var/log/gravae/buttons.log",
         "/home/gravae/Documents/Gravae/buttons.log",
         "/home/pi/Documents/Gravae/buttons.log"
     ]
 
-    for log_path in button_log_paths:
+    for log_path in legacy_log_paths:
         if os.path.exists(log_path):
             try:
                 with open(log_path, "r") as f:
@@ -2563,18 +2603,13 @@ def get_button_history():
                             if entry.get("type") == "button_press":
                                 button_presses.append({
                                     "monitor": entry.get("monitor", "unknown"),
+                                    "monitorId": entry.get("monitorId", ""),
                                     "timestamp": entry.get("timestamp", ""),
                                     "action": entry.get("action", "pressed"),
                                     "type": "button_daemon"
                                 })
                         except:
-                            if "button" in line.lower() or "pressed" in line.lower():
-                                button_presses.append({
-                                    "monitor": "unknown",
-                                    "timestamp": "",
-                                    "action": line[:100],
-                                    "type": "log_line"
-                                })
+                            pass
             except:
                 pass
             break
