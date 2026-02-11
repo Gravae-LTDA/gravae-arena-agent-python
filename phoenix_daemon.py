@@ -26,7 +26,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -1178,11 +1178,6 @@ class PhoenixDaemon:
                 log.warning("Setup incomplete: device.json not found")
                 return False
 
-            config = json.loads(CONFIG_PATH.read_text())
-            if not config.get("tunnelId"):
-                log.warning("Setup incomplete: no tunnelId in device.json")
-                return False
-
             result = subprocess.run(
                 ["systemctl", "list-unit-files", "cloudflared.service"],
                 capture_output=True, text=True, timeout=10
@@ -1202,8 +1197,26 @@ class PhoenixDaemon:
         # Check if we just rebooted
         check_boot_report()
 
+        # Hardware watchdog - handled by systemd WatchdogSec instead of direct /dev/watchdog
+        # sd_notify lets systemd know we're alive; if we hang, systemd restarts us
+        def sd_notify(msg):
+            try:
+                addr = os.environ.get("NOTIFY_SOCKET")
+                if not addr:
+                    return
+                import socket as _sock
+                s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_DGRAM)
+                if addr[0] == "@":
+                    addr = "\0" + addr[1:]
+                s.sendto(msg.encode(), addr)
+                s.close()
+            except:
+                pass
+
+        sd_notify("READY=1")
+        log.info("Systemd notify: READY")
+
         # Only enable hardware watchdog if system is fully set up
-        # This prevents boot loops when cloudflared isn't configured yet
         if self._is_setup_complete():
             self.watchdog.enable()
         else:
@@ -1222,7 +1235,9 @@ class PhoenixDaemon:
             now = time.time()
 
             try:
-                # Ping hardware watchdog
+                # Ping systemd watchdog (keeps WatchdogSec happy)
+                sd_notify("WATCHDOG=1")
+                # Ping hardware watchdog (if enabled)
                 self.watchdog.ping()
 
                 # Service check (every minute)

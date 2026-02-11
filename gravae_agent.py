@@ -851,34 +851,67 @@ WantedBy=multi-user.target
         print(f"[Update] Failed to create agent service: {e}")
 
 def _ensure_phoenix_service():
-    """Create phoenix systemd service if it doesn't exist"""
+    """Create/update phoenix systemd service with watchdog support"""
     service_path = '/etc/systemd/system/gravae-phoenix.service'
-    if os.path.exists(service_path):
-        return
 
     service_content = """[Unit]
 Description=Gravae Phoenix Daemon
 After=network.target gravae-agent.service
 
 [Service]
-Type=simple
+Type=notify
 User=root
 WorkingDirectory=/opt/gravae-agent
 ExecStart=/usr/bin/python3 /opt/gravae-agent/phoenix_daemon.py
 Restart=always
 RestartSec=5
+WatchdogSec=300
+MemoryMax=80M
+StartLimitBurst=5
+StartLimitIntervalSec=600
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
 """
+    needs_update = True
+    if os.path.exists(service_path):
+        try:
+            with open(service_path, 'r') as f:
+                existing = f.read()
+            if 'WatchdogSec=300' in existing and 'Type=notify' in existing:
+                needs_update = False
+        except:
+            pass
+
+    if not needs_update:
+        return
+
     try:
         with open('/tmp/gravae-phoenix.service', 'w') as f:
             f.write(service_content)
         subprocess.run(['sudo', 'mv', '/tmp/gravae-phoenix.service', service_path], check=True)
-        print("[Update] Created gravae-phoenix.service")
+        subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
+        print("[Update] Updated gravae-phoenix.service with watchdog support")
     except Exception as e:
-        print(f"[Update] Failed to create phoenix service: {e}")
+        print(f"[Update] Failed to update phoenix service: {e}")
+
+    # Enable RuntimeWatchdogSec for system-level hardware watchdog (reboots on kernel hang)
+    try:
+        system_conf = '/etc/systemd/system.conf'
+        if os.path.exists(system_conf):
+            with open(system_conf, 'r') as f:
+                content = f.read()
+            if 'RuntimeWatchdogSec=60' not in content:
+                content = content.replace('#RuntimeWatchdogSec=off', 'RuntimeWatchdogSec=60')
+                if 'RuntimeWatchdogSec=60' not in content:
+                    content += '\nRuntimeWatchdogSec=60\n'
+                with open('/tmp/system.conf', 'w') as f:
+                    f.write(content)
+                subprocess.run(['sudo', 'mv', '/tmp/system.conf', system_conf], check=True)
+                print("[Update] Enabled RuntimeWatchdogSec=60 in system.conf")
+    except Exception as e:
+        print(f"[Update] Failed to configure RuntimeWatchdogSec: {e}")
 
 def restart_agent():
     try:
