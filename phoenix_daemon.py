@@ -26,7 +26,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.5.0"
+VERSION = "1.6.1"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -342,8 +342,10 @@ class ServiceGuardian:
                 if not is_running:
                     is_running = self.check_pm2_process(service_name)
             elif service_name == "gravae-buttons":
-                # Button service - check systemd first, then legacy botao.py
+                # Button service - check both possible systemd names, then legacy botao.py
                 is_running = self.check_service_systemd(service_name)
+                if not is_running:
+                    is_running = self.check_service_systemd("gravae-button-daemon")
                 if not is_running:
                     # Check for legacy botao.py process (older arenas)
                     is_running = self.check_legacy_button_process()

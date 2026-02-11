@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.10.10"
+VERSION = "2.10.11"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -1508,6 +1508,8 @@ def cleanup_shinobi(group_key, email, password):
         print(f"[Shinobi Cleanup] Found {len(monitors)} monitors to delete")
 
         for monitor in monitors:
+            if not isinstance(monitor, dict):
+                continue
             mid = monitor.get('mid', '')
             if mid:
                 try:
@@ -2285,6 +2287,8 @@ def get_phoenix_status():
 
                 if isinstance(monitors_data, list):
                     for m in monitors_data[:20]:
+                        if not isinstance(m, dict):
+                            continue
                         status["monitors"].append({
                             "mid": m.get("mid", ""),
                             "name": m.get("name", m.get("mid", "")),
@@ -2519,6 +2523,8 @@ def get_button_history():
                 monitors = json.loads(response.read().decode())
 
                 for monitor in monitors[:10]:
+                    if not isinstance(monitor, dict):
+                        continue
                     mid = monitor.get("mid", "")
                     mname = monitor.get("name", mid)
 
@@ -3007,7 +3013,11 @@ class AgentHandler(BaseHTTPRequestHandler):
                     monitors_data = json.loads(resp.read().decode())
 
                 monitors = []
+                if not isinstance(monitors_data, list):
+                    monitors_data = []
                 for m in monitors_data:
+                    if not isinstance(m, dict):
+                        continue
                     mid = m.get('mid', '')
                     name = m.get('name', mid)
                     mode = m.get('mode', 'stop')
