@@ -26,7 +26,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -73,6 +73,7 @@ DISK_WARNING = 85  # Percent
 DISK_CRITICAL = 95
 MEMORY_WARNING = 85
 MEMORY_CRITICAL = 95
+VOLTAGE_LOW = 4.75  # Volts - RPi recommended minimum for USB power
 
 # === Logging Setup ===
 def setup_logging():
@@ -936,6 +937,50 @@ class NetworkRecovery:
 
 # === Resource Monitor ===
 class ResourceMonitor:
+    def __init__(self):
+        self.undervoltage_alerted = False  # Avoid spamming alerts
+        self.last_voltage_check = 0  # Timestamp for daily voltage check
+
+    def get_throttled(self):
+        """Check Raspberry Pi throttling/voltage status via vcgencmd.
+        Bit flags from 'vcgencmd get_throttled':
+          0: Under-voltage detected (now)
+          1: ARM frequency capped (now)
+          2: Currently throttled (now)
+          3: Soft temperature limit active (now)
+         16: Under-voltage has occurred (since boot)
+         17: ARM frequency capping has occurred
+         18: Throttling has occurred
+         19: Soft temperature limit has occurred
+        """
+        try:
+            result = subprocess.run(
+                ["vcgencmd", "get_throttled"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                # Output: throttled=0x50000
+                value = result.stdout.strip().split("=")[-1]
+                return int(value, 16)
+        except:
+            pass
+        return None
+
+    def get_voltage(self):
+        """Read core voltage via vcgencmd. Returns float (e.g. 1.2000)."""
+        try:
+            result = subprocess.run(
+                ["vcgencmd", "measure_volts", "core"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                # Output: volt=1.2000V
+                value = result.stdout.strip().replace("volt=", "").replace("V", "")
+                return float(value)
+        except:
+            pass
+        return None
+
     def get_temperature(self):
         try:
             with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
@@ -998,6 +1043,42 @@ class ResourceMonitor:
                 alerts.add("memory_critical", "critical", f"Memory usage: {memory:.1f}%")
             elif memory >= MEMORY_WARNING:
                 issues.append(("memory", "warning", f"Memory usage high: {memory:.1f}%"))
+
+        # Voltage / Throttling (Raspberry Pi)
+        throttled = self.get_throttled()
+        if throttled is not None:
+            under_voltage_now = bool(throttled & 0x1)
+            freq_capped_now = bool(throttled & 0x2)
+            throttled_now = bool(throttled & 0x4)
+            under_voltage_boot = bool(throttled & 0x10000)
+
+            if under_voltage_now:
+                voltage = self.get_voltage()
+                issues.append(("voltage", "critical", "Under-voltage detected - power supply inadequate"))
+                if not self.undervoltage_alerted:
+                    alerts.add(
+                        "undervoltage",
+                        "critical",
+                        "Tensão baixa detectada - fonte de alimentação inadequada",
+                        {"throttled_hex": hex(throttled), "voltage": voltage, "freq_capped": freq_capped_now, "throttled": throttled_now}
+                    )
+                    self.undervoltage_alerted = True
+            elif under_voltage_boot and not under_voltage_now:
+                # Voltage recovered but happened since boot
+                if self.undervoltage_alerted:
+                    voltage = self.get_voltage()
+                    alerts.add(
+                        "undervoltage_recovered",
+                        "warning",
+                        "Tensão normalizada, mas houve queda desde o boot",
+                        {"throttled_hex": hex(throttled), "voltage": voltage}
+                    )
+                    self.undervoltage_alerted = False
+            else:
+                self.undervoltage_alerted = False
+
+            if throttled_now and not under_voltage_now:
+                issues.append(("throttling", "warning", "CPU throttled due to thermal/power constraints"))
 
         return issues
 
@@ -1230,6 +1311,7 @@ class PhoenixDaemon:
         last_heartbeat = 0
         last_alert_cleanup = 0
         last_gc = 0
+        last_voltage_check = 0
 
         while self.running:
             now = time.time()
@@ -1269,6 +1351,18 @@ class PhoenixDaemon:
                     self.resources.check_resources()
                     last_resource_check = now
 
+                # Daily voltage check (every 24 hours)
+                if now - last_voltage_check >= 86400:
+                    voltage = self.resources.get_voltage()
+                    if voltage is not None and voltage < VOLTAGE_LOW:
+                        alerts.add(
+                            "voltage_low",
+                            "warning",
+                            f"Tensão baixa detectada: {voltage:.2f}V (mínimo recomendado: {VOLTAGE_LOW}V)",
+                            {"voltage": voltage, "threshold": VOLTAGE_LOW}
+                        )
+                    last_voltage_check = now
+
                 # Heartbeat (every 5 minutes when online)
                 if now - last_heartbeat >= 300 and self.connectivity.is_online:
                     status = {
@@ -1277,7 +1371,8 @@ class PhoenixDaemon:
                         "resources": {
                             "temp": self.resources.get_temperature(),
                             "disk": self.resources.get_disk_usage(),
-                            "memory": self.resources.get_memory_usage()
+                            "memory": self.resources.get_memory_usage(),
+                            "voltage": self.resources.get_voltage()
                         }
                     }
                     self.heartbeat.send(status)

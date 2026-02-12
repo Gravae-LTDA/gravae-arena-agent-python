@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.10.11"
+VERSION = "2.10.12"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -2208,6 +2208,21 @@ def cleanup_arena(options=None):
 PHOENIX_LOG_PATH = "/var/log/gravae/phoenix.log"
 PHOENIX_ALERT_DB = "/var/log/gravae/alerts.db"
 
+def get_core_voltage():
+    """Read core voltage via vcgencmd. Returns float or None."""
+    try:
+        result = subprocess.run(
+            ["vcgencmd", "measure_volts", "core"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            # Output: volt=1.2000V
+            value = result.stdout.strip().replace("volt=", "").replace("V", "")
+            return round(float(value), 4)
+    except:
+        pass
+    return None
+
 def get_phoenix_status():
     """Get Phoenix daemon status with full system info"""
     status = {
@@ -2295,6 +2310,10 @@ def get_phoenix_status():
             status["resources"]["disk"] = round(((total - free) / total) * 100, 1)
     except:
         pass
+
+    voltage = get_core_voltage()
+    if voltage is not None:
+        status["resources"]["voltage"] = voltage
 
     try:
         result = subprocess.run(
