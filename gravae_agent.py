@@ -2315,6 +2315,20 @@ def get_phoenix_status():
     if voltage is not None:
         status["resources"]["voltage"] = voltage
 
+    # Throttling / undervoltage flags from hardware
+    try:
+        result = subprocess.run(
+            ["vcgencmd", "get_throttled"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            throttled_val = int(result.stdout.strip().split("=")[-1], 16)
+            status["resources"]["throttled"] = throttled_val
+            status["resources"]["undervoltage_now"] = bool(throttled_val & 0x1)
+            status["resources"]["undervoltage_boot"] = bool(throttled_val & 0x10000)
+    except:
+        pass
+
     try:
         result = subprocess.run(
             ["ping", "-c", "1", "-W", "2", "8.8.8.8"],

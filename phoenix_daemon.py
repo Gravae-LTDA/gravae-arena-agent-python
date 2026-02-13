@@ -26,7 +26,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -73,7 +73,7 @@ DISK_WARNING = 85  # Percent
 DISK_CRITICAL = 95
 MEMORY_WARNING = 85
 MEMORY_CRITICAL = 95
-VOLTAGE_LOW = 4.75  # Volts - RPi recommended minimum for USB power
+VOLTAGE_LOW = 4.75  # Volts - RPi recommended minimum for USB power (used only in alert messages)
 
 # === Logging Setup ===
 def setup_logging():
@@ -1351,16 +1351,21 @@ class PhoenixDaemon:
                     self.resources.check_resources()
                     last_resource_check = now
 
-                # Daily voltage check (every 24 hours)
+                # Daily undervoltage check (every 24 hours)
+                # Uses get_throttled() bit flags (hardware-level detection) instead of
+                # get_voltage() which returns core voltage (~0.85V), NOT the 5V USB supply.
                 if now - last_voltage_check >= 86400:
-                    voltage = self.resources.get_voltage()
-                    if voltage is not None and voltage < VOLTAGE_LOW:
-                        alerts.add(
-                            "voltage_low",
-                            "warning",
-                            f"Tensão baixa detectada: {voltage:.2f}V (mínimo recomendado: {VOLTAGE_LOW}V)",
-                            {"voltage": voltage, "threshold": VOLTAGE_LOW}
-                        )
+                    throttled = self.resources.get_throttled()
+                    if throttled is not None:
+                        under_voltage_boot = bool(throttled & 0x10000)
+                        if under_voltage_boot:
+                            voltage = self.resources.get_voltage()
+                            alerts.add(
+                                "voltage_low",
+                                "warning",
+                                f"Subtensão detectada desde o boot (fonte inadequada). Core: {voltage:.2f}V" if voltage else "Subtensão detectada desde o boot (fonte inadequada)",
+                                {"throttled_hex": hex(throttled), "core_voltage": voltage, "threshold": VOLTAGE_LOW}
+                            )
                     last_voltage_check = now
 
                 # Heartbeat (every 5 minutes when online)
