@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.11.0"
+VERSION = "2.11.1"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -1834,6 +1834,46 @@ def setup_quick_tunnel():
 
     return {"success": True, "shinobiUrl": shinobi_url or "", "agentUrl": agent_url or ""}
 
+def _fix_cloudflared_service():
+    """Apply fixes to cloudflared systemd service:
+    - Type=simple (Type=notify times out on slow connections)
+    - --protocol http2 (QUIC/UDP often blocked on arena networks)
+    """
+    svc_path = '/etc/systemd/system/cloudflared.service'
+    if not os.path.exists(svc_path):
+        return
+    try:
+        with open(svc_path, 'r') as f:
+            content = f.read()
+        modified = False
+        if 'Type=notify' in content:
+            content = content.replace('Type=notify', 'Type=simple')
+            modified = True
+        if 'tunnel run' in content and '--protocol http2' not in content:
+            content = content.replace('tunnel run', 'tunnel --protocol http2 run')
+            modified = True
+        if modified:
+            with open(svc_path, 'w') as f:
+                f.write(content)
+            subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True)
+            print("[Tunnel] Applied systemd fixes: Type=simple, --protocol http2")
+    except Exception as e:
+        print(f"[Tunnel] Failed to fix cloudflared service: {e}")
+
+def _enable_phoenix_after_tunnel():
+    """Enable Phoenix daemon after tunnel is confirmed running"""
+    try:
+        # Remove install kill switch
+        if os.path.exists('/etc/gravae/no_reboot'):
+            os.remove('/etc/gravae/no_reboot')
+        subprocess.run(['sudo', 'systemctl', 'unmask', 'gravae-phoenix'], capture_output=True)
+        subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True)
+        subprocess.run(['sudo', 'systemctl', 'enable', 'gravae-phoenix'], capture_output=True)
+        subprocess.run(['sudo', 'systemctl', 'restart', 'gravae-phoenix'], capture_output=True)
+        print("[Tunnel] Phoenix enabled after tunnel setup")
+    except Exception as e:
+        print(f"[Tunnel] Failed to enable Phoenix: {e}")
+
 def run_tunnel_with_token(tunnel_token, tunnel_name='custom-tunnel'):
     """Run cloudflared with a token (ingress configured via Cloudflare API)"""
     install_result = install_cloudflared()
@@ -1866,10 +1906,20 @@ def run_tunnel_with_token(tunnel_token, tunnel_name='custom-tunnel'):
                 return {"success": False, "error": "Tunnel failed to start"}
             return {"success": True, "method": "manual", "log": log_path}
         else:
-            time.sleep(3)
+            # Apply Type=simple + protocol http2 fixes
+            _fix_cloudflared_service()
+            subprocess.run(['sudo', 'systemctl', 'restart', 'cloudflared'], capture_output=True)
+            time.sleep(5)
             status = subprocess.run(['systemctl', 'is-active', 'cloudflared'], capture_output=True, text=True)
             if status.stdout.strip() != 'active':
-                return {"success": False, "error": "Tunnel service not active"}
+                # Try one more time
+                subprocess.run(['sudo', 'systemctl', 'start', 'cloudflared'], capture_output=True)
+                time.sleep(5)
+                status = subprocess.run(['systemctl', 'is-active', 'cloudflared'], capture_output=True, text=True)
+                if status.stdout.strip() != 'active':
+                    return {"success": False, "error": "Tunnel service not active after fixes"}
+            # Tunnel is running, enable Phoenix
+            _enable_phoenix_after_tunnel()
             return {"success": True, "method": "systemd"}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1896,11 +1946,14 @@ def setup_named_tunnel(tunnel_token, shinobi_hostname, agent_hostname):
             if pgrep.returncode != 0:
                 return {"success": False, "error": "Tunnel failed to start"}
         else:
-            time.sleep(3)
+            _fix_cloudflared_service()
+            subprocess.run(['sudo', 'systemctl', 'restart', 'cloudflared'], capture_output=True)
+            time.sleep(5)
             status = subprocess.run(['systemctl', 'is-active', 'cloudflared'], capture_output=True, text=True)
             if status.stdout.strip() != 'active':
                 return {"success": False, "error": "Tunnel service not active"}
 
+        _enable_phoenix_after_tunnel()
         return {"success": True, "shinobiUrl": f"https://{shinobi_hostname}", "agentUrl": f"https://{agent_hostname}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
