@@ -26,7 +26,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -1146,70 +1146,31 @@ def check_boot_report():
         except Exception as e:
             log.error(f"Failed to process last will: {e}")
 
-# === Hardware Watchdog ===
+# === Hardware Watchdog (DISABLED) ===
 class HardwareWatchdog:
-    """Hardware watchdog that pings /dev/watchdog in a dedicated thread.
+    """Hardware watchdog DISABLED in v1.8.2.
 
-    CRITICAL: The RPi hardware watchdog has a ~15 second timeout.
-    If /dev/watchdog is opened but not pinged within 15s, the hardware
-    does a hard reset. The ping MUST run in a separate thread because
-    the main Phoenix loop can block for 30+ seconds (service restarts,
-    connectivity checks, sleep intervals).
+    REASON: Opening /dev/watchdog on Raspberry Pi is extremely dangerous.
+    The bcm2835_wdt has a ~15 second timeout. If the process dies or the
+    system is slow (SD card I/O, heavy boot), the watchdog fires and causes
+    a hard reset. Combined with RuntimeWatchdogSec in systemd, this caused
+    infinite reboot loops on multiple production devices.
+
+    The systemd WatchdogSec (software) is sufficient for service monitoring.
+    Hardware watchdog should NEVER be used on RPi with SD cards.
     """
     def __init__(self):
         self.enabled = False
-        self.device = None
-        self._thread = None
-        self._stop_event = threading.Event()
 
     def enable(self):
-        """Enable hardware watchdog with dedicated ping thread"""
-        try:
-            self.device = open("/dev/watchdog", "w")
-            self.enabled = True
-            self._stop_event.clear()
-            self._thread = threading.Thread(
-                target=self._ping_loop, daemon=True, name="watchdog-ping"
-            )
-            self._thread.start()
-            log.info("Hardware watchdog enabled (ping thread started)")
-            return True
-        except Exception as e:
-            log.debug(f"Hardware watchdog not available: {e}")
-            return False
-
-    def _ping_loop(self):
-        """Dedicated thread that pings the watchdog every 5 seconds.
-        Runs as daemon thread so it dies if the main process dies."""
-        while not self._stop_event.is_set():
-            try:
-                if self.device:
-                    self.device.write("1")
-                    self.device.flush()
-            except Exception:
-                log.error("Watchdog ping failed, disabling watchdog")
-                self.enabled = False
-                break
-            self._stop_event.wait(5)  # Ping every 5s (well within 15s timeout)
+        log.info("Hardware watchdog DISABLED (removed in v1.8.2 - too dangerous on RPi)")
+        return False
 
     def ping(self):
-        """No-op: pinging is now handled by the dedicated thread.
-        Kept for API compatibility."""
         pass
 
     def disable(self):
-        """Disable watchdog (write V to disable)"""
-        self._stop_event.set()
-        if self.enabled and self.device:
-            try:
-                self.device.write("V")
-                self.device.close()
-                self.enabled = False
-                log.info("Hardware watchdog disabled")
-            except:
-                pass
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
+        pass
 
 # === Main Phoenix Daemon ===
 class PhoenixDaemon:
@@ -1278,8 +1239,7 @@ class PhoenixDaemon:
         # Check if we just rebooted
         check_boot_report()
 
-        # Hardware watchdog - handled by systemd WatchdogSec instead of direct /dev/watchdog
-        # sd_notify lets systemd know we're alive; if we hang, systemd restarts us
+        # sd_notify kept for backwards compatibility (no-op if service is Type=simple)
         def sd_notify(msg):
             try:
                 addr = os.environ.get("NOTIFY_SOCKET")
@@ -1295,14 +1255,7 @@ class PhoenixDaemon:
                 pass
 
         sd_notify("READY=1")
-        log.info("Systemd notify: READY")
-
-        # Only enable hardware watchdog if system is fully set up
-        if self._is_setup_complete():
-            self.watchdog.enable()
-        else:
-            log.warning("Hardware watchdog DISABLED - system setup incomplete. "
-                       "Watchdog will be enabled once cloudflared is configured.")
+        log.info(f"Phoenix v{VERSION} started (Type=simple, no hardware watchdog)")
 
         last_service_check = 0
         last_connectivity_check = 0
@@ -1317,10 +1270,6 @@ class PhoenixDaemon:
             now = time.time()
 
             try:
-                # Ping systemd watchdog (keeps WatchdogSec happy)
-                sd_notify("WATCHDOG=1")
-                # Ping hardware watchdog (if enabled)
-                self.watchdog.ping()
 
                 # Service check (every minute)
                 if now - last_service_check >= CHECK_INTERVAL:

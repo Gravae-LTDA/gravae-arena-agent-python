@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.11.2"
+VERSION = "2.12.0"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -977,6 +977,10 @@ def _restart_services():
     update_status = {"status": "installing", "progress": 55, "message": "Instalando recovery service...", "error": None}
     _install_recovery_service()
 
+    # Fix dangerous settings before restarting anything
+    update_status = {"status": "installing", "progress": 58, "message": "Corrigindo configuracoes perigosas...", "error": None}
+    _fix_dangerous_settings()
+
     # Restart Phoenix FIRST (before agent, because agent restart kills this process)
     update_status = {"status": "installing", "progress": 60, "message": "Configurando Phoenix service...", "error": None}
     _ensure_phoenix_service()
@@ -1023,7 +1027,7 @@ WantedBy=multi-user.target
         print(f"[Update] Failed to create agent service: {e}")
 
 def _ensure_phoenix_service():
-    """Create/update phoenix systemd service with watchdog support"""
+    """Create/update phoenix systemd service (Type=simple, no hardware watchdog)"""
     service_path = '/etc/systemd/system/gravae-phoenix.service'
 
     service_content = """[Unit]
@@ -1031,13 +1035,12 @@ Description=Gravae Phoenix Daemon
 After=network.target gravae-agent.service
 
 [Service]
-Type=notify
+Type=simple
 User=root
 WorkingDirectory=/opt/gravae-agent
 ExecStart=/usr/bin/python3 /opt/gravae-agent/phoenix_daemon.py
 Restart=always
-RestartSec=5
-WatchdogSec=300
+RestartSec=10
 MemoryMax=80M
 StartLimitBurst=5
 StartLimitIntervalSec=600
@@ -1051,7 +1054,10 @@ WantedBy=multi-user.target
         try:
             with open(service_path, 'r') as f:
                 existing = f.read()
-            if 'WatchdogSec=300' in existing and 'Type=notify' in existing:
+            # Force update if dangerous Type=notify or WatchdogSec are present
+            if 'Type=notify' in existing or 'WatchdogSec' in existing:
+                needs_update = True
+            elif 'Type=simple' in existing and 'RestartSec=10' in existing:
                 needs_update = False
         except:
             pass
@@ -1064,26 +1070,9 @@ WantedBy=multi-user.target
             f.write(service_content)
         subprocess.run(['sudo', 'mv', '/tmp/gravae-phoenix.service', service_path], check=True)
         subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
-        print("[Update] Updated gravae-phoenix.service with watchdog support")
+        print("[Update] Updated gravae-phoenix.service (Type=simple, no watchdog)")
     except Exception as e:
         print(f"[Update] Failed to update phoenix service: {e}")
-
-    # Enable RuntimeWatchdogSec for system-level hardware watchdog (reboots on kernel hang)
-    try:
-        system_conf = '/etc/systemd/system.conf'
-        if os.path.exists(system_conf):
-            with open(system_conf, 'r') as f:
-                content = f.read()
-            if 'RuntimeWatchdogSec=60' not in content:
-                content = content.replace('#RuntimeWatchdogSec=off', 'RuntimeWatchdogSec=60')
-                if 'RuntimeWatchdogSec=60' not in content:
-                    content += '\nRuntimeWatchdogSec=60\n'
-                with open('/tmp/system.conf', 'w') as f:
-                    f.write(content)
-                subprocess.run(['sudo', 'mv', '/tmp/system.conf', system_conf], check=True)
-                print("[Update] Enabled RuntimeWatchdogSec=60 in system.conf")
-    except Exception as e:
-        print(f"[Update] Failed to configure RuntimeWatchdogSec: {e}")
 
 def restart_agent():
     try:
@@ -3977,7 +3966,64 @@ class AgentHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {args[0]}")
 
+def _fix_dangerous_settings():
+    """Fix dangerous systemd settings that can cause boot loops.
+    Called on every agent startup to undo damage from previous versions.
+
+    Fixes:
+    1. RuntimeWatchdogSec in system.conf - hardware watchdog causes infinite reboot on slow RPi
+    2. Phoenix service Type=notify - can fail to send sd_notify, blocking service
+    3. Cloudflared service Type=notify + missing --protocol http2
+    """
+    # 1. Remove RuntimeWatchdogSec from system.conf (hardware watchdog is too dangerous on RPi)
+    try:
+        system_conf = '/etc/systemd/system.conf'
+        if os.path.exists(system_conf):
+            with open(system_conf, 'r') as f:
+                content = f.read()
+            if 'RuntimeWatchdogSec=60' in content:
+                content = content.replace('RuntimeWatchdogSec=60', '#RuntimeWatchdogSec=off')
+                with open('/tmp/system.conf', 'w') as f:
+                    f.write(content)
+                subprocess.run(['sudo', 'mv', '/tmp/system.conf', system_conf], check=True)
+                subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True)
+                print("[Startup] FIXED: Removed dangerous RuntimeWatchdogSec=60 from system.conf")
+    except Exception as e:
+        print(f"[Startup] Failed to fix system.conf: {e}")
+
+    # 2. Fix Phoenix service (Type=notify → Type=simple, remove WatchdogSec)
+    try:
+        phoenix_svc = '/etc/systemd/system/gravae-phoenix.service'
+        if os.path.exists(phoenix_svc):
+            with open(phoenix_svc, 'r') as f:
+                content = f.read()
+            modified = False
+            if 'Type=notify' in content:
+                content = content.replace('Type=notify', 'Type=simple')
+                modified = True
+            # Remove WatchdogSec line entirely
+            new_lines = []
+            for line in content.splitlines():
+                if line.strip().startswith('WatchdogSec='):
+                    modified = True
+                    continue
+                new_lines.append(line)
+            if modified:
+                with open(phoenix_svc, 'w') as f:
+                    f.write('\n'.join(new_lines) + '\n')
+                subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True)
+                print("[Startup] FIXED: Phoenix service → Type=simple, removed WatchdogSec")
+    except Exception as e:
+        print(f"[Startup] Failed to fix phoenix service: {e}")
+
+    # 3. Fix cloudflared service (Type=notify → Type=simple, add --protocol http2)
+    _fix_cloudflared_service()
+
+
 def main():
+    # Fix dangerous settings from previous versions BEFORE anything else
+    _fix_dangerous_settings()
+
     # Start post-update health check if needed (background thread)
     threading.Thread(target=_startup_health_check, daemon=True).start()
 
