@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Phoenix Daemon v1.5.0
+Phoenix Daemon v1.9.0
 Self-healing module for Gravae Arena Agent
 
 Features:
 - Service Guardian: Monitors and restarts failed services
-- Connectivity Sentinel: Tracks internet connectivity and escalates recovery
-- Network Recovery: Auto-switches between static IP and DHCP
+- Connectivity Sentinel: Tracks internet connectivity with safe-only recovery
 - Alert Queue: Stores alerts offline, syncs when back online
 - Persistent Logging: Structured logs with rotation
+
+SAFETY: Phoenix will NEVER reboot the system or modify network configuration.
+Recovery is limited to restarting services (cloudflared, networking).
 """
 
 import os
@@ -26,7 +28,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.8.2"
+VERSION = "1.9.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -34,25 +36,16 @@ NETWORK_BACKUP_DIR = LOG_DIR / "network_backup"
 CONFIG_PATH = Path("/etc/gravae/device.json")
 DHCPCD_CONF = Path("/etc/dhcpcd.conf")
 
-# Kill switch - if this file exists, Phoenix will NOT reboot the system
-# This is a safety mechanism to prevent boot loops
-KILL_SWITCH_PATH = Path("/etc/gravae/no_reboot")
-
 # Timing configuration (in seconds)
-# NOTE: Intervals increased to reduce CPU usage on Raspberry Pi
-CHECK_INTERVAL = 120  # Check every 2 minutes (was 60s)
-CONNECTIVITY_CHECK_INTERVAL = 60  # Check connectivity every minute (was 30s)
+CHECK_INTERVAL = 120  # Check every 2 minutes
+CONNECTIVITY_CHECK_INTERVAL = 60  # Check connectivity every minute
 SERVICE_RESTART_MAX_ATTEMPTS = 3
 SERVICE_RESTART_COOLDOWN = 300  # 5 minutes between restart attempts
 
-# Escalation thresholds (in minutes)
-ESCALATION_RESTART_CLOUDFLARED = 30
-ESCALATION_RESTART_NETWORKING = 60   # 1 hour
-ESCALATION_TRY_DHCP_STATIC = 120    # 2 hours (only when static IP - common modem change scenario)
-ESCALATION_REBOOT = 240             # 4 hours
-
-# Minimum uptime before allowing reboot (prevents boot loops)
-MIN_UPTIME_FOR_REBOOT = 600  # 10 minutes - system must be up at least this long before Phoenix can reboot
+# Escalation thresholds (in minutes) - SAFE actions only
+ESCALATION_RESTART_CLOUDFLARED = 30  # Restart cloudflared service
+ESCALATION_RESTART_NETWORKING = 60   # Restart networking services (no config changes)
+# NOTE: No DHCP switch, no reboot. After Level 2, Phoenix only alerts.
 
 # Connectivity check targets
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
@@ -522,56 +515,13 @@ class ShinobiMonitorWatcher:
                     )
 
 # === Connectivity Sentinel ===
-ESCALATION_STATE_PATH = LOG_DIR / "escalation_state.json"
-
 class ConnectivitySentinel:
     def __init__(self):
         self.is_online = True
         self.offline_since = None
         self.last_successful_ping = datetime.now()
-        self.escalation_level = 0  # 0=none, 1=cloudflared, 2=networking, 3=reboot, 4=dhcp
+        self.escalation_level = 0  # 0=none, 1=cloudflared, 2=networking (max)
         self.actions_taken = []
-        self._load_persisted_state()
-
-    def _load_persisted_state(self):
-        """Load escalation state from disk (survives reboots).
-        If we rebooted due to connectivity loss and internet is still down,
-        we skip straight to level 3+ to avoid rebooting again."""
-        try:
-            if ESCALATION_STATE_PATH.exists():
-                data = json.loads(ESCALATION_STATE_PATH.read_text())
-                saved_level = data.get("escalation_level", 0)
-                saved_time = data.get("offline_since")
-                if saved_level >= 3:
-                    # We already rebooted for connectivity - don't reboot again
-                    self.escalation_level = saved_level
-                    if saved_time:
-                        self.offline_since = datetime.fromisoformat(saved_time)
-                    self.is_online = False
-                    log.info(f"Restored escalation state: level={saved_level}, "
-                            f"offline_since={saved_time} - reboot will NOT repeat")
-        except Exception as e:
-            log.debug(f"Could not load escalation state: {e}")
-
-    def _persist_state(self):
-        """Save escalation state to disk before reboot or periodically."""
-        try:
-            data = {
-                "escalation_level": self.escalation_level,
-                "offline_since": self.offline_since.isoformat() if self.offline_since else None,
-                "timestamp": datetime.now().isoformat()
-            }
-            ESCALATION_STATE_PATH.write_text(json.dumps(data))
-        except Exception as e:
-            log.debug(f"Could not save escalation state: {e}")
-
-    def _clear_persisted_state(self):
-        """Clear persisted state when connectivity is restored."""
-        try:
-            if ESCALATION_STATE_PATH.exists():
-                ESCALATION_STATE_PATH.unlink()
-        except Exception as e:
-            log.debug(f"Could not clear escalation state: {e}")
 
     def ping(self, host):
         try:
@@ -645,116 +595,6 @@ class ConnectivitySentinel:
             log.error(f"Failed to restart networking: {e}")
             return False
 
-    def reboot_system(self):
-        # Safety check 1: Kill switch file
-        if KILL_SWITCH_PATH.exists():
-            log.warning("Reboot blocked: kill switch file exists (/etc/gravae/no_reboot)")
-            alerts.add(
-                "reboot_blocked",
-                "warning",
-                "System reboot was blocked by kill switch",
-                {"reason": "kill_switch", "offline_minutes": self.get_offline_minutes()}
-            )
-            return
-
-        # Safety check 2: Minimum uptime of 10 minutes (prevents boot loops)
-        try:
-            with open("/proc/uptime", "r") as f:
-                uptime_seconds = float(f.read().split()[0])
-            if uptime_seconds < MIN_UPTIME_FOR_REBOOT:
-                log.warning(f"Reboot blocked: system uptime ({uptime_seconds:.0f}s) < minimum ({MIN_UPTIME_FOR_REBOOT}s)")
-                alerts.add(
-                    "reboot_blocked",
-                    "warning",
-                    f"System reboot blocked - uptime too short ({uptime_seconds:.0f}s)",
-                    {"reason": "min_uptime", "uptime": uptime_seconds}
-                )
-                return
-        except Exception as e:
-            # If we can't check uptime, block the reboot to be safe
-            log.error(f"Could not check uptime, blocking reboot: {e}")
-            return
-
-        # Safety check 3: Minimum 10 minutes between reboots
-        try:
-            last_will_path = LOG_DIR / "last_will.json"
-            if last_will_path.exists():
-                with open(last_will_path, "r") as f:
-                    last_will = json.load(f)
-                last_reboot = datetime.fromisoformat(last_will.get("timestamp", "2000-01-01"))
-                time_since_last = (datetime.now() - last_reboot).total_seconds() / 60
-                if time_since_last < 10:
-                    log.warning(f"Reboot blocked: last reboot was {time_since_last:.0f} minutes ago (minimum 10 min)")
-                    alerts.add(
-                        "reboot_blocked",
-                        "critical",
-                        "System reboot blocked - minimum 10 min between reboots",
-                        {"reason": "boot_loop_protection", "minutes_since_last": time_since_last}
-                    )
-                    return
-        except Exception as e:
-            log.debug(f"Could not check last reboot: {e}")
-
-        # Safety check 4: Max 3 reboots per day
-        try:
-            reboot_count_path = LOG_DIR / "reboot_count.json"
-            today = datetime.now().strftime("%Y-%m-%d")
-            reboot_count = 0
-            if reboot_count_path.exists():
-                with open(reboot_count_path, "r") as f:
-                    data = json.load(f)
-                if data.get("date") == today:
-                    reboot_count = data.get("count", 0)
-            if reboot_count >= 3:
-                log.warning(f"Reboot blocked: already rebooted {reboot_count} times today (max 3)")
-                alerts.add(
-                    "reboot_blocked",
-                    "critical",
-                    f"System reboot blocked - max daily reboots reached ({reboot_count}/3)",
-                    {"reason": "max_daily_reboots", "count": reboot_count}
-                )
-                return
-            with open(reboot_count_path, "w") as f:
-                json.dump({"date": today, "count": reboot_count + 1}, f)
-        except Exception as e:
-            log.debug(f"Could not check reboot count: {e}")
-
-        log.warning("Escalation: Rebooting system")
-        alerts.add(
-            "system_reboot",
-            "critical",
-            "System reboot triggered due to extended connectivity loss",
-            {
-                "offline_minutes": self.get_offline_minutes(),
-                "actions_taken": self.actions_taken
-            }
-        )
-
-        # Save state before reboot (so we don't reboot again on next boot)
-        self._save_last_will()
-        self._persist_state()
-
-        try:
-            subprocess.run(["reboot"], timeout=10)
-        except Exception as e:
-            log.error(f"Failed to reboot: {e}")
-
-    def _save_last_will(self):
-        """Save current state before reboot"""
-        try:
-            state = {
-                "timestamp": datetime.now().isoformat(),
-                "reason": "connectivity_loss",
-                "offline_since": self.offline_since.isoformat() if self.offline_since else None,
-                "offline_minutes": self.get_offline_minutes(),
-                "actions_taken": self.actions_taken,
-                "escalation_level": self.escalation_level
-            }
-            with open(LOG_DIR / "last_will.json", "w") as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            log.error(f"Failed to save last will: {e}")
-
     def update(self):
         was_online = self.is_online
         self.is_online = self.check_connectivity()
@@ -775,7 +615,6 @@ class ConnectivitySentinel:
             self.last_successful_ping = datetime.now()
             self.escalation_level = 0
             self.actions_taken = []
-            self._clear_persisted_state()
             return True
 
         # We're offline
@@ -786,20 +625,8 @@ class ConnectivitySentinel:
 
         offline_minutes = self.get_offline_minutes()
 
-        # Escalation logic
-        # When static IP: cloudflared(30m) → networking(1h) → DHCP(2h) → reboot(4h)
-        # When DHCP:      cloudflared(30m) → networking(1h) → reboot(4h)
-        is_static = NetworkRecovery().is_static_ip()
-
-        if offline_minutes >= ESCALATION_REBOOT and self.escalation_level < 4:
-            self.escalation_level = 4
-            self.reboot_system()
-
-        elif is_static and offline_minutes >= ESCALATION_TRY_DHCP_STATIC and self.escalation_level < 3:
-            self.escalation_level = 3
-            # DHCP fallback handled by NetworkRecovery in main loop
-
-        elif offline_minutes >= ESCALATION_RESTART_NETWORKING and self.escalation_level < 2:
+        # Safe escalation: only restart services, NEVER modify network config or reboot
+        if offline_minutes >= ESCALATION_RESTART_NETWORKING and self.escalation_level < 2:
             self.escalation_level = 2
             self.restart_networking()
 
@@ -807,133 +634,18 @@ class ConnectivitySentinel:
             self.escalation_level = 1
             self.restart_cloudflared()
 
+        # After Level 2, Phoenix only logs. No DHCP changes. No reboot. Ever.
+        if offline_minutes >= 120 and self.escalation_level == 2:
+            # Log periodically (every 30 min) so we know the device is still alive but offline
+            hours_offline = offline_minutes / 60
+            if int(offline_minutes) % 30 == 0:
+                log.warning(f"Extended connectivity loss: {hours_offline:.1f}h offline. "
+                           f"No further actions - waiting for internet to return.")
+
         return False
 
-# === Network Recovery ===
-class NetworkRecovery:
-    def __init__(self):
-        NETWORK_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        self.original_config = None
-        self.is_dhcp_mode = False
-
-    def is_static_ip(self):
-        """Check if current config is static IP"""
-        try:
-            if not DHCPCD_CONF.exists():
-                return False
-
-            content = DHCPCD_CONF.read_text()
-            return "static ip_address" in content
-        except:
-            return False
-
-    def backup_network_config(self):
-        """Backup current network config"""
-        try:
-            if DHCPCD_CONF.exists():
-                backup_path = NETWORK_BACKUP_DIR / f"dhcpcd.conf.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                backup_path.write_text(DHCPCD_CONF.read_text())
-
-                # Also keep a "last known good" backup
-                (NETWORK_BACKUP_DIR / "dhcpcd.conf.last_good").write_text(DHCPCD_CONF.read_text())
-
-                log.info(f"Network config backed up to {backup_path}")
-                return True
-        except Exception as e:
-            log.error(f"Failed to backup network config: {e}")
-        return False
-
-    def switch_to_dhcp(self):
-        """Temporarily switch to DHCP"""
-        if not self.is_static_ip():
-            log.info("Already using DHCP")
-            return False
-
-        self.backup_network_config()
-
-        try:
-            # Read current config
-            content = DHCPCD_CONF.read_text()
-            self.original_config = content
-
-            # Comment out static IP lines
-            new_content = []
-            for line in content.splitlines():
-                if any(x in line for x in ["static ip_address", "static routers", "static domain_name_servers"]):
-                    new_content.append(f"# PHOENIX_DISABLED: {line}")
-                else:
-                    new_content.append(line)
-
-            DHCPCD_CONF.write_text("\\n".join(new_content))
-
-            # Restart networking
-            subprocess.run(["systemctl", "restart", "dhcpcd"], timeout=30)
-
-            self.is_dhcp_mode = True
-            log.info("Switched to DHCP mode")
-            alerts.add(
-                "network_config_changed",
-                "warning",
-                "Switched from static IP to DHCP due to connectivity issues"
-            )
-            return True
-
-        except Exception as e:
-            log.error(f"Failed to switch to DHCP: {e}")
-            self.restore_static_ip()
-            return False
-
-    def restore_static_ip(self):
-        """Restore original static IP config"""
-        if not self.original_config:
-            # Try to restore from backup
-            last_good = NETWORK_BACKUP_DIR / "dhcpcd.conf.last_good"
-            if last_good.exists():
-                self.original_config = last_good.read_text()
-            else:
-                log.error("No original config to restore")
-                return False
-
-        try:
-            DHCPCD_CONF.write_text(self.original_config)
-            subprocess.run(["systemctl", "restart", "dhcpcd"], timeout=30)
-
-            self.is_dhcp_mode = False
-            log.info("Restored static IP configuration")
-            alerts.add(
-                "network_config_restored",
-                "info",
-                "Restored original static IP configuration"
-            )
-            return True
-
-        except Exception as e:
-            log.error(f"Failed to restore static IP: {e}")
-            return False
-
-    def attempt_recovery(self, connectivity):
-        """Called when we've been offline long enough to try DHCP"""
-        if not self.is_static_ip() or self.is_dhcp_mode:
-            return
-
-        log.warning("Attempting network recovery by switching to DHCP")
-
-        if self.switch_to_dhcp():
-            # Wait for DHCP to get an IP
-            time.sleep(30)
-
-            # Check if we're online now
-            if connectivity.check_connectivity():
-                log.info("DHCP recovery successful!")
-                alerts.add(
-                    "network_recovery_success",
-                    "warning",
-                    "Network recovered by switching to DHCP - possible IP range change",
-                    {"action": "switched_to_dhcp"}
-                )
-            else:
-                log.warning("DHCP didn't help, restoring static IP")
-                self.restore_static_ip()
+# NetworkRecovery REMOVED in v1.9.0 - modifying network config is too dangerous.
+# Phoenix will NEVER touch dhcpcd.conf or switch between DHCP/static IP.
 
 # === Resource Monitor ===
 class ResourceMonitor:
@@ -1122,29 +834,7 @@ class Heartbeat:
         # TODO: Implement when platform endpoint is ready
         pass
 
-# === Boot Report ===
-def check_boot_report():
-    """Check if we just rebooted and send report"""
-    last_will_path = LOG_DIR / "last_will.json"
-
-    if last_will_path.exists():
-        try:
-            with open(last_will_path, "r") as f:
-                last_will = json.load(f)
-
-            log.info("System was rebooted by Phoenix")
-            alerts.add(
-                "boot_after_phoenix_reboot",
-                "info",
-                "System booted after Phoenix-initiated reboot",
-                last_will
-            )
-
-            # Remove last will after processing
-            last_will_path.unlink()
-
-        except Exception as e:
-            log.error(f"Failed to process last will: {e}")
+# Boot report removed in v1.9.0 - Phoenix no longer reboots the system.
 
 # === Hardware Watchdog (DISABLED) ===
 class HardwareWatchdog:
@@ -1178,7 +868,6 @@ class PhoenixDaemon:
         self.running = True
         self.service_guardian = ServiceGuardian()
         self.connectivity = ConnectivitySentinel()
-        self.network_recovery = NetworkRecovery()
         self.resources = ResourceMonitor()
         self.heartbeat = Heartbeat()
         self.watchdog = HardwareWatchdog()
@@ -1198,6 +887,42 @@ class PhoenixDaemon:
         log.info(f"Received signal {signum}, shutting down")
         self.running = False
         self.watchdog.disable()
+
+    def _cleanup_legacy_files(self):
+        """Remove files from older Phoenix versions that are no longer needed."""
+        legacy_files = [
+            LOG_DIR / "last_will.json",
+            LOG_DIR / "escalation_state.json",
+            LOG_DIR / "reboot_count.json",
+        ]
+        for f in legacy_files:
+            try:
+                if f.exists():
+                    f.unlink()
+                    log.info(f"Cleaned up legacy file: {f}")
+            except Exception as e:
+                log.debug(f"Could not remove {f}: {e}")
+
+        # Also restore dhcpcd.conf if Phoenix had disabled static IP lines
+        try:
+            dhcpcd = Path("/etc/dhcpcd.conf")
+            if dhcpcd.exists():
+                content = dhcpcd.read_text()
+                if "# PHOENIX_DISABLED:" in content:
+                    # Restore the original lines
+                    new_lines = []
+                    for line in content.splitlines():
+                        if line.startswith("# PHOENIX_DISABLED: "):
+                            new_lines.append(line.replace("# PHOENIX_DISABLED: ", ""))
+                        else:
+                            new_lines.append(line)
+                    dhcpcd.write_text("\n".join(new_lines) + "\n")
+                    subprocess.run(["systemctl", "restart", "dhcpcd"], capture_output=True, timeout=30)
+                    log.warning("Restored static IP lines that were disabled by older Phoenix version")
+                    alerts.add("network_config_restored", "warning",
+                              "Restored static IP config disabled by older Phoenix version")
+        except Exception as e:
+            log.debug(f"Could not check/restore dhcpcd.conf: {e}")
 
     def _is_setup_complete(self):
         """Check if the system is fully set up before enabling critical features.
@@ -1236,8 +961,8 @@ class PhoenixDaemon:
     def run(self):
         log.info(f"Phoenix Daemon v{VERSION} starting")
 
-        # Check if we just rebooted
-        check_boot_report()
+        # Clean up legacy files from older versions
+        self._cleanup_legacy_files()
 
         # sd_notify kept for backwards compatibility (no-op if service is Type=simple)
         def sd_notify(msg):
@@ -1255,7 +980,7 @@ class PhoenixDaemon:
                 pass
 
         sd_notify("READY=1")
-        log.info(f"Phoenix v{VERSION} started (Type=simple, no hardware watchdog)")
+        log.info(f"Phoenix v{VERSION} started (SAFE mode: no reboot, no network config changes)")
 
         last_service_check = 0
         last_connectivity_check = 0
@@ -1271,19 +996,14 @@ class PhoenixDaemon:
 
             try:
 
-                # Service check (every minute)
+                # Service check (every 2 minutes)
                 if now - last_service_check >= CHECK_INTERVAL:
                     self.service_guardian.check_all_services_v2()
                     last_service_check = now
 
-                # Connectivity check (every 30 seconds)
+                # Connectivity check (every minute)
                 if now - last_connectivity_check >= CONNECTIVITY_CHECK_INTERVAL:
-                    is_online = self.connectivity.update()
-
-                    # Check if we need to try DHCP recovery (level 3 = DHCP for static IP)
-                    if not is_online and self.connectivity.escalation_level >= 3:
-                        self.network_recovery.attempt_recovery(self.connectivity)
-
+                    self.connectivity.update()
                     last_connectivity_check = now
 
                 # Shinobi monitor check (every 5 minutes, only when online)
@@ -1331,12 +1051,6 @@ class PhoenixDaemon:
                     }
                     self.heartbeat.send(status)
                     last_heartbeat = now
-
-                # Try to enable watchdog if not yet enabled (setup may have completed)
-                if not self.watchdog.enabled and now - last_resource_check >= 300:
-                    if self._is_setup_complete():
-                        log.info("System setup now complete - enabling hardware watchdog")
-                        self.watchdog.enable()
 
                 # Alert cleanup (daily)
                 if now - last_alert_cleanup >= 86400:
