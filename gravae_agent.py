@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.11.1"
+VERSION = "2.11.2"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -1320,13 +1320,86 @@ def create_shinobi_user_in_db(group_key, user_id, email, password):
         print(f"[Shinobi DB] Exception: {e}")
         return {"success": False, "error": str(e)}
 
+def _find_shinobi_dir():
+    """Find the Shinobi installation directory."""
+    candidates = ['/home/Shinobi', '/opt/shinobi', '/home/camera']
+    for d in candidates:
+        if os.path.exists(os.path.join(d, 'conf.json')):
+            return d
+    return '/home/Shinobi'  # default
+
+def _modify_conf_json(shinobi_dir, updates):
+    """Directly modify Shinobi's conf.json in Python (no dependency on modifyConfiguration.js)."""
+    conf_path = os.path.join(shinobi_dir, 'conf.json')
+    try:
+        with open(conf_path, 'r') as f:
+            conf = json.load(f)
+        for key, value in updates.items():
+            conf[key] = value
+        with open(conf_path, 'w') as f:
+            json.dump(conf, f, indent=2)
+        print(f"[FTP Events] Updated conf.json: {list(updates.keys())}")
+        return True
+    except Exception as e:
+        print(f"[FTP Events] Failed to modify conf.json: {e}")
+        return False
+
+def _restart_shinobi():
+    """Restart Shinobi and wait for it to come back up."""
+    # Try PM2 first (common process names)
+    pm2_names = ['camera', 'Shinobi', 'shinobi']
+    restarted = False
+    for name in pm2_names:
+        result = subprocess.run(['pm2', 'restart', name],
+            capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            print(f"[FTP Events] Restarted Shinobi via pm2 ({name})")
+            restarted = True
+            break
+
+    if not restarted:
+        # Try systemctl
+        result = subprocess.run(['sudo', 'systemctl', 'restart', 'shinobi'],
+            capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            print("[FTP Events] Restarted Shinobi via systemctl")
+            restarted = True
+
+    if not restarted:
+        print("[FTP Events] Could not restart Shinobi (tried pm2 and systemctl)")
+        return False
+
+    # Wait for Shinobi to come back up
+    for i in range(20):
+        time.sleep(3)
+        try:
+            req = urllib.request.Request("http://localhost:8080/", method='GET')
+            urllib.request.urlopen(req, timeout=5)
+            print(f"[FTP Events] Shinobi is back up after {(i+1)*3}s")
+            return True
+        except:
+            pass
+    print("[FTP Events] Warning: Shinobi did not respond after 60s")
+    return True  # continue anyway
+
 def setup_ftp_events():
-    """Install ftp-srv and enable FTP event server in Shinobi for alarm input cameras."""
-    shinobi_dir = "/home/Shinobi"
+    """Install ftp-srv and enable FTP event server in Shinobi for alarm input cameras.
+    This runs in the foreground. For background execution, use setup_ftp_events_async().
+
+    Steps:
+    1. Install ftp-srv npm package in Shinobi directory
+    2. Enable FTP settings in conf.json (via super API or direct file edit)
+    3. Restart Shinobi to pick up changes
+    4. Verify FTP port is listening
+    """
+    shinobi_dir = _find_shinobi_dir()
+    print(f"[FTP Events] Shinobi dir: {shinobi_dir}")
+
+    # Step 1: Install ftp-srv npm package
     print("[FTP Events] Installing ftp-srv@4.6.2...")
     try:
         result = subprocess.run(['npm', 'install', 'ftp-srv@4.6.2'],
-            cwd=shinobi_dir, capture_output=True, text=True, timeout=120)
+            cwd=shinobi_dir, capture_output=True, text=True, timeout=180)
         if result.returncode != 0:
             print(f"[FTP Events] npm install failed: {result.stderr}")
             return {"success": False, "error": f"npm install ftp-srv failed: {result.stderr}"}
@@ -1335,62 +1408,98 @@ def setup_ftp_events():
         print(f"[FTP Events] npm install exception: {e}")
         return {"success": False, "error": str(e)}
 
-    print("[FTP Events] Modifying conf.json...")
-    try:
-        result = subprocess.run(['node', 'tools/modifyConfiguration.js',
-            'addToConfig={"dropInEventServer":true,"ftpServer":true}'],
-            cwd=shinobi_dir, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            print(f"[FTP Events] modifyConfiguration failed: {result.stderr}")
-            return {"success": False, "error": f"modifyConfiguration failed: {result.stderr}"}
-        print("[FTP Events] conf.json updated")
-    except Exception as e:
-        print(f"[FTP Events] modifyConfiguration exception: {e}")
-        return {"success": False, "error": str(e)}
+    # Step 2: Enable FTP in conf.json
+    # Full FTP configuration with all required settings
+    ftp_config = {
+        "dropInEventServer": True,
+        "ftpServer": True,
+        "ftpServerPort": 2121,
+        "ftpServerUrl": "ftp://0.0.0.0:{{PORT}}",
+        "dropInEventsDir": "/dev/shm/streams/dropInEvents",
+    }
 
+    # Try super admin API first (/super/{token}/system/configure)
+    super_token = ensure_super_admin_token()
+    if not super_token:
+        super_token = get_shinobi_super_key()
+
+    api_updated = False
+    if super_token:
+        print(f"[FTP Events] Trying super API to update conf.json...")
+        try:
+            # Read current conf.json, merge FTP settings, send via API
+            conf_path = os.path.join(shinobi_dir, 'conf.json')
+            with open(conf_path, 'r') as f:
+                current_conf = json.load(f)
+            current_conf.update(ftp_config)
+            configure_url = f"http://localhost:8080/super/{super_token}/system/configure"
+            req_data = json.dumps({"data": current_conf}).encode()
+            req = urllib.request.Request(configure_url, data=req_data,
+                headers={'Content-Type': 'application/json'}, method='POST')
+            response = urllib.request.urlopen(req, timeout=15)
+            resp_data = json.loads(response.read().decode())
+            if resp_data.get('ok'):
+                api_updated = True
+                print("[FTP Events] conf.json updated via super API")
+            else:
+                print(f"[FTP Events] Super API returned: {resp_data}")
+        except Exception as e:
+            print(f"[FTP Events] Super API failed: {e}")
+
+    # Fallback: direct file edit
+    if not api_updated:
+        print("[FTP Events] Updating conf.json directly...")
+        _modify_conf_json(shinobi_dir, ftp_config)
+
+    # Create dropInEvents directory
+    events_dir = "/dev/shm/streams/dropInEvents"
+    os.makedirs(events_dir, exist_ok=True)
+
+    # Step 3: Restart Shinobi so it picks up the FTP config
     print("[FTP Events] Restarting Shinobi...")
-    try:
-        subprocess.run(['pm2', 'restart', 'camera'],
-            capture_output=True, text=True, timeout=30)
-        # Wait for Shinobi to come back up
-        for i in range(30):
-            time.sleep(2)
-            try:
-                req = urllib.request.Request("http://localhost:8080/", method='GET')
-                urllib.request.urlopen(req, timeout=5)
-                print(f"[FTP Events] Shinobi is back up after {(i+1)*2}s")
-                break
-            except:
-                pass
-        else:
-            print("[FTP Events] Warning: Shinobi did not respond after 60s")
-        # Restart button service if it was running
-        try:
-            status = subprocess.run(['systemctl', 'is-active', 'gravae-buttons'],
-                capture_output=True, text=True, timeout=5)
-            if status.stdout.strip() in ('active', 'failed', 'inactive'):
-                subprocess.run(['systemctl', 'restart', 'gravae-buttons'],
-                    capture_output=True, text=True, timeout=15)
-                print("[FTP Events] Restarted gravae-buttons service")
-        except:
-            pass
-        # Also check legacy botao.py
-        try:
-            pgrep = subprocess.run(['pgrep', '-f', 'botao.py'],
-                capture_output=True, text=True, timeout=5)
-            if pgrep.returncode != 0:
-                # botao.py was running but died, try to restart it
-                botao_path = '/home/Gravae/botao.py'
-                if os.path.exists(botao_path):
-                    subprocess.Popen(['python3', botao_path],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    print("[FTP Events] Restarted legacy botao.py")
-        except:
-            pass
-    except Exception as e:
-        print(f"[FTP Events] pm2 restart exception: {e}")
+    _restart_shinobi()
 
-    return {"success": True}
+    # Step 4: Verify FTP port is listening
+    ftp_running = False
+    for i in range(10):
+        time.sleep(2)
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect(('127.0.0.1', 2121))
+            s.close()
+            ftp_running = True
+            print(f"[FTP Events] FTP server running on port 2121 (after {(i+1)*2}s)")
+            break
+        except:
+            pass
+
+    if not ftp_running:
+        print("[FTP Events] Warning: FTP port 2121 not listening after 20s")
+
+    # Restart button service if it was running
+    try:
+        subprocess.run(['systemctl', 'restart', 'gravae-buttons'],
+            capture_output=True, text=True, timeout=15)
+    except:
+        pass
+
+    print(f"[FTP Events] Setup complete (ftp_running={ftp_running})")
+    return {"success": True, "ftpRunning": ftp_running, "ftpPort": 2121}
+
+def setup_ftp_events_async():
+    """Run FTP events setup in a background thread.
+    Returns immediately so the HTTP response isn't blocked."""
+    def _run():
+        try:
+            result = setup_ftp_events()
+            if result.get('success'):
+                print("[FTP Events Async] FTP setup completed successfully")
+            else:
+                print(f"[FTP Events Async] FTP setup failed: {result.get('error')}")
+        except Exception as e:
+            print(f"[FTP Events Async] Exception: {e}")
+    threading.Thread(target=_run, daemon=True).start()
 
 def ensure_super_admin_token():
     """Ensure super.json has the correct password hash and a valid token.
@@ -3561,12 +3670,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                 save_config()
                 print(f"[Shinobi Setup] Saved credentials to config: apiKey={result['apiKey'][:8]}..., groupKey={result['groupKey']}")
             if result.get('success') and data.get('hasAlarmInput'):
-                print("[Shinobi Setup] hasAlarmInput=True, setting up FTP events...")
-                ftp_result = setup_ftp_events()
-                if not ftp_result.get('success'):
-                    result['ftpWarning'] = ftp_result.get('error', 'FTP setup failed')
-                else:
-                    result['ftpEnabled'] = True
+                print("[Shinobi Setup] hasAlarmInput=True, starting FTP events setup in background...")
+                setup_ftp_events_async()
+                result['ftpInstalling'] = True
             self._send_json({**result, "deviceId": CONFIG.get('deviceId'), "deviceSerial": get_device_serial()})
 
         elif path == '/shinobi/cleanup':
@@ -3575,6 +3681,42 @@ class AgentHandler(BaseHTTPRequestHandler):
                 return
             result = cleanup_shinobi(data['groupKey'], data['email'], data['password'])
             self._send_json(result)
+
+        elif path == '/shinobi/ftp-setup':
+            # Trigger FTP events setup (for alarm input cameras)
+            # Can be called directly for retry if the initial setup failed
+            setup_ftp_events_async()
+            self._send_json({"success": True, "message": "FTP setup started in background"})
+
+        elif path == '/shinobi/ftp-status':
+            # Check if Shinobi's FTP server is running
+            shinobi_dir = _find_shinobi_dir()
+            ftp_installed = os.path.exists(os.path.join(shinobi_dir, 'node_modules', 'ftp-srv'))
+            conf_path = os.path.join(shinobi_dir, 'conf.json')
+            ftp_enabled = False
+            try:
+                with open(conf_path, 'r') as f:
+                    conf = json.load(f)
+                    ftp_enabled = conf.get('ftpServer', False) and conf.get('dropInEventServer', False)
+            except:
+                pass
+            # Check if FTP port is listening (default 2121)
+            ftp_port_open = False
+            try:
+                import socket as _sock
+                s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect(('127.0.0.1', 2121))
+                s.close()
+                ftp_port_open = True
+            except:
+                pass
+            self._send_json({
+                "ftpInstalled": ftp_installed,
+                "ftpEnabled": ftp_enabled,
+                "ftpRunning": ftp_port_open,
+                "shinobiDir": shinobi_dir,
+            })
 
         elif path == '/phoenix/disable':
             # Emergency endpoint to disable Phoenix daemon and prevent reboots
