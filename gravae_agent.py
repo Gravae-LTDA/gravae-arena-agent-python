@@ -2123,6 +2123,361 @@ def deploy_button_daemon(script_content):
     except Exception as e:
         return {"success": False, "error": f"Excecao: {str(e)}"}
 
+
+def find_legacy_botao():
+    """Find legacy botao.py script on the filesystem and parse its triggers."""
+    import re
+
+    user = CONFIG.get('arenaUser', 'gravae')
+    arena_type = CONFIG.get('arenaType', 'gravae')
+    type_name = 'Replayme' if arena_type == 'replayme' else 'Gravae'
+
+    # Search common locations
+    search_paths = [
+        f'/home/{user}/botao.py',
+        f'/home/{user}/Documents/{type_name}/botao.py',
+        f'/home/{user}/Documents/Gravae/botao.py',
+        f'/home/{user}/Documents/Replayme/botao.py',
+    ]
+
+    botao_path = None
+    botao_content = None
+    for path in search_paths:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    botao_content = f.read()
+                botao_path = path
+                break
+            except Exception:
+                continue
+
+    if not botao_content:
+        return {"found": False, "triggers": [], "path": None}
+
+    # Parse btn_triggers dict from the script
+    # Matches patterns like:   13: ('http://...', 'Quadra 1'),
+    triggers = []
+    pattern = r'(\d+)\s*:\s*\(\s*[\'"]([^\'"]+)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]\s*\)'
+    for match in re.finditer(pattern, botao_content):
+        gpio = int(match.group(1))
+        url = match.group(2)
+        quadra = match.group(3)
+        triggers.append({"gpio": gpio, "url": url, "quadra": quadra})
+
+    return {"found": True, "triggers": triggers, "path": botao_path}
+
+
+def migrate_legacy_buttons():
+    """Migrate legacy botao.py to the standard button-daemon.py service."""
+    from datetime import datetime as dt
+
+    legacy = find_legacy_botao()
+    if not legacy["found"]:
+        return {"success": False, "error": "Nenhum botao.py encontrado no dispositivo"}
+
+    triggers = legacy["triggers"]
+    if not triggers:
+        return {"success": False, "error": f"botao.py encontrado em {legacy['path']} mas nenhum trigger parseado"}
+
+    user = CONFIG.get('arenaUser', 'gravae')
+    arena_type = CONFIG.get('arenaType', 'gravae')
+    type_name = 'Replayme' if arena_type == 'replayme' else 'Gravae'
+    daemon_dir = f'/home/{user}/Documents/{type_name}'
+    daemon_path = os.path.join(daemon_dir, 'button-daemon.py')
+
+    # Build triggers code
+    triggers_code = ""
+    for t in triggers:
+        triggers_code += f"    {t['gpio']}: ('{t['url']}', '{t['quadra']}'),\n"
+
+    # Extract API_KEY and GROUP_KEY from first trigger URL
+    api_key = ""
+    group_key = ""
+    if triggers:
+        import re
+        url = triggers[0]["url"]
+        m = re.match(r'https?://[^/]+/([^/]+)/motion/([^/]+)/', url)
+        if m:
+            api_key = m.group(1)
+            group_key = m.group(2)
+
+    # Generate the standard button-daemon.py script
+    script = f'''#!/usr/bin/env python3
+"""
+Gravae Button Daemon
+Migrated from: {legacy["path"]}
+Generated: {dt.now().isoformat()}
+
+Uses RPi.GPIO with polling (no pigpiod dependency).
+Detects button presses via falling edge on GPIO pins (active LOW with pull-up).
+"""
+
+import RPi.GPIO as GPIO
+import requests
+import time
+import os
+import signal
+import sys
+import threading
+from datetime import datetime, date
+
+# =========================
+# CONFIG
+# =========================
+COOLDOWN = 5.0          # Cooldown per button (seconds)
+DEBOUNCE_TIME = 0.2     # Debounce time (seconds)
+POLL_INTERVAL = 0.05    # Polling interval (50ms for responsiveness)
+HTTP_TIMEOUT = 5        # HTTP request timeout (seconds)
+HEARTBEAT_INTERVAL = 60 # Heartbeat log interval (seconds)
+STUCK_LOW_THRESHOLD = 20 # Alert after pin stuck LOW this many seconds
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+DETAILS_FILE = os.path.join(LOG_DIR, 'button_presses_details.txt')
+DAILY_TOTALS_FILE = os.path.join(LOG_DIR, 'button_presses.txt')
+
+# =========================
+# SHINOBI CONFIG
+# =========================
+API_KEY = '{api_key}'
+GROUP_KEY = '{group_key}'
+
+# =========================
+# BUTTON TRIGGERS: GPIO -> (URL, QUADRA)
+# =========================
+BTN_TRIGGERS = {{
+{triggers_code}}}
+
+# =========================
+# GPIO SETUP
+# =========================
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+for pin in BTN_TRIGGERS:
+    GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# =========================
+# STATE
+# =========================
+button_state = {{pin: GPIO.input(pin) for pin in BTN_TRIGGERS}}
+last_change_time = {{pin: 0.0 for pin in BTN_TRIGGERS}}
+cooldown_expire = {{pin: 0.0 for pin in BTN_TRIGGERS}}
+low_since = {{pin: None for pin in BTN_TRIGGERS}}
+button_presses = {{pin: 0 for pin in BTN_TRIGGERS}}
+current_day = date.today()
+stopping = False
+lock = threading.Lock()
+
+# =========================
+# HELPERS
+# =========================
+def ensure_log_dir():
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR, exist_ok=True)
+
+def append_line(filepath, line):
+    ensure_log_dir()
+    with open(filepath, 'a') as f:
+        f.write(line + '\\n')
+
+def now_str():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+def save_daily_totals(day_to_save):
+    parts = []
+    total = 0
+    for pin in BTN_TRIGGERS:
+        count = button_presses[pin]
+        if count > 0:
+            quadra = BTN_TRIGGERS[pin][1]
+            parts.append(f'{{quadra}}: {{count}}')
+            total += count
+            button_presses[pin] = 0
+    line = f'{{day_to_save}} - {{", ".join(parts) + ", " if parts else ""}}Total: {{total}}'
+    append_line(DAILY_TOTALS_FILE, line)
+
+def rollover_if_needed():
+    global current_day
+    today = date.today()
+    if today > current_day:
+        try:
+            save_daily_totals(current_day)
+        except Exception as e:
+            print(f'[WARN] Falha ao salvar totais: {{e}}')
+        current_day = today
+
+# =========================
+# HTTP REQUEST (THREADED)
+# =========================
+def send_request(url, quadra, ts):
+    try:
+        response = requests.get(url, timeout=HTTP_TIMEOUT)
+        print(f'[HTTP] {{ts}} {{quadra}} -> {{response.status_code}}')
+    except requests.RequestException as e:
+        print(f'[HTTP] {{ts}} {{quadra}} -> ERRO: {{e}}')
+
+# =========================
+# BUTTON PRESS HANDLER
+# =========================
+def on_button_press(pin):
+    rollover_if_needed()
+    url, quadra = BTN_TRIGGERS[pin]
+    ts = now_str()
+    button_presses[pin] += 1
+    append_line(DETAILS_FILE, f'{{ts}} - {{quadra}}')
+    print(f'[PRESS] {{ts}} - {{quadra}} (GPIO{{pin}})')
+    t = threading.Thread(target=send_request, args=(url, quadra, ts))
+    t.daemon = True
+    t.start()
+
+# =========================
+# POLLING LOOP
+# =========================
+def poll_buttons():
+    current_time = time.time()
+    for pin in BTN_TRIGGERS:
+        state = GPIO.input(pin)
+        if state != button_state[pin] and (current_time - last_change_time[pin]) > DEBOUNCE_TIME:
+            if not state:
+                with lock:
+                    if current_time >= cooldown_expire[pin]:
+                        on_button_press(pin)
+                        cooldown_expire[pin] = current_time + COOLDOWN
+            button_state[pin] = state
+            last_change_time[pin] = current_time
+        if state == 0:
+            if low_since[pin] is None:
+                low_since[pin] = current_time
+            elif (current_time - low_since[pin]) >= STUCK_LOW_THRESHOLD:
+                quadra = BTN_TRIGGERS[pin][1]
+                dur = int(current_time - low_since[pin])
+                print(f'[ALERT] {{now_str()}} {{quadra}} (GPIO{{pin}}) stuck LOW ~{{dur}}s')
+                low_since[pin] = current_time
+        else:
+            low_since[pin] = None
+
+# =========================
+# HEARTBEAT
+# =========================
+last_heartbeat = time.time()
+
+def check_heartbeat():
+    global last_heartbeat
+    now = time.time()
+    if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+        rollover_if_needed()
+        pins_str = ', '.join(str(p) for p in BTN_TRIGGERS)
+        print(f'[HB] {{now_str()}} alive | GPIOs: {{pins_str}}')
+        last_heartbeat = now
+
+# =========================
+# SHUTDOWN
+# =========================
+def shutdown(signum=None, frame=None):
+    global stopping
+    if stopping:
+        return
+    stopping = True
+    print('[EXIT] Shutting down...')
+    try:
+        save_daily_totals(current_day)
+    except Exception as e:
+        print(f'[WARN] Falha ao salvar totais: {{e}}')
+    GPIO.cleanup()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, shutdown)
+signal.signal(signal.SIGTERM, shutdown)
+
+# =========================
+# MAIN
+# =========================
+print(f'[INIT] Gravae Button Daemon started')
+print(f'[INIT] Buttons: {{len(BTN_TRIGGERS)}}')
+print(f'[INIT] GPIOs: {{", ".join(str(p) for p in BTN_TRIGGERS)}}')
+print(f'[INIT] Cooldown: {{COOLDOWN}}s | Debounce: {{DEBOUNCE_TIME}}s | Poll: {{POLL_INTERVAL}}s')
+
+try:
+    while not stopping:
+        poll_buttons()
+        check_heartbeat()
+        time.sleep(POLL_INTERVAL)
+except KeyboardInterrupt:
+    shutdown()
+except Exception as e:
+    print(f'[FATAL] {{e}}')
+    shutdown()
+'''
+
+    try:
+        # Write the new script
+        os.makedirs(daemon_dir, exist_ok=True)
+        with open(daemon_path, 'w') as f:
+            f.write(script)
+        os.chmod(daemon_path, 0o755)
+
+        # Create/update systemd service for Python daemon
+        service_content = f"""[Unit]
+Description=Gravae Button Daemon
+After=network.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u {daemon_path}
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=5
+User=root
+WorkingDirectory={daemon_dir}
+
+[Install]
+WantedBy=multi-user.target
+"""
+        with open('/etc/systemd/system/gravae-buttons.service', 'w') as f:
+            f.write(service_content)
+
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+        subprocess.run(['systemctl', 'enable', 'gravae-buttons'], capture_output=True)
+
+        # Kill legacy botao.py process if running
+        subprocess.run(['pkill', '-f', 'botao.py'], capture_output=True)
+        time.sleep(1)
+
+        # Start the new service
+        subprocess.run(['systemctl', 'restart', 'gravae-buttons'], capture_output=True)
+        time.sleep(2)
+
+        # Verify
+        status = subprocess.run(['systemctl', 'is-active', 'gravae-buttons'], capture_output=True, text=True)
+        is_active = status.stdout.strip() == 'active'
+
+        if not is_active:
+            journal = subprocess.run(
+                ['journalctl', '-u', 'gravae-buttons', '-n', '10', '--no-pager'],
+                capture_output=True, text=True
+            )
+            return {
+                "success": False,
+                "error": "Servico migrado mas nao iniciou",
+                "triggers": triggers,
+                "details": journal.stdout[:500] if journal.stdout else "Sem logs"
+            }
+
+        return {
+            "success": True,
+            "message": f"Migrado {len(triggers)} botoes de {legacy['path']}",
+            "triggers": triggers,
+            "legacyPath": legacy["path"],
+            "newPath": daemon_path,
+            "serviceActive": True
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Excecao na migracao: {str(e)}", "triggers": triggers}
+
+
 # === Cleanup ===
 def cleanup_arena(options=None):
     """Clean up arena data from the device"""
@@ -3011,6 +3366,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             result = run_tunnel_with_token(tunnel_token, tunnel_name)
             self._send_json(result)
 
+        elif path == '/buttons/migrate-legacy':
+            self._send_json(migrate_legacy_buttons())
+
         elif path == '/buttons/deploy':
             if not data.get('script'):
                 self._send_json({"success": False, "error": "Script required"}, 400)
@@ -3216,6 +3574,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/hardware/info': lambda: {"model": get_device_model(), "serial": get_device_serial(), "os": get_os_info(), "gpio": get_gpio_info()},
             '/gpio/info': get_gpio_info,
             '/buttons/status': get_button_daemon_status,
+            '/buttons/legacy': find_legacy_botao,
             '/discovery': get_full_discovery,
             '/phoenix/status': get_phoenix_status,
             '/phoenix/alerts': get_phoenix_alerts,
