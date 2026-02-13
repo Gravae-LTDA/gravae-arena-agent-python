@@ -73,7 +73,7 @@ DISK_WARNING = 85  # Percent
 DISK_CRITICAL = 95
 MEMORY_WARNING = 85
 MEMORY_CRITICAL = 95
-VOLTAGE_LOW = 4.75  # Volts - RPi recommended minimum for USB power (used only in alert messages)
+VOLTAGE_LOW = 4.63  # Volts - RPi hardware undervoltage threshold (firmware-defined)
 
 # === Logging Setup ===
 def setup_logging():
