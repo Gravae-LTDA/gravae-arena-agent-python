@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.10.13"
+VERSION = "2.11.0"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -720,10 +720,178 @@ def check_for_updates():
     current = VERSION
     return {"currentVersion": current, "latestVersion": current, "updateAvailable": False}
 
+UPDATE_FLAG_FILE = "/tmp/gravae-update-timestamp"
+BACKUP_SUFFIX = ".pre-update"
+
+def _backup_before_update():
+    """Backup current agent files before updating. Returns True if backup succeeded."""
+    files_to_backup = ["gravae_agent.py", "phoenix_daemon.py"]
+    backed_up = []
+    for filename in files_to_backup:
+        src = os.path.join(AGENT_PATH, filename)
+        dst = src + BACKUP_SUFFIX
+        if os.path.exists(src):
+            try:
+                subprocess.run(['sudo', 'cp', src, dst], check=True)
+                backed_up.append(filename)
+            except Exception as e:
+                print(f"[SafeUpdate] Failed to backup {filename}: {e}")
+    # Write update timestamp
+    try:
+        with open(UPDATE_FLAG_FILE, 'w') as f:
+            f.write(str(int(time.time())))
+        print(f"[SafeUpdate] Backed up {len(backed_up)} files: {backed_up}")
+    except Exception as e:
+        print(f"[SafeUpdate] Failed to write update flag: {e}")
+    return len(backed_up) > 0
+
+def _clear_update_backup():
+    """Remove backup files and update flag - called when update is verified healthy."""
+    for filename in ["gravae_agent.py", "phoenix_daemon.py"]:
+        backup = os.path.join(AGENT_PATH, filename + BACKUP_SUFFIX)
+        if os.path.exists(backup):
+            try:
+                os.unlink(backup)
+            except:
+                subprocess.run(['sudo', 'rm', '-f', backup], capture_output=True)
+    try:
+        if os.path.exists(UPDATE_FLAG_FILE):
+            os.unlink(UPDATE_FLAG_FILE)
+    except:
+        pass
+    print("[SafeUpdate] Update verified healthy - backups cleared")
+
+def _restore_from_backup():
+    """Restore agent files from backup. Called by recovery service."""
+    restored = []
+    for filename in ["gravae_agent.py", "phoenix_daemon.py"]:
+        backup = os.path.join(AGENT_PATH, filename + BACKUP_SUFFIX)
+        target = os.path.join(AGENT_PATH, filename)
+        if os.path.exists(backup):
+            try:
+                subprocess.run(['sudo', 'cp', backup, target], check=True)
+                subprocess.run(['sudo', 'rm', '-f', backup], check=True)
+                restored.append(filename)
+            except Exception as e:
+                print(f"[SafeUpdate] Failed to restore {filename}: {e}")
+    try:
+        if os.path.exists(UPDATE_FLAG_FILE):
+            os.unlink(UPDATE_FLAG_FILE)
+    except:
+        pass
+    if restored:
+        print(f"[SafeUpdate] ROLLED BACK {len(restored)} files: {restored}")
+    return restored
+
+def _install_recovery_service():
+    """Install systemd recovery timer that auto-rollbacks failed updates."""
+    recovery_script = f"""#!/bin/bash
+# Gravae Agent Update Recovery
+# Checks if agent is in crash loop after update and rolls back
+AGENT_PATH="{AGENT_PATH}"
+FLAG_FILE="{UPDATE_FLAG_FILE}"
+LOG="/var/log/gravae-agent-recovery.log"
+
+if systemctl is-active --quiet gravae-agent; then
+    exit 0  # Agent is running fine
+fi
+
+if [ ! -f "$FLAG_FILE" ]; then
+    exit 0  # No recent update, nothing to rollback
+fi
+
+UPDATE_TIME=$(cat "$FLAG_FILE" 2>/dev/null)
+CURRENT_TIME=$(date +%s)
+DIFF=$((CURRENT_TIME - UPDATE_TIME))
+
+if [ $DIFF -lt 120 ]; then
+    exit 0  # Less than 2 minutes since update, give it time
+fi
+
+# Agent is down + update flag exists + >2 min since update = rollback
+RESTORED=0
+for FILE in gravae_agent.py phoenix_daemon.py; do
+    BACKUP="${{AGENT_PATH}}/${{FILE}}.pre-update"
+    if [ -f "$BACKUP" ]; then
+        cp "$BACKUP" "${{AGENT_PATH}}/${{FILE}}"
+        rm -f "$BACKUP"
+        RESTORED=$((RESTORED + 1))
+        echo "$(date): Restored $FILE from backup" >> "$LOG"
+    fi
+done
+
+rm -f "$FLAG_FILE"
+
+if [ $RESTORED -gt 0 ]; then
+    echo "$(date): ROLLBACK complete ($RESTORED files). Restarting agent..." >> "$LOG"
+    systemctl restart gravae-agent
+else
+    echo "$(date): Agent down but no backups found" >> "$LOG"
+fi
+"""
+    timer_content = """[Unit]
+Description=Gravae Agent Update Recovery Timer
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=30
+
+[Install]
+WantedBy=timers.target
+"""
+    service_content = """[Unit]
+Description=Gravae Agent Update Recovery
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gravae-agent/recovery.sh
+"""
+    try:
+        # Write recovery script
+        script_path = os.path.join(AGENT_PATH, 'recovery.sh')
+        with open('/tmp/gravae-recovery.sh', 'w') as f:
+            f.write(recovery_script)
+        subprocess.run(['sudo', 'mv', '/tmp/gravae-recovery.sh', script_path], check=True)
+        subprocess.run(['sudo', 'chmod', '+x', script_path], check=True)
+
+        # Write timer
+        with open('/tmp/gravae-agent-recovery.timer', 'w') as f:
+            f.write(timer_content)
+        subprocess.run(['sudo', 'mv', '/tmp/gravae-agent-recovery.timer',
+                       '/etc/systemd/system/gravae-agent-recovery.timer'], check=True)
+
+        # Write service
+        with open('/tmp/gravae-agent-recovery.service', 'w') as f:
+            f.write(service_content)
+        subprocess.run(['sudo', 'mv', '/tmp/gravae-agent-recovery.service',
+                       '/etc/systemd/system/gravae-agent-recovery.service'], check=True)
+
+        # Enable and start timer
+        subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True)
+        subprocess.run(['sudo', 'systemctl', 'enable', 'gravae-agent-recovery.timer'], capture_output=True)
+        subprocess.run(['sudo', 'systemctl', 'start', 'gravae-agent-recovery.timer'], capture_output=True)
+
+        print("[SafeUpdate] Recovery timer installed and started")
+    except Exception as e:
+        print(f"[SafeUpdate] Failed to install recovery service: {e}")
+
+def _startup_health_check():
+    """Background thread: if we're running after an update, wait 60s then mark as healthy."""
+    if not os.path.exists(UPDATE_FLAG_FILE):
+        return
+    print(f"[SafeUpdate] Post-update health check started (60s countdown)")
+    time.sleep(60)
+    # If we got here, the agent has been running for 60s = healthy
+    _clear_update_backup()
+
 def perform_update():
     """Perform update - tries git pull first, falls back to direct download from GitHub"""
     global update_status
     try:
+        # SAFE UPDATE: backup current files before doing anything
+        update_status = {"status": "downloading", "progress": 5, "message": "Fazendo backup...", "error": None}
+        _backup_before_update()
+
         update_status = {"status": "downloading", "progress": 10, "message": "Verificando repositorio...", "error": None}
         if os.path.exists(os.path.join(AGENT_PATH, '.git')):
             update_status = {"status": "downloading", "progress": 20, "message": "Git pull...", "error": None}
@@ -804,6 +972,10 @@ def _perform_update_direct():
 def _restart_services():
     """Restart phoenix first, then agent (agent restart kills this process)"""
     global update_status
+
+    # Install recovery service BEFORE restarting (safety net for crash loops)
+    update_status = {"status": "installing", "progress": 55, "message": "Instalando recovery service...", "error": None}
+    _install_recovery_service()
 
     # Restart Phoenix FIRST (before agent, because agent restart kills this process)
     update_status = {"status": "installing", "progress": 60, "message": "Configurando Phoenix service...", "error": None}
@@ -3310,6 +3482,19 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._send_json({"success": True, "message": "Restarting..."})
             threading.Thread(target=lambda: (time.sleep(1), restart_agent()), daemon=True).start()
 
+        elif path == '/update/rollback':
+            # Manual rollback to pre-update version
+            backup_exists = os.path.exists(os.path.join(AGENT_PATH, 'gravae_agent.py' + BACKUP_SUFFIX))
+            if not backup_exists:
+                self._send_json({"success": False, "error": "No backup found to rollback to"})
+            else:
+                restored = _restore_from_backup()
+                if restored:
+                    self._send_json({"success": True, "message": f"Rolled back {len(restored)} files. Restarting...", "restored": restored})
+                    threading.Thread(target=lambda: (time.sleep(1), restart_agent()), daemon=True).start()
+                else:
+                    self._send_json({"success": False, "error": "Rollback failed - no files restored"})
+
         elif path == '/shinobi/setup':
             if not data.get('groupKey') or not data.get('email') or not data.get('password'):
                 self._send_json({"success": False, "error": "groupKey, email and password required"}, 400)
@@ -3575,6 +3760,12 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/gpio/info': get_gpio_info,
             '/buttons/status': get_button_daemon_status,
             '/buttons/legacy': find_legacy_botao,
+            '/update/backup-status': lambda: {
+                "hasBackup": os.path.exists(os.path.join(AGENT_PATH, 'gravae_agent.py' + BACKUP_SUFFIX)),
+                "updatePending": os.path.exists(UPDATE_FLAG_FILE),
+                "updateTimestamp": int(open(UPDATE_FLAG_FILE).read()) if os.path.exists(UPDATE_FLAG_FILE) else None,
+                "recoveryTimerActive": subprocess.run(['systemctl', 'is-active', 'gravae-agent-recovery.timer'], capture_output=True, text=True).stdout.strip() == 'active',
+            },
             '/discovery': get_full_discovery,
             '/phoenix/status': get_phoenix_status,
             '/phoenix/alerts': get_phoenix_alerts,
@@ -3592,6 +3783,9 @@ class AgentHandler(BaseHTTPRequestHandler):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {args[0]}")
 
 def main():
+    # Start post-update health check if needed (background thread)
+    threading.Thread(target=_startup_health_check, daemon=True).start()
+
     server = HTTPServer(('0.0.0.0', PORT), AgentHandler)
     print(f"Gravae Agent v{VERSION} on port {PORT}")
     server.serve_forever()
