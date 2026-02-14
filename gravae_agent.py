@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.12.1"
+VERSION = "2.12.2"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -2259,20 +2259,35 @@ def get_full_discovery():
     }
 
 # === Button Daemon ===
-def check_button_daemon_deps():
+def check_button_daemon_deps(script_content=None):
     """Check if dependencies for button daemon are available"""
     issues = []
+
+    # If script is Python, only check for python3 + RPi.GPIO
+    if script_content and ('import RPi.GPIO' in script_content or script_content.startswith('#!/usr/bin/env python3')):
+        result = subprocess.run(['which', 'python3'], capture_output=True)
+        if result.returncode != 0:
+            issues.append("python3 nao instalado")
+        else:
+            # Check if RPi.GPIO (or rpi-lgpio drop-in) is available
+            check = subprocess.run(
+                ['python3', '-c', 'import RPi.GPIO'],
+                capture_output=True, text=True, timeout=10
+            )
+            if check.returncode != 0:
+                issues.append("RPi.GPIO nao instalado (sudo apt install python3-rpi-lgpio ou python3-rpi.gpio)")
+        return issues
+
+    # Legacy: Node.js-based daemons
     gpio_info = get_gpio_info()
     recommended = gpio_info.get('recommended_lib', 'pigpio')
     daemon_dir = os.path.dirname(_get_button_daemon_path())
 
     if recommended == 'gpiomon':
-        # Trixie/Bookworm: check for gpiomon (libgpiod)
         result = subprocess.run(['which', 'gpiomon'], capture_output=True)
         if result.returncode != 0:
             issues.append("gpiomon nao instalado (sudo apt install gpiod)")
     elif recommended == 'onoff':
-        # Pi 5: check for Node.js and onoff
         result = subprocess.run(['which', 'node'], capture_output=True)
         if result.returncode != 0:
             issues.append("Node.js nao esta instalado")
@@ -2280,11 +2295,9 @@ def check_button_daemon_deps():
         if not os.path.exists(onoff_path):
             issues.append("Biblioteca 'onoff' nao instalada (npm install onoff)")
     else:
-        # Bullseye: check for Node.js and pigpio
         result = subprocess.run(['which', 'node'], capture_output=True)
         if result.returncode != 0:
             issues.append("Node.js nao esta instalado")
-        # pigpio npm module does direct hardware access - pigpiod must be STOPPED
         pigpiod_check = subprocess.run(['pgrep', 'pigpiod'], capture_output=True)
         if pigpiod_check.returncode == 0:
             subprocess.run(['sudo', 'killall', 'pigpiod'], capture_output=True)
@@ -2297,7 +2310,7 @@ def check_button_daemon_deps():
 
 def deploy_button_daemon(script_content):
     try:
-        dep_issues = check_button_daemon_deps()
+        dep_issues = check_button_daemon_deps(script_content)
         if dep_issues:
             return {
                 "success": False,
@@ -2308,68 +2321,74 @@ def deploy_button_daemon(script_content):
         daemon_dir = os.path.dirname(_get_button_daemon_path())
         os.makedirs(daemon_dir, exist_ok=True)
 
-        gpio_info = get_gpio_info()
-        recommended = gpio_info.get('recommended_lib', 'pigpio')
+        # Detect script type: Python or Node.js
+        is_python = ('import RPi.GPIO' in script_content or script_content.startswith('#!/usr/bin/env python3'))
 
-        # Determine script path based on type
-        if recommended == 'gpiomon':
-            # Bash script for gpiomon
-            script_path = os.path.join(daemon_dir, 'button-daemon.sh')
-            exec_cmd = script_path
+        if is_python:
+            script_path = os.path.join(daemon_dir, 'button-daemon.py')
+            exec_cmd = f"/usr/bin/python3 -u {script_path}"
+            daemon_type = "python"
         else:
-            # Node.js script
-            script_path = _get_button_daemon_path()
-            exec_cmd = f"/usr/bin/node {script_path}"
+            gpio_info = get_gpio_info()
+            recommended = gpio_info.get('recommended_lib', 'pigpio')
 
-        # Install npm dependencies if needed (for Node.js scripts)
-        if recommended == 'pigpio':
-            pigpio_path = os.path.join(daemon_dir, 'node_modules', 'pigpio')
-            if not os.path.exists(pigpio_path):
-                print("[Buttons] pigpio npm module missing, installing...")
-                pkg_json = os.path.join(daemon_dir, 'package.json')
-                if not os.path.exists(pkg_json):
-                    subprocess.run(['npm', 'init', '-y'], cwd=daemon_dir, capture_output=True, timeout=10)
-                env = os.environ.copy()
-                env['NODE_OPTIONS'] = '--dns-result-order=ipv4first'
-                subprocess.run(['npm', 'config', 'set', 'prefer-ip-version', '4'],
-                    cwd=daemon_dir, capture_output=True, timeout=10)
-                install_result = subprocess.run(
-                    ['npm', 'install', 'pigpio'],
-                    cwd=daemon_dir, capture_output=True, text=True, timeout=120, env=env
-                )
-                if install_result.returncode != 0:
-                    return {
-                        "success": False,
-                        "error": f"Falha ao instalar pigpio npm: {install_result.stderr[:200]}",
-                        "details": install_result.stderr
-                    }
-                print("[Buttons] pigpio npm module installed")
-        elif recommended == 'onoff':
-            onoff_path = os.path.join(daemon_dir, 'node_modules', 'onoff')
-            if not os.path.exists(onoff_path):
-                print("[Buttons] onoff npm module missing, installing...")
-                pkg_json = os.path.join(daemon_dir, 'package.json')
-                if not os.path.exists(pkg_json):
-                    subprocess.run(['npm', 'init', '-y'], cwd=daemon_dir, capture_output=True, timeout=10)
-                install_result = subprocess.run(
-                    ['npm', 'install', 'onoff'],
-                    cwd=daemon_dir, capture_output=True, text=True, timeout=120
-                )
-                if install_result.returncode != 0:
-                    return {
-                        "success": False,
-                        "error": f"Falha ao instalar onoff npm: {install_result.stderr[:200]}",
-                        "details": install_result.stderr
-                    }
-                print("[Buttons] onoff npm module installed")
+            if recommended == 'gpiomon':
+                script_path = os.path.join(daemon_dir, 'button-daemon.sh')
+                exec_cmd = script_path
+                daemon_type = "gpiomon"
+            else:
+                script_path = _get_button_daemon_path()
+                exec_cmd = f"/usr/bin/node {script_path}"
+                daemon_type = "nodejs"
+
+            # Install npm dependencies if needed (for Node.js scripts only)
+            if recommended == 'pigpio':
+                pigpio_path = os.path.join(daemon_dir, 'node_modules', 'pigpio')
+                if not os.path.exists(pigpio_path):
+                    print("[Buttons] pigpio npm module missing, installing...")
+                    pkg_json = os.path.join(daemon_dir, 'package.json')
+                    if not os.path.exists(pkg_json):
+                        subprocess.run(['npm', 'init', '-y'], cwd=daemon_dir, capture_output=True, timeout=10)
+                    env = os.environ.copy()
+                    env['NODE_OPTIONS'] = '--dns-result-order=ipv4first'
+                    subprocess.run(['npm', 'config', 'set', 'prefer-ip-version', '4'],
+                        cwd=daemon_dir, capture_output=True, timeout=10)
+                    install_result = subprocess.run(
+                        ['npm', 'install', 'pigpio'],
+                        cwd=daemon_dir, capture_output=True, text=True, timeout=120, env=env
+                    )
+                    if install_result.returncode != 0:
+                        return {
+                            "success": False,
+                            "error": f"Falha ao instalar pigpio npm: {install_result.stderr[:200]}",
+                            "details": install_result.stderr
+                        }
+                    print("[Buttons] pigpio npm module installed")
+            elif recommended == 'onoff':
+                onoff_path = os.path.join(daemon_dir, 'node_modules', 'onoff')
+                if not os.path.exists(onoff_path):
+                    print("[Buttons] onoff npm module missing, installing...")
+                    pkg_json = os.path.join(daemon_dir, 'package.json')
+                    if not os.path.exists(pkg_json):
+                        subprocess.run(['npm', 'init', '-y'], cwd=daemon_dir, capture_output=True, timeout=10)
+                    install_result = subprocess.run(
+                        ['npm', 'install', 'onoff'],
+                        cwd=daemon_dir, capture_output=True, text=True, timeout=120
+                    )
+                    if install_result.returncode != 0:
+                        return {
+                            "success": False,
+                            "error": f"Falha ao instalar onoff npm: {install_result.stderr[:200]}",
+                            "details": install_result.stderr
+                        }
+                    print("[Buttons] onoff npm module installed")
 
         # Write the script
         with open(script_path, 'w') as f:
             f.write(script_content)
         os.chmod(script_path, 0o755)
 
-        # Update systemd service to use correct exec command
-        daemon_type = "gpiomon" if recommended == 'gpiomon' else "nodejs"
+        # Update systemd service
         service_lines = [
             "[Unit]",
             f"Description=Gravae Button Daemon ({daemon_type})",
@@ -2380,11 +2399,12 @@ def deploy_button_daemon(script_content):
             "[Service]",
             "Type=simple",
         ]
-        # Only kill pigpiod for pigpio (npm library), not needed for gpiomon or onoff
-        if recommended == 'pigpio':
-            service_lines.append('ExecStartPre=/bin/bash -c "killall pigpiod 2>/dev/null; rm -f /var/run/pigpio.pid; true"')
-            # pigpio uses port 8888 by default which conflicts with gravae-agent
-            service_lines.append("Environment=PIGPIO_PORT=8889")
+        # Only kill pigpiod for pigpio (npm library)
+        if not is_python and daemon_type == 'nodejs':
+            gpio_info = get_gpio_info()
+            if gpio_info.get('recommended_lib', 'pigpio') == 'pigpio':
+                service_lines.append('ExecStartPre=/bin/bash -c "killall pigpiod 2>/dev/null; rm -f /var/run/pigpio.pid; true"')
+                service_lines.append("Environment=PIGPIO_PORT=8889")
         service_lines.extend([
             f"ExecStart={exec_cmd}",
             "Restart=on-failure",
