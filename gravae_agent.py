@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.12.0"
+VERSION = "2.12.1"
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -2251,7 +2251,7 @@ def get_full_discovery():
         },
         "cloudflare": get_cloudflared_info(),
         "shinobi": get_shinobi_info(),
-        "buttonDaemon": get_button_daemon_status(),
+        "buttonDaemon": {**get_button_daemon_status(), **find_legacy_botao()},
         "agent": {
             "version": VERSION,
             "config": CONFIG
@@ -2455,8 +2455,11 @@ def find_legacy_botao():
     arena_type = CONFIG.get('arenaType', 'gravae')
     type_name = 'Replayme' if arena_type == 'replayme' else 'Gravae'
 
-    # Search common locations
+    # Search common locations (both legacy botao.py and platform button-daemon.py)
     search_paths = [
+        f'/home/{user}/Documents/{type_name}/button-daemon.py',
+        f'/home/{user}/Documents/Gravae/button-daemon.py',
+        f'/home/{user}/Documents/Replayme/button-daemon.py',
         f'/home/{user}/botao.py',
         f'/home/{user}/Documents/{type_name}/botao.py',
         f'/home/{user}/Documents/Gravae/botao.py',
@@ -2486,7 +2489,12 @@ def find_legacy_botao():
         gpio = int(match.group(1))
         url = match.group(2)
         quadra = match.group(3)
-        triggers.append({"gpio": gpio, "url": url, "quadra": quadra})
+        trigger = {"gpio": gpio, "url": url, "quadra": quadra}
+        # Extract monitorId from URL: /motion/{groupKey}/{monitorId}
+        mid_match = re.search(r'/motion/[^/]+/([^/?]+)', url)
+        if mid_match:
+            trigger["monitorId"] = mid_match.group(1)
+        triggers.append(trigger)
 
     return {"found": True, "triggers": triggers, "path": botao_path}
 
