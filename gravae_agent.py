@@ -26,7 +26,32 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "2.12.2"
+VERSION = "3.0.0"
+
+# Centralized logging
+try:
+    from gravae_logging import get_logger, get_recent_logs, get_log_file_entries, get_log_stats
+    log = get_logger('agent')
+except ImportError:
+    # Fallback if logging module not deployed yet
+    import logging
+    log = logging.getLogger('agent')
+    log.addHandler(logging.StreamHandler())
+    log.setLevel(logging.INFO)
+    get_recent_logs = lambda **kw: []
+    get_log_file_entries = lambda **kw: []
+    get_log_stats = lambda: {}
+
+# Coaching Review module (optional - loaded if files present)
+_coaching_module = None
+try:
+    from coaching_module import CoachingReviewModule
+    _coaching_module = CoachingReviewModule()
+    log.info("Coaching module loaded")
+except ImportError:
+    pass  # Coaching files not deployed yet
+except Exception as e:
+    log.error(f"Failed to load coaching module: {e}")
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
 AGENT_PATH = "/opt/gravae-agent"
@@ -887,6 +912,7 @@ def _startup_health_check():
 def perform_update():
     """Perform update - tries git pull first, falls back to direct download from GitHub"""
     global update_status
+    log.info("Starting agent update")
     try:
         # SAFE UPDATE: backup current files before doing anything
         update_status = {"status": "downloading", "progress": 5, "message": "Fazendo backup...", "error": None}
@@ -1149,47 +1175,243 @@ def create_api_key_in_db(group_key, user_id):
     api_key = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(30))
 
     try:
+        # Include treatAsSub, permissionSet, monitorsRestricted, monitorPermissions
+        # in the details JSON (not as separate columns - they may not exist in all versions)
         details = json.dumps({
-            "auth_socket": "1",
-            "api_key_create": "1",
-            "user_change": "1",
-            "edit_permissions": "1",
-            "get_monitors": "1",
-            "edit_monitors": "1",
-            "control_monitors": "1",
-            "monitor_create": "1",
-            "monitor_edit": "1",
-            "monitor_delete": "1",
-            "get_logs": "1",
-            "log_view": "1",
-            "watch_stream": "1",
-            "watch_snapshot": "1",
-            "watch_videos": "1",
-            "delete_videos": "1",
-            "video_delete": "1",
-            "view_events": "1",
-            "edit_events": "1",
-            "delete_events": "1",
-            "event_delete": "1"
+            "treatAsSub": "0", "permissionSet": "", "monitorsRestricted": "0",
+            "monitorPermissions": {},
+            "auth_socket": "1", "create_api_keys": "1", "edit_user": "1",
+            "edit_permissions": "1", "get_monitors": "1", "edit_monitors": "1",
+            "control_monitors": "1", "monitor_create": "1", "monitor_edit": "1",
+            "monitor_delete": "1", "get_logs": "1", "log_view": "1",
+            "watch_stream": "1", "watch_snapshot": "1", "watch_videos": "1",
+            "delete_videos": "1", "video_delete": "1", "view_events": "1",
+            "edit_events": "1", "delete_events": "1", "event_delete": "1",
+            "get_alarms": "1", "edit_alarms": "1"
         })
 
+        # Only use columns that exist in all Shinobi versions: ke, uid, ip, code, details
         sql = f"INSERT INTO API (ke, uid, ip, code, details) VALUES ('{group_key}', '{user_id}', '0.0.0.0', '{api_key}', '{details}') ON DUPLICATE KEY UPDATE code='{api_key}', details='{details}';"
 
+        env = dict(os.environ)
+        env['MYSQL_PWD'] = db_config.get('password') or ''
         result = subprocess.run([
             'mysql',
             '-u', db_config.get('user', 'majesticflame'),
-            f"-p{db_config.get('password', '')}",
             '-h', db_config.get('host', 'localhost'),
             db_config.get('database', 'ccio'),
             '-e', sql
-        ], capture_output=True, text=True, timeout=10)
+        ], env=env, capture_output=True, text=True, timeout=10)
 
         if result.returncode == 0:
             return api_key
+        else:
+            print(f"DB API key creation failed: {result.stderr[:200]}")
     except Exception as e:
         print(f"DB API key creation failed: {e}")
 
     return None
+
+def get_shinobi_monitors():
+    """Get all Shinobi monitors for the configured account."""
+    api_key = CONFIG.get('shinobiApiKey')
+    group_key = CONFIG.get('shinobiGroupKey')
+    if not api_key or not group_key:
+        return {"groupKey": group_key, "monitors": [], "error": "No Shinobi credentials"}
+    try:
+        url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+        req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        monitors = data if isinstance(data, list) else []
+        return {"groupKey": group_key, "monitors": monitors}
+    except Exception as e:
+        return {"groupKey": group_key, "monitors": [], "error": str(e)}
+
+
+def _cleanup_existing_coaching_account(email):
+    """Remove existing coaching account from Shinobi DB if it exists.
+    Uses direct MySQL (no Shinobi password needed).
+    """
+    db_config = get_shinobi_db_config()
+    if not db_config:
+        print(f"[Coaching Cleanup] Cannot read DB config, skipping cleanup")
+        return
+
+    mysql_cmd_base = [
+        'mysql',
+        '-u', db_config.get('user', 'majesticflame'),
+        f"-p{db_config.get('password', '')}",
+        '-h', db_config.get('host', 'localhost'),
+        db_config.get('database', 'ccio'),
+    ]
+
+    # Find the group key for this email
+    try:
+        sql = f"SELECT ke FROM Users WHERE mail = '{email}' LIMIT 1;"
+        result = subprocess.run(mysql_cmd_base + ['-N', '-e', sql],
+                                capture_output=True, text=True, timeout=10)
+        group_key = result.stdout.strip()
+        if not group_key:
+            print(f"[Coaching Cleanup] No existing account found for {email}")
+            return
+    except Exception as e:
+        print(f"[Coaching Cleanup] Error looking up user: {e}")
+        return
+
+    print(f"[Coaching Cleanup] Found existing coaching account {email} (gk={group_key}), removing...")
+
+    for table, where in [
+        ('Monitors', f"ke = '{group_key}'"),
+        ('API', f"ke = '{group_key}'"),
+        ('Users', f"ke = '{group_key}' AND mail = '{email}'"),
+    ]:
+        try:
+            sql = f"DELETE FROM {table} WHERE {where};"
+            subprocess.run(mysql_cmd_base + ['-e', sql],
+                           capture_output=True, text=True, timeout=10)
+            print(f"[Coaching Cleanup] Deleted from {table}")
+        except Exception as e:
+            print(f"[Coaching Cleanup] Error deleting from {table}: {e}")
+
+    print(f"[Coaching Cleanup] Cleanup complete for {email}")
+
+
+def setup_coaching_shinobi(arena_name, password=None):
+    """Create a separate Shinobi account for Coaching Review and clone all OPS monitors.
+
+    Flow:
+    1. Get OPS monitors from existing account
+    2. Create new Shinobi account with "Coaching - {arenaName}" prefix
+    3. Clone all OPS monitors to the new coaching account
+    4. Return new credentials (apiKey, groupKey)
+    """
+    _coaching_password_override = password
+    import string
+    import random
+
+    print(f"[Coaching Shinobi] Setting up coaching account for arena: {arena_name}")
+
+    # Step 1: Get OPS monitors
+    ops_api_key = CONFIG.get('shinobiApiKey')
+    ops_group_key = CONFIG.get('shinobiGroupKey')
+    if not ops_api_key or not ops_group_key:
+        return {"success": False, "error": "OPS Shinobi credentials not configured"}
+
+    try:
+        url = f"http://localhost:8080/{ops_api_key}/monitor/{ops_group_key}"
+        req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ops_monitors = json.loads(resp.read().decode())
+        if not isinstance(ops_monitors, list):
+            ops_monitors = []
+    except Exception as e:
+        return {"success": False, "error": f"Failed to list OPS monitors: {e}"}
+
+    if not ops_monitors:
+        return {"success": False, "error": "No monitors found in OPS Shinobi account"}
+
+    print(f"[Coaching Shinobi] Found {len(ops_monitors)} OPS monitors to clone")
+
+    # Step 2: Create coaching Shinobi account
+    safe_name = arena_name.lower().replace(' ', '-')[:30]
+    coaching_group_key = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(12))
+    coaching_email = f"coaching-{safe_name}@gravae.local"
+    coaching_password = _coaching_password_override or ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
+
+    result = setup_shinobi_account(coaching_group_key, coaching_email, coaching_password)
+    if not result.get('success'):
+        return {"success": False, "error": f"Failed to create coaching account: {result.get('error')}"}
+
+    coaching_api_key = result['apiKey']
+    coaching_gk = result['groupKey']
+    print(f"[Coaching Shinobi] Coaching account created: gk={coaching_gk[:8]}..., api={coaching_api_key[:8]}...")
+
+    # Step 3: Clone OPS monitors to coaching account via INSERT...SELECT
+    # (configureMonitor API has permission issues, so we use direct MySQL copy)
+    cloned = []
+    failed = []
+
+    db_config = get_shinobi_db_config()
+    if not db_config:
+        return {"success": False, "error": "Cannot read Shinobi DB config for monitor cloning"}
+
+    # Use MYSQL_PWD env var to avoid all -p quoting issues
+    mysql_env = dict(os.environ)
+    mysql_env['MYSQL_PWD'] = db_config.get('password') or ''
+    mysql_cmd_base = [
+        'mysql',
+        '-u', db_config.get('user', 'majesticflame'),
+        '-h', db_config.get('host', 'localhost'),
+        db_config.get('database', 'ccio'),
+    ]
+
+    def run_sql(sql, timeout=10):
+        return subprocess.run(
+            mysql_cmd_base + ['-N', '-e', sql],
+            env=mysql_env, capture_output=True, text=True, timeout=timeout
+        )
+
+    try:
+        # Test DB connection first
+        test_result = run_sql("SELECT COUNT(*) FROM Monitors")
+        print(f"[Coaching Shinobi] DB test: rc={test_result.returncode} out={test_result.stdout.strip()} err={test_result.stderr[:100]}")
+        if test_result.returncode != 0:
+            return {"success": False, "error": f"Cannot connect to Shinobi DB: {test_result.stderr[:200]}"}
+
+        # Delete existing coaching monitors
+        run_sql(f"DELETE FROM Monitors WHERE ke='{coaching_gk}'")
+
+        # Clone monitors via INSERT...SELECT (preserves all fields including details JSON)
+        # Note: shto/shfr columns may not exist in all Shinobi versions, so we exclude them
+        clone_sql = (
+            f"INSERT INTO Monitors (ke, mid, name, type, ext, protocol, host, path, port, fps, mode, width, height, details) "
+            f"SELECT '{coaching_gk}', mid, CONCAT('Coaching - ', name), type, ext, protocol, host, path, port, fps, 'stop', width, height, details "
+            f"FROM Monitors WHERE ke='{ops_group_key}'"
+        )
+        clone_result = run_sql(clone_sql, timeout=15)
+
+        if clone_result.returncode != 0:
+            full_err = clone_result.stderr
+            # Extract actual MySQL error (skip the SQL echo lines)
+            err_lines = [l for l in full_err.split('\n') if l.strip() and not l.startswith('-') and 'INSERT INTO' not in l and 'SELECT' not in l and 'CONCAT' not in l]
+            err_msg = '; '.join(err_lines)[:500] if err_lines else full_err[-500:]
+            print(f"[Coaching Shinobi] MySQL clone failed: {err_msg}")
+            return {"success": False, "error": f"MySQL clone failed: {err_msg}"}
+
+        # Verify cloned monitors
+        verify_sql = f"SELECT mid, host, protocol FROM Monitors WHERE ke='{coaching_gk}';"
+        verify_result = subprocess.run(
+            mysql_cmd_base + ['-N', '-B', '-e', verify_sql],
+            env=mysql_env, capture_output=True, text=True, timeout=10
+        )
+
+        for line in verify_result.stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            parts = line.split('\t')
+            mid = parts[0] if len(parts) > 0 else '?'
+            host = parts[1] if len(parts) > 1 else '?'
+            cloned.append({"mid": mid, "name": mid})
+            print(f"[Coaching Shinobi] Cloned: {mid} host={host}")
+
+    except Exception as e:
+        print(f"[Coaching Shinobi] Clone failed: {e}")
+        return {"success": False, "error": f"Clone failed: {e}"}
+
+    print(f"[Coaching Shinobi] Clone results: {len(cloned)} cloned, {len(failed)} failed")
+
+    return {
+        "success": True,
+        "coachingGroupKey": coaching_gk,
+        "coachingApiKey": coaching_api_key,
+        "coachingEmail": coaching_email,
+        "coachingPassword": coaching_password,
+        "clonedMonitors": cloned,
+        "failedMonitors": failed,
+        "totalOpsMonitors": len(ops_monitors),
+    }
+
 
 def list_shinobi_accounts():
     """List all Shinobi user accounts from database"""
@@ -1589,6 +1811,7 @@ def setup_shinobi_account(group_key, email, password):
     4. Create API key via Shinobi's API endpoint (so it shows in UI)
     5. Fallback to DB direct if API methods fail
     """
+    log.info(f"Setting up Shinobi account: {email}", extra={"group_key": group_key})
     import string
     import random
 
@@ -1720,12 +1943,16 @@ def setup_shinobi_account(group_key, email, password):
             "data": {
                 "ip": "0.0.0.0",
                 "details": {
-                    "auth_socket": "1", "get_monitors": "1", "control_monitors": "1",
-                    "get_logs": "1", "watch_stream": "1", "watch_snapshot": "1",
-                    "watch_videos": "1", "delete_videos": "1", "view_monitor": "1",
-                    "edit_monitor": "1", "view_events": "1", "delete_events": "1",
-                    "monitor_create": "1", "monitor_edit": "1", "monitor_delete": "1",
-                    "video_delete": "1", "event_delete": "1", "log_view": "1"
+                    "treatAsSub": "0", "permissionSet": "", "monitorsRestricted": "0",
+                    "monitorPermissions": {},
+                    "auth_socket": "1", "create_api_keys": "1", "edit_user": "1",
+                    "edit_permissions": "1", "get_monitors": "1", "edit_monitors": "1",
+                    "control_monitors": "1", "get_logs": "1", "watch_stream": "1",
+                    "watch_snapshot": "1", "watch_videos": "1", "delete_videos": "1",
+                    "view_monitor": "1", "edit_monitor": "1", "view_events": "1",
+                    "delete_events": "1", "monitor_create": "1", "monitor_edit": "1",
+                    "monitor_delete": "1", "video_delete": "1", "event_delete": "1",
+                    "log_view": "1", "get_alarms": "1", "edit_alarms": "1"
                 }
             }
         }).encode()
@@ -2057,6 +2284,8 @@ def setup_named_tunnel(tunnel_token, shinobi_hostname, agent_hostname):
         return {"success": False, "error": str(e)}
 
 def setup_cloudflare_tunnel(tunnel_type='quick', tunnel_token=None, shinobi_hostname=None, agent_hostname=None):
+    log.info(f"Setting up Cloudflare tunnel: type={tunnel_type}",
+             extra={"shinobi_hostname": shinobi_hostname, "agent_hostname": agent_hostname})
     install_result = install_cloudflared()
     if not install_result.get('success'):
         return install_result
@@ -3603,6 +3832,10 @@ class AgentHandler(BaseHTTPRequestHandler):
         except:
             data = {}
 
+        # Log non-terminal POST requests
+        if not path.startswith('/terminal/'):
+            log.info(f"POST {path}", extra={"content_length": length})
+
         if path == '/terminal/create':
             session_id = create_terminal_session()
             self._send_json({"sessionId": session_id})
@@ -3922,6 +4155,25 @@ class AgentHandler(BaseHTTPRequestHandler):
 
             self._send_json(result)
 
+        elif path == '/coaching/cleanup':
+            email = data.get('email')
+            if not email:
+                self._send_json({"success": False, "error": "email required"}, 400)
+                return
+            _cleanup_existing_coaching_account(email)
+            self._send_json({"success": True, "email": email})
+
+        elif path == '/coaching/setup-shinobi':
+            arena_name = data.get('arenaName', 'unknown')
+            if not arena_name:
+                self._send_json({"success": False, "error": "arenaName is required"}, 400)
+                return
+            result = setup_coaching_shinobi(arena_name, password=data.get('password'))
+            self._send_json(result)
+
+        elif path.startswith('/coaching/') and _coaching_module:
+            _coaching_module.handle_request(self, 'POST', path, data)
+
         else:
             self._send_json({"error": "Not found"}, 404)
 
@@ -3957,6 +4209,32 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._send_json({"version": VERSION})
             return
 
+        # === Log Endpoints ===
+        if path == '/logs':
+            lines = int(query.get('lines', ['100'])[0])
+            component = query.get('component', [None])[0]
+            level = query.get('level', [None])[0]
+            source = query.get('source', ['memory'])[0]  # memory or file
+
+            if source == 'file':
+                entries = get_log_file_entries(
+                    component=component or 'agent', lines=lines
+                )
+            else:
+                entries = get_recent_logs(
+                    lines=lines, component=component, level=level
+                )
+            self._send_json({"entries": entries, "count": len(entries)})
+            return
+
+        if path == '/logs/stats':
+            self._send_json(get_log_stats())
+            return
+
+        if path.startswith('/coaching/') and _coaching_module:
+            _coaching_module.handle_request(self, 'GET', path)
+            return
+
         routes = {
             '/': lambda: {"status": "ok", "agent": "gravae", "version": VERSION, "deviceId": CONFIG.get("deviceId"), "deviceSerial": get_device_serial(), "deviceModel": get_device_model()},
             '/health': lambda: {"status": "ok", "agent": "gravae", "version": VERSION},
@@ -3984,6 +4262,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/phoenix/logs': get_phoenix_logs,
             '/phoenix/buttons': get_button_history,
             '/shinobi/accounts': list_shinobi_accounts,
+            '/shinobi/monitors': get_shinobi_monitors,
             '/cameras/discover': discover_cameras
         }
         if path in routes:
@@ -3992,7 +4271,11 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Not found"}, 404)
 
     def log_message(self, format, *args):
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {args[0]}")
+        # Suppress noisy HTTP request logs (200s) to keep logs clean
+        msg = args[0] if args else format
+        if '"GET /health' in str(msg) or '"GET / ' in str(msg):
+            return  # Skip health checks
+        log.debug(f"HTTP {msg}")
 
 def _fix_dangerous_settings():
     """Fix dangerous systemd settings that can cause boot loops.
@@ -4049,14 +4332,22 @@ def _fix_dangerous_settings():
 
 
 def main():
+    log.info(f"Gravae Agent v{VERSION} starting", extra={"port": PORT})
+
     # Fix dangerous settings from previous versions BEFORE anything else
     _fix_dangerous_settings()
+    log.info("Dangerous settings check complete")
 
     # Start post-update health check if needed (background thread)
     threading.Thread(target=_startup_health_check, daemon=True).start()
 
+    # Start coaching review module if configured
+    if _coaching_module and _coaching_module.is_configured():
+        _coaching_module.start()
+        log.info("Coaching module started")
+
     server = HTTPServer(('0.0.0.0', PORT), AgentHandler)
-    print(f"Gravae Agent v{VERSION} on port {PORT}")
+    log.info(f"HTTP server listening on 0.0.0.0:{PORT}")
     server.serve_forever()
 
 if __name__ == '__main__':
