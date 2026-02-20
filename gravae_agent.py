@@ -1164,7 +1164,10 @@ def hash_shinobi_password(password):
         return hashlib.md5(password.encode()).hexdigest()
 
 def create_api_key_in_db(group_key, user_id):
-    """Create API key directly in Shinobi database"""
+    """DEPRECATED: Create API key directly in Shinobi database.
+    SQL-inserted keys don't work properly for motion/monitor endpoints.
+    Use Shinobi API instead: POST /{session_token}/api/{group_key}/add
+    Kept only for legacy/emergency use."""
     import string
     import random
 
@@ -1467,7 +1470,9 @@ def list_shinobi_accounts():
         return {"success": False, "error": str(e)}
 
 def create_shinobi_user_in_db(group_key, user_id, email, password):
-    """Create Shinobi user directly in database"""
+    """DEPRECATED: Create Shinobi user directly in database.
+    Use super admin API instead: POST /super/{token}/accounts/registerAdmin
+    Kept only for legacy/emergency use."""
     db_config = get_shinobi_db_config()
     if not db_config:
         return {"success": False, "error": "Could not read Shinobi database config"}
@@ -1874,15 +1879,9 @@ def setup_shinobi_account(group_key, email, password):
         except Exception as e:
             print(f"[Shinobi Setup] registerAdmin exception: {e}")
 
-    # Fallback: create via DB if super API failed and account doesn't exist
+    # If super API failed and account doesn't exist, return error
     if not actual_uid and not account_existed:
-        print(f"[Shinobi Setup] Falling back to DB direct creation...")
-        user_id = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(6))
-        db_result = create_shinobi_user_in_db(group_key, user_id, email, password)
-        if not db_result.get('success'):
-            return db_result
-        actual_uid = db_result.get('uid', user_id)
-        account_existed = db_result.get('existed', False)
+        return {"success": False, "error": "Failed to create Shinobi account via super admin API. Check super.json token and Shinobi status."}
 
     # Step 3: Login as user (with retry for newly created accounts)
     login_url = "http://localhost:8080/?json=true"
@@ -1960,19 +1959,22 @@ def setup_shinobi_account(group_key, email, password):
         try:
             req = urllib.request.Request(api_add_url, data=api_data, headers={'Content-Type': 'application/json'})
             response = urllib.request.urlopen(req, timeout=30)
-            result = json.loads(response.read().decode())
-            api_key = result.get('api', {}).get('code', '') or result.get('key', '') or result.get('code', '')
+            resp_text = response.read().decode()
+            result = json.loads(resp_text)
+            print(f"[Shinobi Setup] API add response: {resp_text[:200]}")
+            # Try multiple response formats (Shinobi versions vary)
+            api_key = (
+                result.get('api', {}).get('code', '') or
+                result.get('key', '') or
+                result.get('code', '') or
+                result.get('api', {}).get('key', '')
+            )
             if api_key:
                 print(f"[Shinobi Setup] API key created via Shinobi API: {api_key[:8]}...")
+            else:
+                print(f"[Shinobi Setup] API key creation returned OK but no key found in response")
         except Exception as e:
             print(f"[Shinobi Setup] API key via Shinobi API failed: {e}")
-
-    # Fallback: create API key directly in DB
-    if not api_key:
-        print("[Shinobi Setup] Falling back to DB API key creation...")
-        api_key = create_api_key_in_db(verified_group_key, verified_user_id)
-        if api_key:
-            print(f"[Shinobi Setup] API key created via DB: {api_key[:8]}...")
 
     if api_key:
         status_msg = "verified (existing)" if account_existed else "created"
@@ -1985,18 +1987,7 @@ def setup_shinobi_account(group_key, email, password):
             "message": f"Account {status_msg}, API key generated"
         }
 
-    # Last resort: use session token as temporary API key
-    if session_token:
-        return {
-            "success": True,
-            "groupKey": verified_group_key or group_key,
-            "apiKey": session_token,
-            "userId": verified_user_id,
-            "superToken": super_token,
-            "warning": "Using session token (temporary, expires in 15min)"
-        }
-
-    return {"success": False, "error": "Could not create API key"}
+    return {"success": False, "error": "Could not create API key via Shinobi API. Login succeeded but API key creation failed."}
 
 def cleanup_shinobi(group_key, email, password):
     """Delete all monitors and API keys for a group, optionally delete user"""
@@ -2551,7 +2542,7 @@ def deploy_button_daemon(script_content):
         os.makedirs(daemon_dir, exist_ok=True)
 
         # Detect script type: Python or Node.js
-        is_python = ('import RPi.GPIO' in script_content or script_content.startswith('#!/usr/bin/env python3'))
+        is_python = ('import RPi.GPIO' in script_content or 'cleanup_stale_gpio' in script_content or script_content.startswith('#!/usr/bin/env python3'))
 
         if is_python:
             script_path = os.path.join(daemon_dir, 'button-daemon.py')
@@ -2628,8 +2619,11 @@ def deploy_button_daemon(script_content):
             "[Service]",
             "Type=simple",
         ]
+        if is_python:
+            # Kill stale GPIO processes before starting (Trixie/lgpio fix: claims persist after SIGKILL)
+            service_lines.append('ExecStartPre=/bin/bash -c "for pid in $(lsof -t /dev/gpiochip0 2>/dev/null); do kill -9 $pid 2>/dev/null; done; sleep 1; true"')
         # Only kill pigpiod for pigpio (npm library)
-        if not is_python and daemon_type == 'nodejs':
+        elif daemon_type == 'nodejs':
             gpio_info = get_gpio_info()
             if gpio_info.get('recommended_lib', 'pigpio') == 'pigpio':
                 service_lines.append('ExecStartPre=/bin/bash -c "killall pigpiod 2>/dev/null; rm -f /var/run/pigpio.pid; true"')
@@ -2638,7 +2632,7 @@ def deploy_button_daemon(script_content):
             f"ExecStart={exec_cmd}",
             "Restart=on-failure",
             "RestartSec=15",
-            "TimeoutStopSec=5",
+            "TimeoutStopSec=10",
             "User=root",
             f"WorkingDirectory={daemon_dir}",
             "",
