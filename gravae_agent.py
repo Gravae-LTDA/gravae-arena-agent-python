@@ -1868,7 +1868,7 @@ def setup_shinobi_account(group_key, email, password):
                 time.sleep(2)
 
         register_url = f"http://localhost:8080/super/{super_token}/accounts/registerAdmin"
-        register_data = json.dumps({
+        register_data = json.dumps({"data": {
             "mail": email,
             "pass": password,
             "pass_again": password,
@@ -1883,7 +1883,7 @@ def setup_shinobi_account(group_key, email, password):
                 "permissions": "all",
                 "use_admin": "1"
             }
-        }).encode()
+        }}).encode()
 
         try:
             req = urllib.request.Request(register_url, data=register_data, headers={'Content-Type': 'application/json'})
