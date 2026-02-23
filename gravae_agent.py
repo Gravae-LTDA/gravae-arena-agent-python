@@ -1800,6 +1800,20 @@ def ensure_super_admin_token():
             with open(super_path, 'w') as f:
                 json.dump(super_data, f, indent=2)
             print(f"[Shinobi Super] Updated {super_path}")
+            # Shinobi reads super.json only at startup — must restart for new token to work
+            print("[Shinobi Super] Restarting Shinobi to load updated super.json...")
+            try:
+                result = subprocess.run(['sudo', 'pm2', 'restart', 'all'], capture_output=True, text=True, timeout=15)
+                if result.returncode == 0:
+                    print("[Shinobi Super] Shinobi restarted via pm2")
+                else:
+                    # Fallback: try restarting the node process directly
+                    subprocess.run(['sudo', 'pkill', '-f', 'camera.js'], capture_output=True, timeout=5)
+                    print("[Shinobi Super] Sent kill signal to camera.js")
+                import time
+                time.sleep(3)  # Wait for Shinobi to come back up
+            except Exception as restart_err:
+                print(f"[Shinobi Super] Failed to restart Shinobi: {restart_err}")
         except Exception as e:
             print(f"[Shinobi Super] Failed to write {super_path}: {e}")
 
@@ -1840,6 +1854,19 @@ def setup_shinobi_account(group_key, email, password):
     actual_uid = None
 
     if super_token:
+        # Wait for Shinobi to be ready (may have just been restarted by ensure_super_admin_token)
+        for wait_attempt in range(6):
+            try:
+                health_req = urllib.request.Request("http://localhost:8080/", method='GET')
+                health_resp = urllib.request.urlopen(health_req, timeout=5)
+                if health_resp.status == 200:
+                    break
+            except:
+                pass
+            if wait_attempt < 5:
+                print(f"[Shinobi Setup] Waiting for Shinobi to be ready... ({wait_attempt + 1}/6)")
+                time.sleep(2)
+
         register_url = f"http://localhost:8080/super/{super_token}/accounts/registerAdmin"
         register_data = json.dumps({
             "mail": email,
