@@ -1222,7 +1222,7 @@ def get_shinobi_monitors():
     if not api_key or not group_key:
         return {"groupKey": group_key, "monitors": [], "error": "No Shinobi credentials"}
     try:
-        url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+        url = f"http://127.0.0.1:8080/{api_key}/monitor/{group_key}"
         req = urllib.request.Request(url, headers={'Accept': 'application/json'})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
@@ -1302,7 +1302,7 @@ def setup_coaching_shinobi(arena_name, password=None):
         return {"success": False, "error": "OPS Shinobi credentials not configured"}
 
     try:
-        url = f"http://localhost:8080/{ops_api_key}/monitor/{ops_group_key}"
+        url = f"http://127.0.0.1:8080/{ops_api_key}/monitor/{ops_group_key}"
         req = urllib.request.Request(url, headers={'Accept': 'application/json'})
         with urllib.request.urlopen(req, timeout=10) as resp:
             ops_monitors = json.loads(resp.read().decode())
@@ -1589,7 +1589,7 @@ def _restart_shinobi():
     for i in range(20):
         time.sleep(3)
         try:
-            req = urllib.request.Request("http://localhost:8080/", method='GET')
+            req = urllib.request.Request("http://127.0.0.1:8080/", method='GET')
             urllib.request.urlopen(req, timeout=5)
             print(f"[FTP Events] Shinobi is back up after {(i+1)*3}s")
             return True
@@ -1648,7 +1648,7 @@ def setup_ftp_events():
             with open(conf_path, 'r') as f:
                 current_conf = json.load(f)
             current_conf.update(ftp_config)
-            configure_url = f"http://localhost:8080/super/{super_token}/system/configure"
+            configure_url = f"http://127.0.0.1:8080/super/{super_token}/system/configure"
             req_data = json.dumps({"data": current_conf}).encode()
             req = urllib.request.Request(configure_url, data=req_data,
                 headers={'Content-Type': 'application/json'}, method='POST')
@@ -1857,7 +1857,7 @@ def setup_shinobi_account(group_key, email, password):
         # Wait for Shinobi to be ready (may have just been restarted by ensure_super_admin_token)
         for wait_attempt in range(6):
             try:
-                health_req = urllib.request.Request("http://localhost:8080/", method='GET')
+                health_req = urllib.request.Request("http://127.0.0.1:8080/", method='GET')
                 health_resp = urllib.request.urlopen(health_req, timeout=5)
                 if health_resp.status == 200:
                     break
@@ -1867,11 +1867,11 @@ def setup_shinobi_account(group_key, email, password):
                 print(f"[Shinobi Setup] Waiting for Shinobi to be ready... ({wait_attempt + 1}/6)")
                 time.sleep(2)
 
-        register_url = f"http://localhost:8080/super/{super_token}/accounts/registerAdmin"
+        register_url = f"http://127.0.0.1:8080/super/{super_token}/accounts/registerAdmin"
         register_data = json.dumps({"data": {
             "mail": email,
             "pass": password,
-            "pass_again": password,
+            "password_again": password,
             "ke": group_key,
             "details": {
                 "factorAuth": "0",
@@ -1881,7 +1881,8 @@ def setup_shinobi_account(group_key, email, password):
                 "log_days": "10",
                 "max_camera": "20",
                 "permissions": "all",
-                "use_admin": "1"
+                "use_admin": "1",
+                "lang": "pt"
             }
         }}).encode()
 
@@ -1911,7 +1912,7 @@ def setup_shinobi_account(group_key, email, password):
         return {"success": False, "error": "Failed to create Shinobi account via super admin API. Check super.json token and Shinobi status."}
 
     # Step 3: Login as user (with retry for newly created accounts)
-    login_url = "http://localhost:8080/?json=true"
+    login_url = "http://127.0.0.1:8080/?json=true"
     login_data = json.dumps({"mail": email, "pass": password, "machineID": "gravae-agent"}).encode()
 
     verified_user_id = None
@@ -1964,7 +1965,7 @@ def setup_shinobi_account(group_key, email, password):
     api_key = None
 
     if session_token:
-        api_add_url = f"http://localhost:8080/{session_token}/api/{verified_group_key}/add"
+        api_add_url = f"http://127.0.0.1:8080/{session_token}/api/{verified_group_key}/add"
         api_data = json.dumps({
             "data": {
                 "ip": "0.0.0.0",
@@ -2023,7 +2024,7 @@ def cleanup_shinobi(group_key, email, password):
     if not group_key or not email or not password:
         return {"success": False, "error": "groupKey, email and password required"}
 
-    login_url = "http://localhost:8080/?json=true"
+    login_url = "http://127.0.0.1:8080/?json=true"
     login_data = json.dumps({"mail": email, "pass": password, "machineID": "gravae-agent"}).encode()
 
     try:
@@ -2048,7 +2049,7 @@ def cleanup_shinobi(group_key, email, password):
     errors = []
 
     try:
-        monitors_url = f"http://localhost:8080/{session_token}/monitor/{group_key}"
+        monitors_url = f"http://127.0.0.1:8080/{session_token}/monitor/{group_key}"
         req = urllib.request.Request(monitors_url)
         response = urllib.request.urlopen(req, timeout=30)
         monitors = json.loads(response.read().decode())
@@ -2061,7 +2062,7 @@ def cleanup_shinobi(group_key, email, password):
             mid = monitor.get('mid', '')
             if mid:
                 try:
-                    delete_url = f"http://localhost:8080/{session_token}/configureMonitor/{group_key}/{mid}/delete"
+                    delete_url = f"http://127.0.0.1:8080/{session_token}/configureMonitor/{group_key}/{mid}/delete"
                     req = urllib.request.Request(delete_url, method='POST')
                     urllib.request.urlopen(req, timeout=30)
                     deleted_monitors.append(mid)
@@ -2145,7 +2146,7 @@ def setup_quick_tunnel():
 
     try:
         with open('/tmp/cf_shinobi.log', 'w') as log:
-            subprocess.Popen(['cloudflared', 'tunnel', '--url', 'http://localhost:8080', '--no-autoupdate'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            subprocess.Popen(['cloudflared', 'tunnel', '--url', 'http://127.0.0.1:8080', '--no-autoupdate'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         for _ in range(15):
             time.sleep(1)
             try:
@@ -3301,7 +3302,7 @@ def get_phoenix_status():
             group_key = shinobi_conf.get("groupKey") or CONFIG.get("shinobiGroupKey")
 
             if api_key and group_key:
-                monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+                monitors_url = f"http://127.0.0.1:8080/{api_key}/monitor/{group_key}"
                 req = urllib.request.Request(monitors_url)
                 req.add_header("Accept", "application/json")
                 response = urllib.request.urlopen(req, timeout=5)
@@ -3538,7 +3539,7 @@ def get_button_history():
             api_key = shinobi_conf["apiKey"]
             group_key = shinobi_conf["groupKey"]
 
-            monitors_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+            monitors_url = f"http://127.0.0.1:8080/{api_key}/monitor/{group_key}"
             try:
                 req = urllib.request.Request(monitors_url)
                 response = urllib.request.urlopen(req, timeout=5)
@@ -3550,7 +3551,7 @@ def get_button_history():
                     mid = monitor.get("mid", "")
                     mname = monitor.get("name", mid)
 
-                    events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}"
+                    events_url = f"http://127.0.0.1:8080/{api_key}/events/{group_key}/{mid}"
                     try:
                         req = urllib.request.Request(events_url)
                         response = urllib.request.urlopen(req, timeout=5)
@@ -4082,7 +4083,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                shinobi_url = f"http://localhost:8080/{api_key}/monitor/{group_key}"
+                shinobi_url = f"http://127.0.0.1:8080/{api_key}/monitor/{group_key}"
                 req = urllib.request.Request(shinobi_url, headers={'Accept': 'application/json'})
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     monitors_data = json.loads(resp.read().decode())
@@ -4102,7 +4103,7 @@ class AgentHandler(BaseHTTPRequestHandler):
 
                     events = []
                     try:
-                        events_url = f"http://localhost:8080/{api_key}/events/{group_key}/{mid}?limit=5"
+                        events_url = f"http://127.0.0.1:8080/{api_key}/events/{group_key}/{mid}?limit=5"
                         events_req = urllib.request.Request(events_url, headers={'Accept': 'application/json'})
                         with urllib.request.urlopen(events_req, timeout=5) as events_resp:
                             events_data = json.loads(events_resp.read().decode())
