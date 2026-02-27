@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phoenix Daemon v1.9.0
+Phoenix Daemon v1.9.1
 Self-healing module for Gravae Arena Agent
 
 Features:
@@ -28,7 +28,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -57,6 +57,7 @@ SERVICES = {
     "cloudflared": {"critical": True, "port": None},
     "gravae-buttons": {"critical": True, "port": None, "alert_only": True},  # Alert but don't auto-restart
     "shinobi": {"critical": True, "port": 8080, "pm2": True},  # Shinobi via pm2
+    "mariadb": {"critical": True, "port": 3306},  # MariaDB database server
 }
 
 # Resource thresholds

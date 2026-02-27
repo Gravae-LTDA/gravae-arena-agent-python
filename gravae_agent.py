@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 
 # Centralized logging
 try:
