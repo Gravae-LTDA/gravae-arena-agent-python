@@ -3558,14 +3558,17 @@ def get_button_history():
                         events = json.loads(response.read().decode())
 
                         for event in events[:5]:
-                            reason = (event.get("details") or {}).get("reason", "")
+                            details = event.get("details") or {}
+                            reason = details.get("reason", "")
+                            plug = details.get("plug", "")
                             if reason in ("motion", "recording", "object", ""):
                                 button_presses.append({
                                     "monitor": mname,
                                     "monitorId": mid,
                                     "timestamp": event.get("time", ""),
                                     "action": reason or "triggered",
-                                    "type": "shinobi_event"
+                                    "type": "shinobi_event",
+                                    "gpio": plug if plug.startswith("GPIO") else "",
                                 })
                     except:
                         pass
@@ -3594,10 +3597,26 @@ def get_button_history():
                         line = line.strip()
                         if not line:
                             continue
-                        # Parse plain text format: "2024-02-08 14:30:22 - Cancha 1"
-                        # or: "2024-02-08 14:30:22 - Btn1 -> [Cancha 1, Cancha 2]"
-                        parts = line.split(" - ", 1)
-                        if len(parts) == 2:
+                        # Parse formats:
+                        # New: "2024-02-08 14:30:22 - GPIO21 - Cancha 1, Cancha 2"
+                        # Old: "2024-02-08 14:30:22 - Cancha 1"
+                        # Arrow: "2024-02-08 14:30:22 - Btn1 -> [Cancha 1, Cancha 2]"
+                        parts = line.split(" - ")
+                        if len(parts) >= 3:
+                            # New format with GPIO
+                            timestamp = parts[0].strip()
+                            gpio_part = parts[1].strip()
+                            monitor_part = " - ".join(parts[2:]).strip()
+                            button_presses.append({
+                                "monitor": monitor_part,
+                                "monitorId": "",
+                                "timestamp": timestamp,
+                                "action": "pressed",
+                                "type": "button_daemon",
+                                "gpio": gpio_part if gpio_part.startswith("GPIO") else "",
+                            })
+                        elif len(parts) == 2:
+                            # Old format without GPIO
                             timestamp = parts[0].strip()
                             monitor_part = parts[1].strip()
                             button_presses.append({
@@ -3605,7 +3624,8 @@ def get_button_history():
                                 "monitorId": "",
                                 "timestamp": timestamp,
                                 "action": "pressed",
-                                "type": "button_daemon"
+                                "type": "button_daemon",
+                                "gpio": "",
                             })
             except:
                 pass
@@ -3635,7 +3655,8 @@ def get_button_history():
                                     "monitorId": entry.get("monitorId", ""),
                                     "timestamp": entry.get("timestamp", ""),
                                     "action": entry.get("action", "pressed"),
-                                    "type": "button_daemon"
+                                    "type": "button_daemon",
+                                    "gpio": entry.get("gpio", ""),
                                 })
                         except:
                             pass
