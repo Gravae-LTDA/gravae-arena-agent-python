@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Phoenix Daemon v1.9.1
+Phoenix Daemon v1.10.0
 Self-healing module for Gravae Arena Agent
 
 Features:
 - Service Guardian: Monitors and restarts failed services
-- Connectivity Sentinel: Tracks internet connectivity with safe-only recovery
+- Connectivity Sentinel: Tracks internet connectivity with escalating recovery
+- Safe Reboot: After 4h offline, reboot up to 3x/day with boot-loop protection
 - Alert Queue: Stores alerts offline, syncs when back online
 - Persistent Logging: Structured logs with rotation
 
-SAFETY: Phoenix will NEVER reboot the system or modify network configuration.
-Recovery is limited to restarting services (cloudflared, networking).
+SAFETY: Phoenix will NEVER modify network configuration (dhcpcd.conf / nmcli).
+Reboot only after 4h offline, max 3/day, and only if uptime > 5min (anti boot-loop).
 """
 
 import os
@@ -28,7 +29,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -42,10 +43,13 @@ CONNECTIVITY_CHECK_INTERVAL = 60  # Check connectivity every minute
 SERVICE_RESTART_MAX_ATTEMPTS = 3
 SERVICE_RESTART_COOLDOWN = 300  # 5 minutes between restart attempts
 
-# Escalation thresholds (in minutes) - SAFE actions only
+# Escalation thresholds (in minutes)
 ESCALATION_RESTART_CLOUDFLARED = 30  # Restart cloudflared service
 ESCALATION_RESTART_NETWORKING = 60   # Restart networking services (no config changes)
-# NOTE: No DHCP switch, no reboot. After Level 2, Phoenix only alerts.
+ESCALATION_REBOOT = 240              # Reboot system after 4 hours without internet
+MAX_REBOOTS_PER_DAY = 3              # Maximum reboots in a 24-hour window
+MIN_UPTIME_BEFORE_REBOOT = 300       # 5 minutes: don't reboot if system just booted (prevents boot loops)
+REBOOT_STATE_FILE = LOG_DIR / "reboot_state.json"
 
 # Connectivity check targets
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
@@ -521,8 +525,10 @@ class ConnectivitySentinel:
         self.is_online = True
         self.offline_since = None
         self.last_successful_ping = datetime.now()
-        self.escalation_level = 0  # 0=none, 1=cloudflared, 2=networking (max)
+        self.escalation_level = 0  # 0=none, 1=cloudflared, 2=networking, 3=reboot
         self.actions_taken = []
+        self.reboot_timestamps = []  # timestamps of reboots in last 24h
+        self._load_reboot_state()
 
     def ping(self, host):
         try:
@@ -596,6 +602,88 @@ class ConnectivitySentinel:
             log.error(f"Failed to restart networking: {e}")
             return False
 
+    def _load_reboot_state(self):
+        """Load reboot timestamps from persistent file."""
+        try:
+            if REBOOT_STATE_FILE.exists():
+                data = json.loads(REBOOT_STATE_FILE.read_text())
+                self.reboot_timestamps = data.get("timestamps", [])
+                # Prune entries older than 24h
+                cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+                self.reboot_timestamps = [t for t in self.reboot_timestamps if t > cutoff]
+        except Exception as e:
+            log.debug(f"Could not load reboot state: {e}")
+            self.reboot_timestamps = []
+
+    def _save_reboot_state(self):
+        """Save reboot timestamps to persistent file."""
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            REBOOT_STATE_FILE.write_text(json.dumps({
+                "timestamps": self.reboot_timestamps,
+                "version": VERSION,
+            }))
+        except Exception as e:
+            log.error(f"Could not save reboot state: {e}")
+
+    def _get_uptime_seconds(self):
+        """Get system uptime in seconds."""
+        try:
+            with open("/proc/uptime", "r") as f:
+                return float(f.read().split()[0])
+        except:
+            return 999999  # Assume long uptime if we can't read
+
+    def _can_reboot(self):
+        """Check if it's safe to reboot."""
+        # Anti boot-loop: don't reboot if system just started
+        uptime = self._get_uptime_seconds()
+        if uptime < MIN_UPTIME_BEFORE_REBOOT:
+            log.warning(f"Reboot blocked: uptime only {uptime:.0f}s (need {MIN_UPTIME_BEFORE_REBOOT}s)")
+            return False
+
+        # Max reboots per day
+        cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+        recent_reboots = [t for t in self.reboot_timestamps if t > cutoff]
+        if len(recent_reboots) >= MAX_REBOOTS_PER_DAY:
+            log.warning(f"Reboot blocked: already {len(recent_reboots)} reboots in last 24h (max {MAX_REBOOTS_PER_DAY})")
+            return False
+
+        return True
+
+    def reboot_system(self):
+        """Reboot the system as last resort after extended connectivity loss."""
+        if not self._can_reboot():
+            return False
+
+        offline_min = self.get_offline_minutes()
+        reboot_count = len(self.reboot_timestamps) + 1
+        log.warning(f"Escalation: REBOOTING system after {offline_min:.0f}min offline (reboot {reboot_count}/{MAX_REBOOTS_PER_DAY} today)")
+
+        # Record this reboot BEFORE rebooting
+        self.reboot_timestamps.append(datetime.now().isoformat())
+        self._save_reboot_state()
+
+        alerts.add(
+            "system_reboot",
+            "critical",
+            f"Reiniciando sistema após {offline_min:.0f} min sem internet (reboot {reboot_count}/{MAX_REBOOTS_PER_DAY} hoje)",
+            {"offline_minutes": offline_min, "reboot_count": reboot_count, "uptime": self._get_uptime_seconds()}
+        )
+
+        self.actions_taken.append(("reboot", datetime.now().isoformat()))
+
+        try:
+            # Sync filesystem before reboot
+            subprocess.run(["sync"], timeout=10)
+            # Use systemctl reboot (clean shutdown)
+            subprocess.run(["systemctl", "reboot"], timeout=10)
+        except Exception as e:
+            log.error(f"Reboot failed: {e}")
+            return False
+
+        return True
+
     def update(self):
         was_online = self.is_online
         self.is_online = self.check_connectivity()
@@ -626,8 +714,13 @@ class ConnectivitySentinel:
 
         offline_minutes = self.get_offline_minutes()
 
-        # Safe escalation: only restart services, NEVER modify network config or reboot
-        if offline_minutes >= ESCALATION_RESTART_NETWORKING and self.escalation_level < 2:
+        # Escalation: restart services first, then reboot as last resort
+        if offline_minutes >= ESCALATION_REBOOT and self.escalation_level < 3:
+            # Level 3: Reboot after 4 hours offline (with safety checks)
+            self.escalation_level = 3
+            self.reboot_system()
+
+        elif offline_minutes >= ESCALATION_RESTART_NETWORKING and self.escalation_level < 2:
             self.escalation_level = 2
             self.restart_networking()
 
@@ -635,18 +728,18 @@ class ConnectivitySentinel:
             self.escalation_level = 1
             self.restart_cloudflared()
 
-        # After Level 2, Phoenix only logs. No DHCP changes. No reboot. Ever.
-        if offline_minutes >= 120 and self.escalation_level == 2:
-            # Log periodically (every 30 min) so we know the device is still alive but offline
+        # After Level 3 (reboot attempted), log periodically
+        if offline_minutes >= ESCALATION_REBOOT and self.escalation_level >= 3:
             hours_offline = offline_minutes / 60
             if int(offline_minutes) % 30 == 0:
                 log.warning(f"Extended connectivity loss: {hours_offline:.1f}h offline. "
-                           f"No further actions - waiting for internet to return.")
+                           f"Reboot was attempted. Waiting for internet to return.")
 
         return False
 
 # NetworkRecovery REMOVED in v1.9.0 - modifying network config is too dangerous.
 # Phoenix will NEVER touch dhcpcd.conf or switch between DHCP/static IP.
+# Reboot RE-ADDED in v1.10.0 with safety: 4h threshold, 3/day limit, 5min uptime guard.
 
 # === Resource Monitor ===
 class ResourceMonitor:
@@ -981,7 +1074,7 @@ class PhoenixDaemon:
                 pass
 
         sd_notify("READY=1")
-        log.info(f"Phoenix v{VERSION} started (SAFE mode: no reboot, no network config changes)")
+        log.info(f"Phoenix v{VERSION} started (reboot after 4h offline, max {MAX_REBOOTS_PER_DAY}/day, no network config changes)")
 
         last_service_check = 0
         last_connectivity_check = 0

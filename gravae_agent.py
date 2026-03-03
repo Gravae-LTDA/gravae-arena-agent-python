@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 
 # Centralized logging
 try:
@@ -383,6 +383,27 @@ def get_network_interfaces():
     except Exception as e:
         return {'error': str(e), 'interfaces': [], 'network_manager': get_network_manager_type()}
 
+def _get_nm_connection_name(interface):
+    """Get the NetworkManager connection name for an interface.
+    nmcli connection modify requires the connection name, NOT the interface name.
+    E.g., interface 'eth0' might have connection name 'Wired connection 1'.
+    """
+    try:
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,DEVICE', 'connection', 'show', '--active'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().split('\n'):
+            if ':' in line:
+                name, dev = line.split(':', 1)
+                if dev.strip() == interface:
+                    return name.strip()
+    except:
+        pass
+    # Fallback: try interface name directly (works if connection name matches)
+    return interface
+
+
 def configure_network_static(interface, ip, prefix, gateway, dns=None):
     """Configure static IP on an interface.
     Works with both NetworkManager (Bookworm+) and dhcpcd (Bullseye).
@@ -391,29 +412,33 @@ def configure_network_static(interface, ip, prefix, gateway, dns=None):
 
     try:
         if net_manager['type'] == 'networkmanager':
+            # Find the actual connection name for this interface
+            conn_name = _get_nm_connection_name(interface)
+            print(f"[network] Interface '{interface}' -> connection '{conn_name}'")
+
             # Use nmcli for NetworkManager
             commands = [
-                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.method', 'manual'],
-                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.addresses', f'{ip}/{prefix}'],
-                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.gateway', gateway],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.method', 'manual'],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.addresses', f'{ip}/{prefix}'],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.gateway', gateway],
             ]
 
             if dns:
                 dns_str = ','.join(dns) if isinstance(dns, list) else dns
-                commands.append(['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.dns', dns_str])
+                commands.append(['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.dns', dns_str])
 
             for cmd in commands:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
                 if result.returncode != 0:
                     return {'success': False, 'error': f'nmcli error: {result.stderr}'}
 
-            # Apply changes
-            subprocess.run(['sudo', 'nmcli', 'connection', 'down', interface],
+            # Apply changes — use connection name, not interface name
+            subprocess.run(['sudo', 'nmcli', 'connection', 'down', conn_name],
                           capture_output=True, text=True, timeout=10)
-            subprocess.run(['sudo', 'nmcli', 'connection', 'up', interface],
+            subprocess.run(['sudo', 'nmcli', 'connection', 'up', conn_name],
                           capture_output=True, text=True, timeout=10)
 
-            return {'success': True, 'method': 'networkmanager', 'message': 'Static IP configured'}
+            return {'success': True, 'method': 'networkmanager', 'message': f'Static IP configured (connection: {conn_name})'}
 
         else:
             # Use dhcpcd.conf for older systems (Bullseye)
@@ -466,21 +491,25 @@ def configure_network_dhcp(interface):
 
     try:
         if net_manager['type'] == 'networkmanager':
+            # Find the actual connection name for this interface
+            conn_name = _get_nm_connection_name(interface)
+            print(f"[network] DHCP: Interface '{interface}' -> connection '{conn_name}'")
+
             # Use nmcli for NetworkManager
             commands = [
-                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.method', 'auto'],
-                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.addresses', ''],
-                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.gateway', ''],
-                ['sudo', 'nmcli', 'connection', 'modify', interface, 'ipv4.dns', ''],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.method', 'auto'],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.addresses', ''],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.gateway', ''],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.dns', ''],
             ]
 
             for cmd in commands:
                 subprocess.run(cmd, capture_output=True, text=True, timeout=10)
 
-            # Apply changes
-            subprocess.run(['sudo', 'nmcli', 'connection', 'down', interface],
+            # Apply changes — use connection name
+            subprocess.run(['sudo', 'nmcli', 'connection', 'down', conn_name],
                           capture_output=True, text=True, timeout=10)
-            subprocess.run(['sudo', 'nmcli', 'connection', 'up', interface],
+            subprocess.run(['sudo', 'nmcli', 'connection', 'up', conn_name],
                           capture_output=True, text=True, timeout=10)
 
             return {'success': True, 'method': 'networkmanager', 'message': 'DHCP enabled'}
@@ -3558,14 +3587,17 @@ def get_button_history():
                         events = json.loads(response.read().decode())
 
                         for event in events[:5]:
-                            reason = (event.get("details") or {}).get("reason", "")
+                            details = event.get("details") or {}
+                            reason = details.get("reason", "")
+                            plug = details.get("plug", "")
                             if reason in ("motion", "recording", "object", ""):
                                 button_presses.append({
                                     "monitor": mname,
                                     "monitorId": mid,
                                     "timestamp": event.get("time", ""),
                                     "action": reason or "triggered",
-                                    "type": "shinobi_event"
+                                    "type": "shinobi_event",
+                                    "gpio": plug if plug.startswith("GPIO") else "",
                                 })
                     except:
                         pass
@@ -3594,10 +3626,26 @@ def get_button_history():
                         line = line.strip()
                         if not line:
                             continue
-                        # Parse plain text format: "2024-02-08 14:30:22 - Cancha 1"
-                        # or: "2024-02-08 14:30:22 - Btn1 -> [Cancha 1, Cancha 2]"
-                        parts = line.split(" - ", 1)
-                        if len(parts) == 2:
+                        # Parse formats:
+                        # New: "2024-02-08 14:30:22 - GPIO21 - Cancha 1, Cancha 2"
+                        # Old: "2024-02-08 14:30:22 - Cancha 1"
+                        # Arrow: "2024-02-08 14:30:22 - Btn1 -> [Cancha 1, Cancha 2]"
+                        parts = line.split(" - ")
+                        if len(parts) >= 3:
+                            # New format with GPIO
+                            timestamp = parts[0].strip()
+                            gpio_part = parts[1].strip()
+                            monitor_part = " - ".join(parts[2:]).strip()
+                            button_presses.append({
+                                "monitor": monitor_part,
+                                "monitorId": "",
+                                "timestamp": timestamp,
+                                "action": "pressed",
+                                "type": "button_daemon",
+                                "gpio": gpio_part if gpio_part.startswith("GPIO") else "",
+                            })
+                        elif len(parts) == 2:
+                            # Old format without GPIO
                             timestamp = parts[0].strip()
                             monitor_part = parts[1].strip()
                             button_presses.append({
@@ -3605,7 +3653,8 @@ def get_button_history():
                                 "monitorId": "",
                                 "timestamp": timestamp,
                                 "action": "pressed",
-                                "type": "button_daemon"
+                                "type": "button_daemon",
+                                "gpio": "",
                             })
             except:
                 pass
@@ -3635,7 +3684,8 @@ def get_button_history():
                                     "monitorId": entry.get("monitorId", ""),
                                     "timestamp": entry.get("timestamp", ""),
                                     "action": entry.get("action", "pressed"),
-                                    "type": "button_daemon"
+                                    "type": "button_daemon",
+                                    "gpio": entry.get("gpio", ""),
                                 })
                         except:
                             pass
