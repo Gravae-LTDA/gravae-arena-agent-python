@@ -28,7 +28,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.9.1"
+VERSION = "1.11.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -42,10 +42,16 @@ CONNECTIVITY_CHECK_INTERVAL = 60  # Check connectivity every minute
 SERVICE_RESTART_MAX_ATTEMPTS = 3
 SERVICE_RESTART_COOLDOWN = 300  # 5 minutes between restart attempts
 
-# Escalation thresholds (in minutes) - SAFE actions only
+# Escalation thresholds (in minutes)
 ESCALATION_RESTART_CLOUDFLARED = 30  # Restart cloudflared service
 ESCALATION_RESTART_NETWORKING = 60   # Restart networking services (no config changes)
-# NOTE: No DHCP switch, no reboot. After Level 2, Phoenix only alerts.
+ESCALATION_DHCP_FALLBACK = 120       # Try DHCP fallback after 2 hours offline
+ESCALATION_REBOOT = 240              # Reboot system after 4 hours without internet
+MAX_REBOOTS_PER_DAY = 3              # Maximum reboots in a 24-hour window
+MIN_UPTIME_BEFORE_REBOOT = 300       # 5 minutes: don't reboot if system just booted (prevents boot loops)
+REBOOT_STATE_FILE = LOG_DIR / "reboot_state.json"
+NETWORK_BACKUP_FILE = Path("/etc/gravae/network-backup.json")
+NETWORK_CHANGE_KILLSWITCH = Path("/etc/gravae/no_network_change")
 
 # Connectivity check targets
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
@@ -521,8 +527,11 @@ class ConnectivitySentinel:
         self.is_online = True
         self.offline_since = None
         self.last_successful_ping = datetime.now()
-        self.escalation_level = 0  # 0=none, 1=cloudflared, 2=networking (max)
+        self.escalation_level = 0  # 0=none, 1=cloudflared, 2=networking, 3=dhcp_fallback, 4=reboot
         self.actions_taken = []
+        self.reboot_timestamps = []  # timestamps of reboots in last 24h
+        self.dhcp_fallback_attempted = False  # Only one DHCP fallback per offline event
+        self._load_reboot_state()
 
     def ping(self, host):
         try:
@@ -596,6 +605,316 @@ class ConnectivitySentinel:
             log.error(f"Failed to restart networking: {e}")
             return False
 
+    def _get_primary_interface(self):
+        """Get the primary network interface name (usually eth0)."""
+        try:
+            result = subprocess.run(
+                ['ip', '-j', 'route', 'show', 'default'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.stdout:
+                routes = json.loads(result.stdout)
+                if routes:
+                    return routes[0].get('dev', 'eth0')
+        except:
+            pass
+        return 'eth0'
+
+    def _get_nm_connection_name(self, interface):
+        """Get the NetworkManager connection name for an interface."""
+        try:
+            result = subprocess.run(
+                ['nmcli', '-t', '-f', 'NAME,DEVICE', 'connection', 'show', '--active'],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.strip().split('\n'):
+                if ':' in line:
+                    name, dev = line.rsplit(':', 1)
+                    if dev.strip() == interface:
+                        return name.strip()
+        except:
+            pass
+        # Try all connections
+        try:
+            result = subprocess.run(
+                ['nmcli', '-t', '-f', 'NAME,DEVICE', 'connection', 'show'],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.strip().split('\n'):
+                if ':' in line:
+                    name, dev = line.rsplit(':', 1)
+                    if dev.strip() == interface:
+                        return name.strip()
+        except:
+            pass
+        return interface
+
+    def _is_static_ip(self, interface):
+        """Check if an interface is configured with a static IP."""
+        try:
+            result = subprocess.run(
+                ['nmcli', '-t', '-f', 'IP4.METHOD', 'device', 'show', interface],
+                capture_output=True, text=True, timeout=5
+            )
+            return 'manual' in result.stdout.lower()
+        except:
+            return False
+
+    def _get_current_network_config(self, interface, conn_name):
+        """Get current network configuration for backup."""
+        config = {
+            'interface': interface,
+            'connection': conn_name,
+            'timestamp': datetime.now().isoformat(),
+        }
+        try:
+            # Get IP address
+            result = subprocess.run(
+                ['nmcli', '-t', '-f', 'IP4.ADDRESS', 'device', 'show', interface],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.strip().split('\n'):
+                if 'IP4.ADDRESS' in line:
+                    config['ip'] = line.split(':', 1)[1].strip()
+                    break
+
+            # Get gateway
+            result = subprocess.run(
+                ['nmcli', '-t', '-f', 'IP4.GATEWAY', 'device', 'show', interface],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.strip().split('\n'):
+                if 'IP4.GATEWAY' in line:
+                    config['gateway'] = line.split(':', 1)[1].strip()
+                    break
+
+            # Get DNS
+            result = subprocess.run(
+                ['nmcli', '-t', '-f', 'IP4.DNS', 'device', 'show', interface],
+                capture_output=True, text=True, timeout=5
+            )
+            dns_servers = []
+            for line in result.stdout.strip().split('\n'):
+                if 'IP4.DNS' in line:
+                    dns_servers.append(line.split(':', 1)[1].strip())
+            if dns_servers:
+                config['dns'] = ','.join(dns_servers)
+
+        except Exception as e:
+            log.warning(f"[dhcp-fallback] Could not read full network config: {e}")
+
+        return config
+
+    def _restore_static_config(self, backup):
+        """Restore static IP configuration from backup."""
+        conn_name = backup.get('connection', 'eth0')
+        ip = backup.get('ip', '')
+        gateway = backup.get('gateway', '')
+        dns = backup.get('dns', '')
+
+        log.info(f"[dhcp-fallback] Restoring static config: IP={ip}, GW={gateway}, DNS={dns}")
+
+        try:
+            commands = [
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.method', 'manual'],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.addresses', ip],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.gateway', gateway],
+            ]
+            if dns:
+                commands.append(['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.dns', dns])
+
+            for cmd in commands:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                if result.returncode != 0:
+                    log.error(f"[dhcp-fallback] Restore command failed: {' '.join(cmd)} -> {result.stderr}")
+
+            subprocess.run(['sudo', 'nmcli', 'connection', 'down', conn_name],
+                          capture_output=True, text=True, timeout=10)
+            subprocess.run(['sudo', 'nmcli', 'connection', 'up', conn_name],
+                          capture_output=True, text=True, timeout=10)
+
+            log.info("[dhcp-fallback] Static config restored successfully")
+            return True
+        except Exception as e:
+            log.error(f"[dhcp-fallback] Failed to restore static config: {e}")
+            return False
+
+    def try_dhcp_fallback(self):
+        """Try switching to DHCP as a fallback when static IP has no connectivity.
+        Only runs once per offline event. Restores static config if DHCP doesn't help.
+        """
+        # Safety checks
+        if self.dhcp_fallback_attempted:
+            log.debug("[dhcp-fallback] Already attempted this offline cycle, skipping")
+            return False
+
+        if NETWORK_CHANGE_KILLSWITCH.exists():
+            log.info("[dhcp-fallback] Kill switch active (/etc/gravae/no_network_change), skipping")
+            alerts.add(
+                "dhcp_fallback_skipped", "info",
+                "DHCP fallback skipped: kill switch active",
+                {"offline_minutes": self.get_offline_minutes()}
+            )
+            return False
+
+        interface = self._get_primary_interface()
+
+        # Only try if interface is currently static
+        if not self._is_static_ip(interface):
+            log.info(f"[dhcp-fallback] Interface {interface} is already DHCP, skipping")
+            return False
+
+        self.dhcp_fallback_attempted = True
+        conn_name = self._get_nm_connection_name(interface)
+        offline_min = self.get_offline_minutes()
+
+        log.warning(f"[dhcp-fallback] Attempting DHCP fallback after {offline_min:.0f}min offline "
+                    f"(interface={interface}, connection={conn_name})")
+
+        # Save current config as backup
+        backup = self._get_current_network_config(interface, conn_name)
+        try:
+            Path("/etc/gravae").mkdir(parents=True, exist_ok=True)
+            NETWORK_BACKUP_FILE.write_text(json.dumps(backup, indent=2))
+            log.info(f"[dhcp-fallback] Network config backed up to {NETWORK_BACKUP_FILE}")
+        except Exception as e:
+            log.error(f"[dhcp-fallback] Failed to save backup, aborting: {e}")
+            alerts.add(
+                "dhcp_fallback_error", "warning",
+                f"DHCP fallback aborted: could not save backup ({e})",
+                {"offline_minutes": offline_min}
+            )
+            return False
+
+        # Switch to DHCP
+        try:
+            commands = [
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.method', 'auto'],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.addresses', ''],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.gateway', ''],
+                ['sudo', 'nmcli', 'connection', 'modify', conn_name, 'ipv4.dns', ''],
+            ]
+            for cmd in commands:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+            subprocess.run(['sudo', 'nmcli', 'connection', 'down', conn_name],
+                          capture_output=True, text=True, timeout=10)
+            subprocess.run(['sudo', 'nmcli', 'connection', 'up', conn_name],
+                          capture_output=True, text=True, timeout=10)
+
+            log.info("[dhcp-fallback] Switched to DHCP, waiting 60s for connectivity...")
+        except Exception as e:
+            log.error(f"[dhcp-fallback] Failed to switch to DHCP: {e}")
+            self._restore_static_config(backup)
+            return False
+
+        # Wait for DHCP to assign an IP and connectivity to be established
+        time.sleep(60)
+
+        # Check connectivity
+        if self.check_connectivity():
+            log.warning("[dhcp-fallback] DHCP fallback RESTORED connectivity!")
+            alerts.add(
+                "dhcp_fallback_success", "warning",
+                f"Fallback DHCP restaurou conectividade após {offline_min:.0f}min offline. "
+                f"Config estática anterior salva em {NETWORK_BACKUP_FILE}",
+                {"offline_minutes": offline_min, "backup": str(NETWORK_BACKUP_FILE)}
+            )
+            self.actions_taken.append(("dhcp_fallback_success", datetime.now().isoformat()))
+            return True
+        else:
+            log.warning("[dhcp-fallback] DHCP fallback did NOT restore connectivity, restoring static config")
+            self._restore_static_config(backup)
+            alerts.add(
+                "dhcp_fallback_failed", "warning",
+                f"DHCP fallback falhou após {offline_min:.0f}min offline. Config estática restaurada.",
+                {"offline_minutes": offline_min}
+            )
+            self.actions_taken.append(("dhcp_fallback_failed", datetime.now().isoformat()))
+            return False
+
+    def _load_reboot_state(self):
+        """Load reboot timestamps from persistent file."""
+        try:
+            if REBOOT_STATE_FILE.exists():
+                data = json.loads(REBOOT_STATE_FILE.read_text())
+                self.reboot_timestamps = data.get("timestamps", [])
+                # Prune entries older than 24h
+                cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+                self.reboot_timestamps = [t for t in self.reboot_timestamps if t > cutoff]
+        except Exception as e:
+            log.debug(f"Could not load reboot state: {e}")
+            self.reboot_timestamps = []
+
+    def _save_reboot_state(self):
+        """Save reboot timestamps to persistent file."""
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            REBOOT_STATE_FILE.write_text(json.dumps({
+                "timestamps": self.reboot_timestamps,
+                "version": VERSION,
+            }))
+        except Exception as e:
+            log.error(f"Could not save reboot state: {e}")
+
+    def _get_uptime_seconds(self):
+        """Get system uptime in seconds."""
+        try:
+            with open("/proc/uptime", "r") as f:
+                return float(f.read().split()[0])
+        except:
+            return 999999  # Assume long uptime if we can't read
+
+    def _can_reboot(self):
+        """Check if it's safe to reboot."""
+        # Anti boot-loop: don't reboot if system just started
+        uptime = self._get_uptime_seconds()
+        if uptime < MIN_UPTIME_BEFORE_REBOOT:
+            log.warning(f"Reboot blocked: uptime only {uptime:.0f}s (need {MIN_UPTIME_BEFORE_REBOOT}s)")
+            return False
+
+        # Max reboots per day
+        cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+        recent_reboots = [t for t in self.reboot_timestamps if t > cutoff]
+        if len(recent_reboots) >= MAX_REBOOTS_PER_DAY:
+            log.warning(f"Reboot blocked: already {len(recent_reboots)} reboots in last 24h (max {MAX_REBOOTS_PER_DAY})")
+            return False
+
+        return True
+
+    def reboot_system(self):
+        """Reboot the system as last resort after extended connectivity loss."""
+        if not self._can_reboot():
+            return False
+
+        offline_min = self.get_offline_minutes()
+        reboot_count = len(self.reboot_timestamps) + 1
+        log.warning(f"Escalation: REBOOTING system after {offline_min:.0f}min offline (reboot {reboot_count}/{MAX_REBOOTS_PER_DAY} today)")
+
+        # Record this reboot BEFORE rebooting
+        self.reboot_timestamps.append(datetime.now().isoformat())
+        self._save_reboot_state()
+
+        alerts.add(
+            "system_reboot",
+            "critical",
+            f"Reiniciando sistema após {offline_min:.0f} min sem internet (reboot {reboot_count}/{MAX_REBOOTS_PER_DAY} hoje)",
+            {"offline_minutes": offline_min, "reboot_count": reboot_count, "uptime": self._get_uptime_seconds()}
+        )
+
+        self.actions_taken.append(("reboot", datetime.now().isoformat()))
+
+        try:
+            # Sync filesystem before reboot
+            subprocess.run(["sync"], timeout=10)
+            # Use systemctl reboot (clean shutdown)
+            subprocess.run(["systemctl", "reboot"], timeout=10)
+        except Exception as e:
+            log.error(f"Reboot failed: {e}")
+            return False
+
+        return True
+
     def update(self):
         was_online = self.is_online
         self.is_online = self.check_connectivity()
@@ -616,6 +935,7 @@ class ConnectivitySentinel:
             self.last_successful_ping = datetime.now()
             self.escalation_level = 0
             self.actions_taken = []
+            self.dhcp_fallback_attempted = False
             return True
 
         # We're offline
@@ -626,8 +946,18 @@ class ConnectivitySentinel:
 
         offline_minutes = self.get_offline_minutes()
 
-        # Safe escalation: only restart services, NEVER modify network config or reboot
-        if offline_minutes >= ESCALATION_RESTART_NETWORKING and self.escalation_level < 2:
+        # Escalation levels: cloudflared(30m) → networking(60m) → DHCP fallback(120m) → reboot(240m)
+        if offline_minutes >= ESCALATION_REBOOT and self.escalation_level < 4:
+            # Level 4: Reboot after 4 hours offline (with safety checks)
+            self.escalation_level = 4
+            self.reboot_system()
+
+        elif offline_minutes >= ESCALATION_DHCP_FALLBACK and self.escalation_level < 3:
+            # Level 3: Try DHCP fallback after 2 hours (only for static IP interfaces)
+            self.escalation_level = 3
+            self.try_dhcp_fallback()
+
+        elif offline_minutes >= ESCALATION_RESTART_NETWORKING and self.escalation_level < 2:
             self.escalation_level = 2
             self.restart_networking()
 
@@ -635,18 +965,19 @@ class ConnectivitySentinel:
             self.escalation_level = 1
             self.restart_cloudflared()
 
-        # After Level 2, Phoenix only logs. No DHCP changes. No reboot. Ever.
-        if offline_minutes >= 120 and self.escalation_level == 2:
-            # Log periodically (every 30 min) so we know the device is still alive but offline
+        # After Level 4 (reboot attempted), log periodically
+        if offline_minutes >= ESCALATION_REBOOT and self.escalation_level >= 4:
             hours_offline = offline_minutes / 60
             if int(offline_minutes) % 30 == 0:
                 log.warning(f"Extended connectivity loss: {hours_offline:.1f}h offline. "
-                           f"No further actions - waiting for internet to return.")
+                           f"Reboot was attempted. Waiting for internet to return.")
 
         return False
 
 # NetworkRecovery REMOVED in v1.9.0 - modifying network config is too dangerous.
 # Phoenix will NEVER touch dhcpcd.conf or switch between DHCP/static IP.
+# Reboot RE-ADDED in v1.10.0 with safety: 4h threshold, 3/day limit, 5min uptime guard.
+# DHCP fallback ADDED in v1.11.0 with safety: backup+restore, kill switch, 1 attempt per cycle.
 
 # === Resource Monitor ===
 class ResourceMonitor:
