@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.0.2"
+VERSION = "3.0.3"
 
 # Centralized logging
 try:
@@ -387,7 +387,11 @@ def _get_nm_connection_name(interface):
     """Get the NetworkManager connection name for an interface.
     nmcli connection modify requires the connection name, NOT the interface name.
     E.g., interface 'eth0' might have connection name 'Wired connection 1'.
+
+    On Trixie/Bookworm, connection names vary: 'Wired connection 1', 'preconfigured', etc.
+    Uses rsplit to handle connection names containing colons.
     """
+    # Step 1: Search active connections
     try:
         result = subprocess.run(
             ['nmcli', '-t', '-f', 'NAME,DEVICE', 'connection', 'show', '--active'],
@@ -395,13 +399,106 @@ def _get_nm_connection_name(interface):
         )
         for line in result.stdout.strip().split('\n'):
             if ':' in line:
-                name, dev = line.split(':', 1)
+                name, dev = line.rsplit(':', 1)
                 if dev.strip() == interface:
+                    log.info(f"[network] Found active connection '{name.strip()}' for interface '{interface}'")
                     return name.strip()
-    except:
-        pass
-    # Fallback: try interface name directly (works if connection name matches)
+    except Exception as e:
+        log.debug(f"[network] Failed to list active connections: {e}")
+
+    # Step 2: Search ALL connections (including inactive)
+    try:
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,DEVICE', 'connection', 'show'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().split('\n'):
+            if ':' in line:
+                name, dev = line.rsplit(':', 1)
+                if dev.strip() == interface:
+                    log.info(f"[network] Found inactive connection '{name.strip()}' for interface '{interface}'")
+                    return name.strip()
+    except Exception as e:
+        log.debug(f"[network] Failed to list all connections: {e}")
+
+    # Step 3: No profile exists — create one
+    try:
+        conn_name = f"static-{interface}"
+        log.info(f"[network] No connection profile found for '{interface}', creating '{conn_name}'")
+        result = subprocess.run(
+            ['sudo', 'nmcli', 'connection', 'add', 'type', 'ethernet',
+             'con-name', conn_name, 'ifname', interface],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            log.info(f"[network] Created connection profile '{conn_name}' for '{interface}'")
+            return conn_name
+        else:
+            log.warning(f"[network] Failed to create connection profile: {result.stderr}")
+    except Exception as e:
+        log.warning(f"[network] Failed to create connection profile: {e}")
+
+    # Final fallback: try interface name directly
+    log.warning(f"[network] Using interface name '{interface}' as connection name (last resort)")
     return interface
+
+
+def check_ip_conflict(interface, ip):
+    """Check if an IP address is already in use on the network.
+    Uses arping (DAD mode) if available, falls back to ping.
+
+    Returns: {available: bool, method: str, details: str}
+    """
+    # Try arping first (more reliable — uses ARP, works even if ICMP is blocked)
+    try:
+        result = subprocess.run(
+            ['which', 'arping'], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            # DAD mode (-D): exit 0 = IP free, exit 1 = IP in use
+            result = subprocess.run(
+                ['sudo', 'arping', '-D', '-c', '2', '-w', '3', '-I', interface, ip],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                return {
+                    'available': True,
+                    'method': 'arping',
+                    'details': f'IP {ip} is available (no ARP response on {interface})'
+                }
+            else:
+                return {
+                    'available': False,
+                    'method': 'arping',
+                    'details': f'IP {ip} is already in use (ARP response received on {interface})'
+                }
+    except Exception as e:
+        log.debug(f"[network] arping failed: {e}")
+
+    # Fallback: use ping (less reliable — host may block ICMP)
+    try:
+        result = subprocess.run(
+            ['ping', '-c', '2', '-W', '2', ip],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return {
+                'available': False,
+                'method': 'ping',
+                'details': f'IP {ip} responded to ping (likely in use)'
+            }
+        else:
+            return {
+                'available': True,
+                'method': 'ping',
+                'details': f'IP {ip} did not respond to ping (likely available, but host may block ICMP)'
+            }
+    except Exception as e:
+        return {
+            'available': True,
+            'method': 'none',
+            'details': f'Could not check IP availability: {e}'
+        }
 
 
 def configure_network_static(interface, ip, prefix, gateway, dns=None):
@@ -4179,6 +4276,18 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json({"monitors": monitors})
             except Exception as e:
                 self._send_json({"monitors": [], "error": str(e)})
+
+        elif path == '/network/check-ip':
+            # Check if an IP is already in use on the network
+            ip = data.get('ip')
+            interface = data.get('interface', 'eth0')
+
+            if not ip:
+                self._send_json({"success": False, "error": "ip is required"}, 400)
+                return
+
+            result = check_ip_conflict(interface, ip)
+            self._send_json(result)
 
         elif path == '/network/configure':
             # Configure static IP or DHCP
