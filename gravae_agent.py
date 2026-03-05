@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.0.4"
+VERSION = "3.0.5"
 
 # Centralized logging
 try:
@@ -4537,6 +4537,46 @@ def _get_ffmpeg_timeout_flag():
     return '-stimeout'
 
 
+def _ensure_shinobi_running():
+    """Check if Shinobi PM2 process is running, restart if needed.
+    Runs in a background thread on startup with a short delay."""
+    import time
+    time.sleep(10)  # Wait for system to settle
+    try:
+        result = subprocess.run(
+            ['sudo', 'pm2', 'jlist'],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode != 0:
+            print("[Shinobi] PM2 not available, skipping health check")
+            return
+
+        import json as _json
+        processes = _json.loads(result.stdout) if result.stdout.strip() else []
+        shinobi_running = False
+        for p in processes:
+            name = p.get('name', '').lower()
+            status = p.get('pm2_env', {}).get('status', '')
+            if name in ('shinobi', 'camera'):
+                if status == 'online':
+                    shinobi_running = True
+                else:
+                    print(f"[Shinobi] PM2 process '{p.get('name')}' is {status}, restarting...")
+                    subprocess.run(['sudo', 'pm2', 'restart', p.get('name')], capture_output=True, timeout=30)
+                    shinobi_running = True
+
+        if not shinobi_running and processes:
+            # PM2 exists but no Shinobi process found at all - try restart all
+            print("[Shinobi] No Shinobi/camera PM2 process found, trying pm2 restart all...")
+            subprocess.run(['sudo', 'pm2', 'restart', 'all'], capture_output=True, timeout=30)
+        elif not processes:
+            # PM2 has no processes - try to resurrect
+            print("[Shinobi] PM2 has no processes, trying pm2 resurrect...")
+            subprocess.run(['sudo', 'pm2', 'resurrect'], capture_output=True, timeout=30)
+    except Exception as e:
+        print(f"[Shinobi] Health check error: {e}")
+
+
 def _fix_shinobi_monitors_stimeout():
     """Add RTSP timeout to all Shinobi monitors to prevent FFmpeg from hanging
     indefinitely when RTSP connections drop. Detects FFmpeg version to use the
@@ -4608,6 +4648,9 @@ def main():
 
     # Start post-update health check if needed (background thread)
     threading.Thread(target=_startup_health_check, daemon=True).start()
+
+    # Ensure Shinobi PM2 process is running (background, 10s delay)
+    threading.Thread(target=_ensure_shinobi_running, daemon=True).start()
 
     # Fix Shinobi monitors: add RTSP timeout to prevent stale streams (background, 30s delay)
     threading.Thread(target=_fix_shinobi_monitors_stimeout, daemon=True).start()
