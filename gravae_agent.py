@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.0.3"
+VERSION = "3.0.4"
 
 # Centralized logging
 try:
@@ -4512,6 +4512,64 @@ def _fix_dangerous_settings():
     _fix_cloudflared_service()
 
 
+def _fix_shinobi_monitors_stimeout():
+    """Add -stimeout 5000000 to all Shinobi monitors to prevent FFmpeg from hanging
+    indefinitely when RTSP connections drop. Uses MySQL JSON_SET to update only the
+    cust_input field without touching other monitor settings.
+    Runs in a background thread on startup with a delay to let Shinobi start."""
+    import time
+    time.sleep(30)  # Wait for Shinobi to be ready
+
+    group_key = CONFIG.get('shinobiGroupKey')
+    if not group_key:
+        return
+
+    try:
+        db_config = get_shinobi_db_config()
+        if not db_config:
+            print("[Shinobi] Cannot read DB config for stimeout fix")
+            return
+
+        db_name = db_config.get('database', 'ccio')
+        env = os.environ.copy()
+        if db_config.get('password'):
+            env['MYSQL_PWD'] = db_config['password']
+
+        # Count monitors that need fixing
+        check = subprocess.run(
+            ['sudo', 'mysql', '-N', db_name, '-e',
+             f"SELECT COUNT(*) FROM Monitors WHERE ke='{group_key}' "
+             f"AND (JSON_EXTRACT(details, '$.cust_input') IS NULL "
+             f"OR JSON_EXTRACT(details, '$.cust_input') = '' "
+             f"OR JSON_EXTRACT(details, '$.cust_input') NOT LIKE '%stimeout%');"],
+            capture_output=True, text=True, env=env, timeout=10
+        )
+
+        count = int(check.stdout.strip()) if check.returncode == 0 and check.stdout.strip() else 0
+        if count == 0:
+            return  # All monitors already have stimeout
+
+        # Update all monitors that need fixing in one query
+        result = subprocess.run(
+            ['sudo', 'mysql', db_name, '-e',
+             f"UPDATE Monitors SET details = JSON_SET(details, '$.cust_input', '-stimeout 5000000') "
+             f"WHERE ke='{group_key}' "
+             f"AND (JSON_EXTRACT(details, '$.cust_input') IS NULL "
+             f"OR JSON_EXTRACT(details, '$.cust_input') = '' "
+             f"OR JSON_EXTRACT(details, '$.cust_input') NOT LIKE '%stimeout%');"],
+            capture_output=True, text=True, env=env, timeout=10
+        )
+
+        if result.returncode == 0:
+            # Restart Shinobi to apply the new FFmpeg flags
+            subprocess.run(['sudo', 'pm2', 'restart', 'all'], capture_output=True, timeout=30)
+            print(f"[Shinobi] Added -stimeout 5000000 to {count} monitor(s), restarted Shinobi")
+        else:
+            print(f"[Shinobi] Failed to update monitors: {result.stderr}")
+    except Exception as e:
+        print(f"[Shinobi] stimeout fix error: {e}")
+
+
 def main():
     log.info(f"Gravae Agent v{VERSION} starting", extra={"port": PORT})
 
@@ -4521,6 +4579,9 @@ def main():
 
     # Start post-update health check if needed (background thread)
     threading.Thread(target=_startup_health_check, daemon=True).start()
+
+    # Fix Shinobi monitors: add RTSP timeout to prevent stale streams (background, 30s delay)
+    threading.Thread(target=_fix_shinobi_monitors_stimeout, daemon=True).start()
 
     # Start coaching review module if configured
     if _coaching_module and _coaching_module.is_configured():
