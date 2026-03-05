@@ -4513,7 +4513,7 @@ def _fix_dangerous_settings():
 
 
 def _fix_shinobi_monitors_stimeout():
-    """Add -stimeout 5000000 to all Shinobi monitors to prevent FFmpeg from hanging
+    """Add -timeout 5000000 to all Shinobi monitors to prevent FFmpeg from hanging
     indefinitely when RTSP connections drop. Uses MySQL JSON_SET to update only the
     cust_input field without touching other monitor settings.
     Runs in a background thread on startup with a delay to let Shinobi start."""
@@ -4552,7 +4552,7 @@ def _fix_shinobi_monitors_stimeout():
         # Update all monitors that need fixing in one query
         result = subprocess.run(
             ['sudo', 'mysql', db_name, '-e',
-             f"UPDATE Monitors SET details = JSON_SET(details, '$.cust_input', '-stimeout 5000000') "
+             f"UPDATE Monitors SET details = JSON_SET(details, '$.cust_input', '-timeout 5000000') "
              f"WHERE ke='{group_key}' "
              f"AND (JSON_EXTRACT(details, '$.cust_input') IS NULL "
              f"OR JSON_EXTRACT(details, '$.cust_input') = '' "
@@ -4563,7 +4563,7 @@ def _fix_shinobi_monitors_stimeout():
         if result.returncode == 0:
             # Restart Shinobi to apply the new FFmpeg flags
             subprocess.run(['sudo', 'pm2', 'restart', 'all'], capture_output=True, timeout=30)
-            print(f"[Shinobi] Added -stimeout 5000000 to {count} monitor(s), restarted Shinobi")
+            print(f"[Shinobi] Added -timeout 5000000 to {count} monitor(s), restarted Shinobi")
         else:
             print(f"[Shinobi] Failed to update monitors: {result.stderr}")
     except Exception as e:
