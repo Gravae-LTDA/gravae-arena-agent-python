@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.0.5"
+VERSION = "3.0.6"
 
 # Centralized logging
 try:
@@ -54,7 +54,7 @@ except Exception as e:
     log.error(f"Failed to load coaching module: {e}")
 CORS_ORIGIN = "*"
 CONFIG_PATH = "/etc/gravae/device.json"
-AGENT_PATH = "/opt/gravae-agent"
+AGENT_PATH = os.path.dirname(os.path.abspath(__file__)) or "/opt/gravae-agent"
 GITHUB_REPO = "Gravae-LTDA/gravae-arena-agent-python"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/Gravae-LTDA/gravae-arena-agent-python/main"
 
@@ -3352,7 +3352,7 @@ def get_phoenix_status():
         try:
             if check_type == "pm2":
                 result = subprocess.run(
-                    ["pm2", "list", "--no-color"],
+                    ["sudo", "pm2", "list", "--no-color"],
                     capture_output=True, text=True, timeout=10
                 )
                 status["services"][service_name] = "online" in result.stdout.lower()
