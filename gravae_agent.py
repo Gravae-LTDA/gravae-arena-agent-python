@@ -4516,25 +4516,32 @@ def _get_ffmpeg_timeout_flag():
     """Detect the correct RTSP timeout flag for the installed FFmpeg version.
     - FFmpeg < 7: -stimeout (microseconds)
     - FFmpeg >= 7: -timeout (microseconds), -stimeout was removed
+    Retries up to 3 times to handle slow boot.
     """
-    try:
-        result = subprocess.run(
-            ['/usr/bin/ffmpeg', '-version'],
-            capture_output=True, text=True, timeout=5
-        )
-        # First line: "ffmpeg version 7.1.2-... " or "ffmpeg version 4.3.6-..."
-        first_line = result.stdout.split('\n')[0] if result.stdout else ''
-        import re
-        match = re.search(r'version\s+(\d+)\.', first_line)
-        if match:
-            major = int(match.group(1))
-            flag = '-timeout' if major >= 7 else '-stimeout'
-            print(f"[Shinobi] FFmpeg {major}.x detected, using {flag}")
-            return flag
-    except Exception:
-        pass
-    # Default to -timeout (works on ffmpeg 5.x+, required for ffmpeg 7.x/Trixie)
-    return '-timeout'
+    import re
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ['/usr/bin/ffmpeg', '-version'],
+                capture_output=True, text=True, timeout=10
+            )
+            first_line = result.stdout.split('\n')[0] if result.stdout else ''
+            match = re.search(r'version\s+(\d+)\.', first_line)
+            if match:
+                major = int(match.group(1))
+                flag = '-timeout' if major >= 7 else '-stimeout'
+                print(f"[Shinobi] FFmpeg {major}.x detected, using {flag}")
+                return flag
+            else:
+                print(f"[Shinobi] Could not parse ffmpeg version: {first_line[:80]}")
+        except Exception as e:
+            print(f"[Shinobi] ffmpeg version check attempt {attempt+1} failed: {e}")
+        if attempt < 2:
+            import time
+            time.sleep(5)
+    # Default to -stimeout (safe for Bullseye which is 90% of devices)
+    print("[Shinobi] ffmpeg version detection failed, defaulting to -stimeout")
+    return '-stimeout'
 
 
 def _ensure_shinobi_running():
