@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.0.6"
+VERSION = "3.0.7"
 
 # Centralized logging
 try:
@@ -4533,8 +4533,8 @@ def _get_ffmpeg_timeout_flag():
             return flag
     except Exception:
         pass
-    # Default to -stimeout (works on 95% of devices running Bullseye)
-    return '-stimeout'
+    # Default to -timeout (works on ffmpeg 5.x+, required for ffmpeg 7.x/Trixie)
+    return '-timeout'
 
 
 def _ensure_shinobi_running():
