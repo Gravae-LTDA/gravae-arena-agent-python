@@ -18,6 +18,7 @@ import os
 import sys
 import json
 import time
+import uuid
 import socket
 import sqlite3
 import subprocess
@@ -29,7 +30,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -66,6 +67,16 @@ SERVICES = {
     "shinobi": {"critical": True, "port": 8080, "pm2": True},  # Shinobi via pm2
     "mariadb": {"critical": True, "port": 3306},  # MariaDB database server
 }
+
+# Webhook configuration
+WEBHOOK_SECRET = "b36d1655-99ea-45b1-a627-984eb7e376a9"
+WEBHOOK_URLS = {
+    "gravae": "https://api.gravae.io/webhooks/phoenix/incidents",
+    "replayme": "https://api.replayme.io/webhooks/phoenix/incidents",
+}
+WEBHOOK_SEND_INTERVAL = 300  # Send pending alerts every 5 minutes
+WEBHOOK_MAX_RETRIES = 3
+WEBHOOK_TIMEOUT = 10
 
 # Resource thresholds
 TEMP_WARNING = 70  # Celsius
@@ -1115,26 +1126,183 @@ class ResourceMonitor:
         except Exception as e:
             log.error(f"Disk cleanup failed: {e}")
 
-# === Heartbeat ===
-class Heartbeat:
+# === Webhook Sender ===
+class WebhookSender:
+    """Sends Phoenix incidents to the Gravae/Replayme API webhook."""
+
+    # Map Phoenix alert types to webhook event types
+    ALERT_TYPE_MAP = {
+        "service_down": ("service_down", None),
+        "service_recovered": ("service_up", None),
+        "service_restarted": ("service_down", None),
+        "service_restart_failed": ("service_down", None),
+        "connectivity_lost": ("device_offline", "cloudflared"),
+        "connectivity_restored": ("service_up", "cloudflared"),
+        "connectivity_action": ("service_down", "cloudflared"),
+        "monitor_status_change": ("monitor_offline", "camera"),
+        "monitor_recovered": ("service_up", "camera"),
+        "temperature_critical": ("resource_warning", "temperature"),
+        "disk_critical": ("resource_warning", "disk"),
+        "memory_critical": ("resource_warning", "memory"),
+        "undervoltage": ("resource_warning", "undervoltage"),
+        "undervoltage_recovered": ("resource_warning", "undervoltage"),
+        "voltage_low": ("resource_warning", "undervoltage"),
+        "system_reboot": ("device_offline", None),
+    }
+
     def __init__(self):
-        self.last_heartbeat = None
-        self.platform_url = None
+        self.webhook_url = None
+        self.platform = None
+        self.device_serial = None
+        self.device_name = None
+        self.arena_name = None
         self._load_config()
 
     def _load_config(self):
         try:
             if CONFIG_PATH.exists():
                 config = json.loads(CONFIG_PATH.read_text())
-                # Future: get platform URL from config
-        except:
-            pass
+                self.arena_name = config.get("arenaName")
+                self.device_name = config.get("deviceName", self.arena_name)
 
-    def send(self, status):
-        """Send heartbeat to platform (future implementation)"""
-        self.last_heartbeat = datetime.now()
-        # TODO: Implement when platform endpoint is ready
-        pass
+                # Detect platform from email or explicit config
+                email = config.get("shinobiEmail", "")
+                if config.get("platform"):
+                    self.platform = config["platform"]
+                elif "replayme" in email:
+                    self.platform = "replayme"
+                else:
+                    self.platform = "gravae"
+
+                self.webhook_url = config.get("webhookUrl") or WEBHOOK_URLS.get(self.platform)
+
+            # Read device serial
+            try:
+                with open("/proc/cpuinfo") as f:
+                    for line in f:
+                        if line.startswith("Serial"):
+                            self.device_serial = line.split(":")[1].strip()
+                            break
+            except Exception:
+                pass
+
+            log.info(f"Webhook configured: platform={self.platform}, url={self.webhook_url}, serial={self.device_serial}")
+        except Exception as e:
+            log.warning(f"Webhook config load failed: {e}")
+
+    # Map systemd service names to webhook 'what' values
+    SERVICE_NAME_MAP = {
+        "gravae-agent": "agent",
+        "cloudflared": "cloudflared",
+        "gravae-buttons": "button_daemon",
+        "shinobi": "shinobi",
+        "mariadb": "shinobi",  # MariaDB down = Shinobi problem
+    }
+
+    def _extract_service_name(self, message):
+        """Extract the service name from alert messages like 'Service cloudflared is down'."""
+        if "Service " in message:
+            # "Service cloudflared is down" → "cloudflared"
+            parts = message.split("Service ", 1)
+            if len(parts) > 1:
+                name = parts[1].split(" ")[0]
+                return self.SERVICE_NAME_MAP.get(name, name)
+        return None
+
+    def _alert_to_event(self, alert):
+        """Convert a Phoenix alert to a webhook event."""
+        alert_type = alert.get("type", "")
+        message = alert.get("message", "")
+        mapped = self.ALERT_TYPE_MAP.get(alert_type)
+
+        if not mapped:
+            event_type = "service_down" if "down" in alert_type or "fail" in alert_type else "resource_warning"
+            what = alert_type
+        else:
+            event_type, what = mapped
+
+        # Extract 'what' from message (service name) or details
+        details = alert.get("details") or {}
+        if what is None:
+            what = self._extract_service_name(message) or details.get("service") or details.get("what") or alert_type
+
+        event = {
+            "type": event_type,
+            "what": what,
+            "device": {
+                "serial": self.device_serial,
+                "name": self.device_name,
+            },
+            "arena": {
+                "name": self.arena_name,
+                "platform": self.platform,
+            },
+            "timestamp": alert.get("timestamp", datetime.now().isoformat()),
+            "summary": alert.get("message", ""),
+            "details": details,
+        }
+        return event
+
+    def send_pending(self, alert_queue):
+        """Send all pending alerts as webhook events."""
+        if not self.webhook_url:
+            return
+
+        pending = alert_queue.get_pending(limit=50)
+        if not pending:
+            return
+
+        # Convert alerts to webhook events
+        events = []
+        alert_ids = []
+        for alert in pending:
+            events.append(self._alert_to_event(alert))
+            alert_ids.append(alert["id"])
+
+        payload = {
+            "events": events,
+            "metadata": {
+                "phoenixVersion": VERSION,
+                "generatedAt": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            },
+        }
+
+        headers = {
+            "Authorization": f"Bearer {WEBHOOK_SECRET}",
+            "X-Phoenix-Timestamp": str(int(time.time())),
+            "X-Phoenix-Event-Id": str(uuid.uuid4()),
+            "Content-Type": "application/json",
+        }
+
+        # Send with retry
+        for attempt in range(WEBHOOK_MAX_RETRIES):
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    self.webhook_url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT) as resp:
+                    status = resp.status
+                    if status in (200, 202):
+                        alert_queue.mark_synced(alert_ids)
+                        log.info(f"Webhook sent: {len(events)} event(s), status={status}")
+                        return True
+                    elif status == 429:
+                        wait = 2 ** attempt
+                        log.warning(f"Webhook rate limited, retrying in {wait}s")
+                        time.sleep(wait)
+                    else:
+                        log.warning(f"Webhook returned {status}")
+                        return False
+            except Exception as e:
+                if attempt < WEBHOOK_MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    log.warning(f"Webhook send failed after {WEBHOOK_MAX_RETRIES} attempts: {e}")
+        return False
 
 # Boot report removed in v1.9.0 - Phoenix no longer reboots the system.
 
@@ -1171,7 +1339,7 @@ class PhoenixDaemon:
         self.service_guardian = ServiceGuardian()
         self.connectivity = ConnectivitySentinel()
         self.resources = ResourceMonitor()
-        self.heartbeat = Heartbeat()
+        self.webhook = WebhookSender()
         self.watchdog = HardwareWatchdog()
         self.shinobi_watcher = None  # Lazy loaded to save memory
 
@@ -1288,7 +1456,7 @@ class PhoenixDaemon:
         last_connectivity_check = 0
         last_resource_check = 0
         last_monitor_check = 0
-        last_heartbeat = 0
+        last_webhook_send = 0
         last_alert_cleanup = 0
         last_gc = 0
         last_voltage_check = 0
@@ -1339,20 +1507,13 @@ class PhoenixDaemon:
                             )
                     last_voltage_check = now
 
-                # Heartbeat (every 5 minutes when online)
-                if now - last_heartbeat >= 300 and self.connectivity.is_online:
-                    status = {
-                        "services": self.service_guardian.service_status,
-                        "connectivity": self.connectivity.is_online,
-                        "resources": {
-                            "temp": self.resources.get_temperature(),
-                            "disk": self.resources.get_disk_usage(),
-                            "memory": self.resources.get_memory_usage(),
-                            "voltage": self.resources.get_voltage()
-                        }
-                    }
-                    self.heartbeat.send(status)
-                    last_heartbeat = now
+                # Webhook: send pending alerts (every 5 minutes when online)
+                if now - last_webhook_send >= WEBHOOK_SEND_INTERVAL and self.connectivity.is_online:
+                    try:
+                        self.webhook.send_pending(alerts)
+                    except Exception as e:
+                        log.debug(f"Webhook send error: {e}")
+                    last_webhook_send = now
 
                 # Alert cleanup (daily)
                 if now - last_alert_cleanup >= 86400:
