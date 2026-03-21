@@ -2953,9 +2953,9 @@ from datetime import datetime, date
 # =========================
 # CONFIG
 # =========================
-COOLDOWN = 5.0          # Cooldown per button (seconds)
-DEBOUNCE_TIME = 0.2     # Debounce time (seconds)
-POLL_INTERVAL = 0.05    # Polling interval (50ms for responsiveness)
+COOLDOWN = 1.0          # Cooldown per button (seconds)
+DEBOUNCE_TIME = 0.05    # Debounce time (50ms)
+POLL_INTERVAL = 0.01    # Polling interval (10ms for fast button detection)
 HTTP_TIMEOUT = 5        # HTTP request timeout (seconds)
 HEARTBEAT_INTERVAL = 60 # Heartbeat log interval (seconds)
 STUCK_LOW_THRESHOLD = 20 # Alert after pin stuck LOW this many seconds
@@ -4646,12 +4646,63 @@ def _fix_shinobi_monitors_stimeout():
         print(f"[Shinobi] timeout fix error: {e}")
 
 
+def _fix_button_daemon_polling():
+    """Update button daemon polling settings for faster press detection.
+    Changes COOLDOWN, DEBOUNCE_TIME and POLL_INTERVAL in-place via sed,
+    preserving all GPIO-to-monitor mappings. Restarts service if changed."""
+    import re
+    # Find the button daemon script
+    user = CONFIG.get('arenaUser', 'gravae')
+    arena_type = CONFIG.get('arenaType', 'gravae')
+    type_name = 'Replayme' if arena_type == 'replayme' else 'Gravae'
+    candidates = [
+        f'/home/{user}/Documents/{type_name}/button-daemon.py',
+        f'/home/{user}/Documents/Gravae/button-daemon.py',
+        f'/home/{user}/Documents/Replayme/button-daemon.py',
+    ]
+    daemon_path = None
+    for p in candidates:
+        if os.path.exists(p):
+            daemon_path = p
+            break
+    if not daemon_path:
+        return
+
+    try:
+        with open(daemon_path, 'r') as f:
+            content = f.read()
+
+        modified = False
+        replacements = [
+            (r'COOLDOWN\s*=\s*5\.0', 'COOLDOWN = 1.0'),
+            (r'DEBOUNCE_TIME\s*=\s*0\.2', 'DEBOUNCE_TIME = 0.05'),
+            (r'POLL_INTERVAL\s*=\s*0\.05', 'POLL_INTERVAL = 0.01'),
+        ]
+        for pattern, replacement in replacements:
+            if re.search(pattern, content):
+                content = re.sub(pattern, replacement, content)
+                modified = True
+
+        if modified:
+            with open(daemon_path, 'w') as f:
+                f.write(content)
+            subprocess.run(['sudo', 'systemctl', 'restart', 'gravae-buttons'], capture_output=True, timeout=10)
+            print(f"[Startup] FIXED: Button daemon polling updated (COOLDOWN=1.0, DEBOUNCE=0.05, POLL=0.01)")
+        else:
+            print("[Startup] Button daemon polling already up to date")
+    except Exception as e:
+        print(f"[Startup] Button daemon polling fix error: {e}")
+
+
 def main():
     log.info(f"Gravae Agent v{VERSION} starting", extra={"port": PORT})
 
     # Fix dangerous settings from previous versions BEFORE anything else
     _fix_dangerous_settings()
     log.info("Dangerous settings check complete")
+
+    # Fix button daemon polling if needed (faster detection)
+    _fix_button_daemon_polling()
 
     # Start post-update health check if needed (background thread)
     threading.Thread(target=_startup_health_check, daemon=True).start()
