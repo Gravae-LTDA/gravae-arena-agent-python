@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.2.2"
+VERSION = "3.2.3"
 
 # Centralized logging
 try:
@@ -4463,6 +4463,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/phoenix/status': get_phoenix_status,
             '/phoenix/alerts': get_phoenix_alerts,
             '/phoenix/logs': get_phoenix_logs,
+            '/phoenix/monitors': get_phoenix_monitors,
             '/phoenix/buttons': get_button_history,
             '/shinobi/accounts': list_shinobi_accounts,
             '/shinobi/monitors': get_shinobi_monitors,
@@ -4666,6 +4667,60 @@ def _fix_shinobi_monitors_stimeout():
             print(f"[Shinobi] Failed to update monitors: {result.stderr}")
     except Exception as e:
         print(f"[Shinobi] timeout fix error: {e}")
+
+
+def get_phoenix_monitors():
+    """Get Shinobi monitors with events for anomaly detection (GET handler)."""
+    api_key = CONFIG.get('shinobiApiKey')
+    group_key = CONFIG.get('shinobiGroupKey')
+    if not api_key or not group_key:
+        return {"monitors": [], "error": "No Shinobi credentials"}
+
+    try:
+        shinobi_url = f"http://127.0.0.1:8080/{api_key}/monitor/{group_key}"
+        req = urllib.request.Request(shinobi_url, headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            monitors_data = json.loads(resp.read().decode())
+
+        monitors = []
+        if not isinstance(monitors_data, list):
+            monitors_data = []
+        for m in monitors_data:
+            if not isinstance(m, dict):
+                continue
+            mid = m.get('mid', '')
+            name = m.get('name', mid)
+            mode = m.get('mode', 'stop')
+            status = m.get('status', 'unknown')
+            is_online = mode == 'start' and status not in ['died', 'connecting', 'failed', 'error']
+
+            events = []
+            try:
+                events_url = f"http://127.0.0.1:8080/{api_key}/events/{group_key}/{mid}?limit=5"
+                events_req = urllib.request.Request(events_url, headers={'Accept': 'application/json'})
+                with urllib.request.urlopen(events_req, timeout=5) as events_resp:
+                    events_data = json.loads(events_resp.read().decode())
+                    for ev in (events_data if isinstance(events_data, list) else []):
+                        events.append({
+                            'time': ev.get('time', ''),
+                            'reason': ev.get('reason', ''),
+                            'plug': ev.get('details', {}).get('plug', '') if isinstance(ev.get('details'), dict) else '',
+                        })
+            except:
+                pass
+
+            monitors.append({
+                'mid': mid,
+                'name': name,
+                'mode': mode,
+                'status': status,
+                'isOnline': is_online,
+                'events': events,
+            })
+
+        return {"monitors": monitors}
+    except Exception as e:
+        return {"monitors": [], "error": str(e)}
 
 
 def _fix_button_daemon_polling():
