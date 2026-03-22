@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.2.3"
+VERSION = "3.2.4"
 
 # Centralized logging
 try:
@@ -4673,6 +4673,34 @@ def get_phoenix_monitors():
     """Get Shinobi monitors with events for anomaly detection (GET handler)."""
     api_key = CONFIG.get('shinobiApiKey')
     group_key = CONFIG.get('shinobiGroupKey')
+
+    # Fallback: try to discover credentials from Shinobi DB if not in config
+    if not api_key or not group_key:
+        try:
+            db_pass = ''
+            for conf_path in ['/home/Shinobi/conf.json', '/opt/shinobi/conf.json']:
+                if os.path.exists(conf_path):
+                    with open(conf_path) as f:
+                        conf = json.load(f)
+                    db_pass = conf.get('db', {}).get('password', '')
+                    break
+
+            env = dict(os.environ)
+            if db_pass:
+                env['MYSQL_PWD'] = db_pass
+            result = subprocess.run(
+                ['mysql', '-u', 'majesticflame', 'ccio', '-N', '-e',
+                 "SELECT ke, code FROM Users u LEFT JOIN API a ON u.ke = a.ke LIMIT 1"],
+                capture_output=True, text=True, timeout=5, env=env
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split('\t')
+                if len(parts) >= 2:
+                    group_key = parts[0]
+                    api_key = parts[1]
+        except:
+            pass
+
     if not api_key or not group_key:
         return {"monitors": [], "error": "No Shinobi credentials"}
 
