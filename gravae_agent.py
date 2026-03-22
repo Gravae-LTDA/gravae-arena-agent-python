@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.2.1"
+VERSION = "3.2.2"
 
 # Centralized logging
 try:
@@ -3351,11 +3351,33 @@ def get_phoenix_status():
     for service_name, check_type in services_to_check:
         try:
             if check_type == "pm2":
-                result = subprocess.run(
-                    ["sudo", "pm2", "list", "--no-color"],
-                    capture_output=True, text=True, timeout=10
-                )
-                status["services"][service_name] = "online" in result.stdout.lower()
+                # Check port 8080 first (most reliable), fallback to pm2 list
+                is_running = False
+                try:
+                    import urllib.request
+                    req = urllib.request.Request("http://127.0.0.1:8080/", method="HEAD")
+                    with urllib.request.urlopen(req, timeout=3) as resp:
+                        is_running = resp.status < 500
+                except:
+                    pass
+                if not is_running:
+                    for pm2_path in ["/usr/local/bin/pm2", "/usr/bin/pm2", "pm2"]:
+                        try:
+                            result = subprocess.run(
+                                ["sudo", pm2_path, "jlist"],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if result.returncode == 0 and result.stdout.strip():
+                                processes = json.loads(result.stdout)
+                                is_running = any(
+                                    p.get("pm2_env", {}).get("status") == "online"
+                                    for p in processes
+                                    if p.get("name", "").lower() in ("camera", "shinobi")
+                                )
+                            break
+                        except:
+                            continue
+                status["services"][service_name] = is_running
             else:
                 result = subprocess.run(
                     ["systemctl", "is-active", service_name],
