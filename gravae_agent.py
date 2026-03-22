@@ -4688,11 +4688,22 @@ def get_phoenix_monitors():
             env = dict(os.environ)
             if db_pass:
                 env['MYSQL_PWD'] = db_pass
-            result = subprocess.run(
-                ['mysql', '-u', 'majesticflame', 'ccio', '-N', '-e',
-                 "SELECT ke, code FROM Users u LEFT JOIN API a ON u.ke = a.ke LIMIT 1"],
-                capture_output=True, text=True, timeout=5, env=env
-            )
+            # Try with sudo first (some arenas require it), then without
+            for cmd_prefix in [['sudo'], []]:
+                result = subprocess.run(
+                    cmd_prefix + ['mysql', '-u', 'majesticflame', 'ccio', '-N', '-e',
+                     "SELECT u.ke, a.code FROM Users u LEFT JOIN API a ON u.ke = a.ke LIMIT 1"],
+                    capture_output=True, text=True, timeout=5, env=env
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    break
+            # Fallback: try sudo mysql without user (root auth)
+            if result.returncode != 0 or not result.stdout.strip():
+                result = subprocess.run(
+                    ['sudo', 'mysql', 'ccio', '-N', '-e',
+                     "SELECT u.ke, a.code FROM Users u LEFT JOIN API a ON u.ke = a.ke LIMIT 1"],
+                    capture_output=True, text=True, timeout=5
+                )
             if result.returncode == 0 and result.stdout.strip():
                 parts = result.stdout.strip().split('\t')
                 if len(parts) >= 2:
