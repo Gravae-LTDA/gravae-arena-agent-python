@@ -967,7 +967,8 @@ class ResourceMonitor:
         self.last_voltage_check = 0  # Timestamp for daily voltage check
         self.last_speed_test = 0  # Timestamp for speed test
         self.download_speed_mbps = None  # Last measured download speed
-        self.slow_internet = False  # True if < 2 Mbps
+        self.slow_internet = False  # True if < 30 Mbps
+        self.very_slow_internet = False  # True if < 10 Mbps
 
     def get_throttled(self):
         """Check Raspberry Pi throttling/voltage status via vcgencmd.
@@ -1059,18 +1060,23 @@ class ResourceMonitor:
                     mbps = round((len(data) * 8 / 1_000_000) / elapsed, 1)
                     self.download_speed_mbps = mbps
                     was_slow = self.slow_internet
-                    self.slow_internet = mbps < 2.0
-                    if self.slow_internet and not was_slow:
+                    was_very_slow = self.very_slow_internet
+                    self.slow_internet = mbps < 30.0
+                    self.very_slow_internet = mbps < 10.0
+                    if self.very_slow_internet and not was_very_slow:
+                        alerts.add("very_slow_internet", "critical", f"Internet muito lenta: {mbps} Mbps", {"speed_mbps": mbps})
+                    elif self.slow_internet and not was_slow:
                         alerts.add("slow_internet", "warning", f"Internet lenta: {mbps} Mbps", {"speed_mbps": mbps})
                     elif not self.slow_internet and was_slow:
                         alerts.add("internet_recovered", "info", f"Internet normalizada: {mbps} Mbps", {"speed_mbps": mbps})
-                    log.info(f"Speed test: {mbps} Mbps {'(slow!)' if self.slow_internet else '(ok)'}")
+                    label = '(muito lenta!)' if self.very_slow_internet else '(lenta)' if self.slow_internet else '(ok)'
+                    log.info(f"Speed test: {mbps} Mbps {label}")
                     self.last_speed_test = time.time()
                     # Write result for agent to read
                     try:
                         import json as _json
                         with open('/tmp/gravae_speed_test.json', 'w') as _f:
-                            _json.dump({"speed_mbps": mbps, "slow": self.slow_internet, "timestamp": time.time()}, _f)
+                            _json.dump({"speed_mbps": mbps, "slow": self.slow_internet, "very_slow": self.very_slow_internet, "timestamp": time.time()}, _f)
                     except:
                         pass
                     return
