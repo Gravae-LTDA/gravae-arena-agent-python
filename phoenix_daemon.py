@@ -1046,8 +1046,8 @@ class ResourceMonitor:
         """Quick download speed test (~1MB). Updates self.download_speed_mbps and self.slow_internet."""
         import urllib.request as _req
         urls = [
+            'http://speedtest.tele2.net/10MB.zip',
             'https://proof.ovh.net/files/10Mb.dat',
-            'https://speed.hetzner.de/10MB.bin',
         ]
         for url in urls:
             try:
