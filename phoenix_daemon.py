@@ -1043,50 +1043,60 @@ class ResourceMonitor:
             return None
 
     def check_speed(self):
-        """Download speed test (~10MB). Tests multiple servers, uses best result."""
-        import urllib.request as _req
-        urls = [
-            'https://proof.ovh.net/files/10Mb.dat',
-            'http://speedtest.tele2.net/10MB.zip',
-        ]
-        best_mbps = 0.0
-        for url in urls:
-            try:
-                start = time.time()
-                req = _req.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with _req.urlopen(req, timeout=60) as resp:
-                    data = resp.read()
-                elapsed = time.time() - start
-                if elapsed > 0 and len(data) > 0:
-                    mbps = round((len(data) * 8 / 1_000_000) / elapsed, 1)
-                    log.info(f"Speed test ({url.split('/')[2]}): {mbps} Mbps")
-                    if mbps > best_mbps:
-                        best_mbps = mbps
-            except Exception as e:
-                log.debug(f"Speed test failed ({url}): {e}")
+        """Speed test via speedtest-cli (accurate, multi-connection)."""
+        mbps = None
 
-        if best_mbps > 0:
-            self.download_speed_mbps = best_mbps
+        # Try speedtest-cli first (most accurate)
+        try:
+            result = subprocess.run(
+                ['speedtest-cli', '--simple', '--no-upload'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    if line.startswith('Download:'):
+                        mbps = round(float(line.split()[1]), 1)
+                        break
+        except FileNotFoundError:
+            # Install speedtest-cli if not available
+            try:
+                subprocess.run(['pip3', 'install', 'speedtest-cli'], capture_output=True, timeout=30)
+                result = subprocess.run(
+                    ['speedtest-cli', '--simple', '--no-upload'],
+                    capture_output=True, text=True, timeout=60
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.strip().split('\n'):
+                        if line.startswith('Download:'):
+                            mbps = round(float(line.split()[1]), 1)
+                            break
+            except:
+                log.debug("Failed to install speedtest-cli")
+        except Exception as e:
+            log.debug(f"speedtest-cli failed: {e}")
+
+        if mbps is not None:
+            self.download_speed_mbps = mbps
             was_slow = self.slow_internet
             was_very_slow = self.very_slow_internet
-            self.slow_internet = best_mbps < 30.0
-            self.very_slow_internet = best_mbps < 10.0
+            self.slow_internet = mbps < 30.0
+            self.very_slow_internet = mbps < 10.0
             if self.very_slow_internet and not was_very_slow:
-                alerts.add("very_slow_internet", "critical", f"Internet muito lenta: {best_mbps} Mbps", {"speed_mbps": best_mbps})
+                alerts.add("very_slow_internet", "critical", f"Internet muito lenta: {mbps} Mbps", {"speed_mbps": mbps})
             elif self.slow_internet and not was_slow:
-                alerts.add("slow_internet", "warning", f"Internet lenta: {best_mbps} Mbps", {"speed_mbps": best_mbps})
+                alerts.add("slow_internet", "warning", f"Internet lenta: {mbps} Mbps", {"speed_mbps": mbps})
             elif not self.slow_internet and was_slow:
-                alerts.add("internet_recovered", "info", f"Internet normalizada: {best_mbps} Mbps", {"speed_mbps": best_mbps})
+                alerts.add("internet_recovered", "info", f"Internet normalizada: {mbps} Mbps", {"speed_mbps": mbps})
             label = '(muito lenta!)' if self.very_slow_internet else '(lenta)' if self.slow_internet else '(ok)'
-            log.info(f"Speed test best: {best_mbps} Mbps {label}")
+            log.info(f"Speed test: {mbps} Mbps {label}")
             try:
                 import json as _json
                 with open('/tmp/gravae_speed_test.json', 'w') as _f:
-                    _json.dump({"speed_mbps": best_mbps, "slow": self.slow_internet, "very_slow": self.very_slow_internet, "timestamp": time.time()}, _f)
+                    _json.dump({"speed_mbps": mbps, "slow": self.slow_internet, "very_slow": self.very_slow_internet, "timestamp": time.time()}, _f)
             except:
                 pass
         else:
-            log.warning("All speed test URLs failed")
+            log.warning("Speed test failed")
         self.last_speed_test = time.time()
 
     def check_resources(self):
