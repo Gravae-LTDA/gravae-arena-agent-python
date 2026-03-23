@@ -1046,14 +1046,14 @@ class ResourceMonitor:
         """Quick download speed test (~1MB). Updates self.download_speed_mbps and self.slow_internet."""
         import urllib.request as _req
         urls = [
-            'https://proof.ovh.net/files/1Mb.dat',
-            'https://speed.hetzner.de/1MB.bin',
+            'https://proof.ovh.net/files/10Mb.dat',
+            'https://speed.hetzner.de/10MB.bin',
         ]
         for url in urls:
             try:
                 start = time.time()
                 req = _req.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with _req.urlopen(req, timeout=20) as resp:
+                with _req.urlopen(req, timeout=60) as resp:
                     data = resp.read()
                 elapsed = time.time() - start
                 if elapsed > 0 and len(data) > 0:
