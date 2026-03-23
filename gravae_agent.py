@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.2.8"
+VERSION = "3.2.9"
 
 # Centralized logging
 try:
@@ -1045,6 +1045,8 @@ def perform_update():
         _backup_before_update()
 
         update_status = {"status": "downloading", "progress": 10, "message": "Verificando repositorio...", "error": None}
+        # Fix git "dubious ownership" error (git 2.35.2+)
+        subprocess.run(['git', 'config', '--global', '--add', 'safe.directory', AGENT_PATH], capture_output=True, timeout=5)
         if os.path.exists(os.path.join(AGENT_PATH, '.git')):
             update_status = {"status": "downloading", "progress": 20, "message": "Git pull...", "error": None}
             subprocess.run(['git', 'reset', '--hard', 'HEAD'], cwd=AGENT_PATH, capture_output=True, timeout=10)
@@ -4825,6 +4827,9 @@ def _fix_button_daemon_polling():
 
 def main():
     log.info(f"Gravae Agent v{VERSION} starting", extra={"port": PORT})
+
+    # Fix git safe.directory for updates (git 2.35.2+ blocks cross-user repos)
+    subprocess.run(['git', 'config', '--global', '--add', 'safe.directory', AGENT_PATH], capture_output=True, timeout=5)
 
     # Fix dangerous settings from previous versions BEFORE anything else
     _fix_dangerous_settings()
