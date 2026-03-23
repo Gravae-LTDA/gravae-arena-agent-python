@@ -965,6 +965,9 @@ class ResourceMonitor:
     def __init__(self):
         self.undervoltage_alerted = False  # Avoid spamming alerts
         self.last_voltage_check = 0  # Timestamp for daily voltage check
+        self.last_speed_test = 0  # Timestamp for speed test
+        self.download_speed_mbps = None  # Last measured download speed
+        self.slow_internet = False  # True if < 2 Mbps
 
     def get_throttled(self):
         """Check Raspberry Pi throttling/voltage status via vcgencmd.
@@ -1037,6 +1040,44 @@ class ResourceMonitor:
                 return (used / total) * 100 if total > 0 else 0
         except:
             return None
+
+    def check_speed(self):
+        """Quick download speed test (~1MB). Updates self.download_speed_mbps and self.slow_internet."""
+        import urllib.request as _req
+        urls = [
+            'https://proof.ovh.net/files/1Mb.dat',
+            'https://speed.hetzner.de/1MB.bin',
+        ]
+        for url in urls:
+            try:
+                start = time.time()
+                req = _req.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with _req.urlopen(req, timeout=20) as resp:
+                    data = resp.read()
+                elapsed = time.time() - start
+                if elapsed > 0 and len(data) > 0:
+                    mbps = round((len(data) * 8 / 1_000_000) / elapsed, 1)
+                    self.download_speed_mbps = mbps
+                    was_slow = self.slow_internet
+                    self.slow_internet = mbps < 2.0
+                    if self.slow_internet and not was_slow:
+                        alerts.add("slow_internet", "warning", f"Internet lenta: {mbps} Mbps", {"speed_mbps": mbps})
+                    elif not self.slow_internet and was_slow:
+                        alerts.add("internet_recovered", "info", f"Internet normalizada: {mbps} Mbps", {"speed_mbps": mbps})
+                    log.info(f"Speed test: {mbps} Mbps {'(slow!)' if self.slow_internet else '(ok)'}")
+                    self.last_speed_test = time.time()
+                    # Write result for agent to read
+                    try:
+                        import json as _json
+                        with open('/tmp/gravae_speed_test.json', 'w') as _f:
+                            _json.dump({"speed_mbps": mbps, "slow": self.slow_internet, "timestamp": time.time()}, _f)
+                    except:
+                        pass
+                    return
+            except Exception as e:
+                log.debug(f"Speed test failed ({url}): {e}")
+        log.warning("All speed test URLs failed")
+        self.last_speed_test = time.time()
 
     def check_resources(self):
         issues = []
@@ -1460,6 +1501,8 @@ class PhoenixDaemon:
         last_alert_cleanup = 0
         last_gc = 0
         last_voltage_check = 0
+        last_speed_test = 0
+        SPEED_TEST_INTERVAL = 4 * 60 * 60  # 4 hours
 
         while self.running:
             now = time.time()
@@ -1489,6 +1532,14 @@ class PhoenixDaemon:
                 if now - last_resource_check >= 300:
                     self.resources.check_resources()
                     last_resource_check = now
+
+                # Speed test (every 4 hours, only when online)
+                if now - last_speed_test >= SPEED_TEST_INTERVAL and self.connectivity.is_online:
+                    try:
+                        self.resources.check_speed()
+                    except Exception as e:
+                        log.debug(f"Speed test error: {e}")
+                    last_speed_test = now
 
                 # Daily undervoltage check (every 24 hours)
                 # Uses get_throttled() bit flags (hardware-level detection) instead of

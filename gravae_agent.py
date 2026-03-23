@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.2.4"
+VERSION = "3.2.5"
 
 # Centralized logging
 try:
@@ -3442,6 +3442,19 @@ def get_phoenix_status():
         status["connectivity"] = result.returncode == 0
     except:
         status["connectivity"] = False
+
+    # Speed test results from Phoenix ResourceMonitor
+    try:
+        phoenix_log = "/var/log/gravae/phoenix.log"
+        # Read from Phoenix shared state file if available
+        speed_file = "/tmp/gravae_speed_test.json"
+        if os.path.exists(speed_file):
+            with open(speed_file) as f:
+                speed_data = json.load(f)
+            status["resources"]["download_speed_mbps"] = speed_data.get("speed_mbps")
+            status["resources"]["slow_internet"] = speed_data.get("slow", False)
+    except:
+        pass
 
     try:
         shinobi_conf = get_shinobi_config()
