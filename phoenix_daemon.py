@@ -1049,7 +1049,7 @@ class ResourceMonitor:
         # Try speedtest-cli first (most accurate)
         try:
             result = subprocess.run(
-                ['speedtest-cli', '--simple', '--no-upload'],
+                ['speedtest-cli', '--simple', '--no-upload', '--secure'],
                 capture_output=True, text=True, timeout=60
             )
             if result.returncode == 0:
@@ -1062,7 +1062,7 @@ class ResourceMonitor:
             try:
                 subprocess.run(['pip3', 'install', 'speedtest-cli'], capture_output=True, timeout=30)
                 result = subprocess.run(
-                    ['speedtest-cli', '--simple', '--no-upload'],
+                    ['speedtest-cli', '--simple', '--no-upload', '--secure'],
                     capture_output=True, text=True, timeout=60
                 )
                 if result.returncode == 0:
