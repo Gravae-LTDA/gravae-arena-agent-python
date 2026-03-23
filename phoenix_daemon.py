@@ -1043,12 +1043,13 @@ class ResourceMonitor:
             return None
 
     def check_speed(self):
-        """Quick download speed test (~1MB). Updates self.download_speed_mbps and self.slow_internet."""
+        """Download speed test (~10MB). Tests multiple servers, uses best result."""
         import urllib.request as _req
         urls = [
-            'http://speedtest.tele2.net/10MB.zip',
             'https://proof.ovh.net/files/10Mb.dat',
+            'http://speedtest.tele2.net/10MB.zip',
         ]
+        best_mbps = 0.0
         for url in urls:
             try:
                 start = time.time()
@@ -1058,31 +1059,34 @@ class ResourceMonitor:
                 elapsed = time.time() - start
                 if elapsed > 0 and len(data) > 0:
                     mbps = round((len(data) * 8 / 1_000_000) / elapsed, 1)
-                    self.download_speed_mbps = mbps
-                    was_slow = self.slow_internet
-                    was_very_slow = self.very_slow_internet
-                    self.slow_internet = mbps < 30.0
-                    self.very_slow_internet = mbps < 10.0
-                    if self.very_slow_internet and not was_very_slow:
-                        alerts.add("very_slow_internet", "critical", f"Internet muito lenta: {mbps} Mbps", {"speed_mbps": mbps})
-                    elif self.slow_internet and not was_slow:
-                        alerts.add("slow_internet", "warning", f"Internet lenta: {mbps} Mbps", {"speed_mbps": mbps})
-                    elif not self.slow_internet and was_slow:
-                        alerts.add("internet_recovered", "info", f"Internet normalizada: {mbps} Mbps", {"speed_mbps": mbps})
-                    label = '(muito lenta!)' if self.very_slow_internet else '(lenta)' if self.slow_internet else '(ok)'
-                    log.info(f"Speed test: {mbps} Mbps {label}")
-                    self.last_speed_test = time.time()
-                    # Write result for agent to read
-                    try:
-                        import json as _json
-                        with open('/tmp/gravae_speed_test.json', 'w') as _f:
-                            _json.dump({"speed_mbps": mbps, "slow": self.slow_internet, "very_slow": self.very_slow_internet, "timestamp": time.time()}, _f)
-                    except:
-                        pass
-                    return
+                    log.info(f"Speed test ({url.split('/')[2]}): {mbps} Mbps")
+                    if mbps > best_mbps:
+                        best_mbps = mbps
             except Exception as e:
                 log.debug(f"Speed test failed ({url}): {e}")
-        log.warning("All speed test URLs failed")
+
+        if best_mbps > 0:
+            self.download_speed_mbps = best_mbps
+            was_slow = self.slow_internet
+            was_very_slow = self.very_slow_internet
+            self.slow_internet = best_mbps < 30.0
+            self.very_slow_internet = best_mbps < 10.0
+            if self.very_slow_internet and not was_very_slow:
+                alerts.add("very_slow_internet", "critical", f"Internet muito lenta: {best_mbps} Mbps", {"speed_mbps": best_mbps})
+            elif self.slow_internet and not was_slow:
+                alerts.add("slow_internet", "warning", f"Internet lenta: {best_mbps} Mbps", {"speed_mbps": best_mbps})
+            elif not self.slow_internet and was_slow:
+                alerts.add("internet_recovered", "info", f"Internet normalizada: {best_mbps} Mbps", {"speed_mbps": best_mbps})
+            label = '(muito lenta!)' if self.very_slow_internet else '(lenta)' if self.slow_internet else '(ok)'
+            log.info(f"Speed test best: {best_mbps} Mbps {label}")
+            try:
+                import json as _json
+                with open('/tmp/gravae_speed_test.json', 'w') as _f:
+                    _json.dump({"speed_mbps": best_mbps, "slow": self.slow_internet, "very_slow": self.very_slow_internet, "timestamp": time.time()}, _f)
+            except:
+                pass
+        else:
+            log.warning("All speed test URLs failed")
         self.last_speed_test = time.time()
 
     def check_resources(self):
