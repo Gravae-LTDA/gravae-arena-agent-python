@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.2.9"
+VERSION = "3.3.0"
 
 # Centralized logging
 try:
@@ -4622,6 +4622,52 @@ def _ensure_shinobi_running():
         print(f"[Shinobi] Health check error: {e}")
 
 
+def _fix_mysql_shinobi_user():
+    """Ensure MySQL user 'majesticflame' exists for both 127.0.0.1 AND localhost.
+    Shinobi conf.json uses host=127.0.0.1 but MySQL connections via socket resolve
+    as 'localhost'. Without both users, Shinobi silently fails to write videos/events.
+    Works on MariaDB 10.5 (Bullseye), 10.11 (Bookworm), and 11.8 (Trixie)."""
+    try:
+        # Check if MariaDB/MySQL is running
+        result = subprocess.run(
+            ['sudo', 'mysqladmin', 'ping'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return  # MySQL not running, skip
+
+        # Read password from Shinobi conf.json (usually empty string)
+        db_password = ''
+        conf_path = '/home/Shinobi/conf.json'
+        if os.path.exists(conf_path):
+            try:
+                import json
+                with open(conf_path) as f:
+                    conf = json.load(f)
+                db_password = conf.get('db', {}).get('password', '')
+            except Exception:
+                pass
+
+        # Check if localhost user exists
+        check = subprocess.run(
+            ['sudo', 'mysql', '-N', '-e',
+             "SELECT COUNT(*) FROM mysql.user WHERE user='majesticflame' AND host='localhost';"],
+            capture_output=True, text=True, timeout=10
+        )
+        if check.returncode == 0 and check.stdout.strip() == '0':
+            # Create user for localhost — syntax works on MariaDB 10.5+
+            cmds = [
+                f"CREATE USER IF NOT EXISTS 'majesticflame'@'localhost' IDENTIFIED BY '{db_password}';",
+                "GRANT ALL PRIVILEGES ON ccio.* TO 'majesticflame'@'localhost';",
+                "FLUSH PRIVILEGES;"
+            ]
+            for cmd in cmds:
+                subprocess.run(['sudo', 'mysql', '-e', cmd], capture_output=True, timeout=10)
+            print("[Startup] FIXED: Created MySQL user majesticflame@localhost")
+    except Exception as e:
+        print(f"[Startup] MySQL user fix skipped: {e}")
+
+
 def _fix_shinobi_monitors_stimeout():
     """Add RTSP timeout to all Shinobi monitors to prevent FFmpeg from hanging
     indefinitely when RTSP connections drop. Detects FFmpeg version to use the
@@ -4834,6 +4880,9 @@ def main():
     # Fix dangerous settings from previous versions BEFORE anything else
     _fix_dangerous_settings()
     log.info("Dangerous settings check complete")
+
+    # Fix MySQL user for Shinobi (majesticflame@localhost)
+    _fix_mysql_shinobi_user()
 
     # Fix button daemon polling if needed (faster detection)
     _fix_button_daemon_polling()
