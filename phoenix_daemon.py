@@ -30,7 +30,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -55,6 +55,9 @@ REBOOT_STATE_FILE = LOG_DIR / "reboot_state.json"
 NETWORK_BACKUP_FILE = Path("/etc/gravae/network-backup.json")
 NETWORK_CHANGE_KILLSWITCH = Path("/etc/gravae/no_network_change")
 
+# Shinobi directories (try both common locations)
+SHINOBI_DIRS = [Path("/home/Shinobi"), Path("/opt/shinobi")]
+
 # Connectivity check targets
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
 HTTP_TARGETS = ["https://cloudflare.com", "https://google.com"]
@@ -64,7 +67,7 @@ SERVICES = {
     "gravae-agent": {"critical": True, "port": 8888},
     "cloudflared": {"critical": True, "port": None},
     "gravae-buttons": {"critical": True, "port": None, "alert_only": True},  # Alert but don't auto-restart
-    "shinobi": {"critical": True, "port": 8080, "pm2": True},  # Shinobi via pm2
+    "shinobi": {"critical": True, "port": 8080, "pm2": True, "pm2_names": ["camera", "cron"]},  # Shinobi via pm2
     "mariadb": {"critical": True, "port": 3306},  # MariaDB database server
 }
 
@@ -229,8 +232,9 @@ class ServiceGuardian:
         # Shinobi runs via pm2, check port 8080
         return self.check_port(8080)
 
-    def check_pm2_process(self, name_contains):
-        """Check if a pm2 process is running"""
+    def check_pm2_process(self, service_name):
+        """Check if PM2 processes for a service are running.
+        Uses pm2_names from SERVICES config to find the correct process names."""
         try:
             result = subprocess.run(
                 ["pm2", "jlist"],
@@ -238,9 +242,19 @@ class ServiceGuardian:
             )
             if result.returncode == 0 and result.stdout.strip():
                 processes = json.loads(result.stdout)
-                for proc in processes:
-                    if name_contains.lower() in proc.get("name", "").lower():
-                        return proc.get("pm2_env", {}).get("status") == "online"
+                if not processes:
+                    return False
+                pm2_names = SERVICES.get(service_name, {}).get("pm2_names", [service_name])
+                for target_name in pm2_names:
+                    found = False
+                    for proc in processes:
+                        if proc.get("name", "").lower() == target_name.lower():
+                            if proc.get("pm2_env", {}).get("status") == "online":
+                                found = True
+                                break
+                    if not found:
+                        return False
+                return True
         except:
             pass
         return False
@@ -256,12 +270,120 @@ class ServiceGuardian:
         except:
             return False
 
-    def restart_pm2_process(self, name):
-        """Restart a pm2 process"""
+    def _find_shinobi_dir(self):
+        """Find the Shinobi installation directory"""
+        for d in SHINOBI_DIRS:
+            if d.exists() and (d / "camera.js").exists():
+                return d
+        return None
+
+    def _get_pm2_processes(self):
+        """Get list of PM2 processes"""
         try:
-            subprocess.run(["pm2", "restart", name], capture_output=True, timeout=30)
-            return True
+            result = subprocess.run(
+                ["pm2", "jlist"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return json.loads(result.stdout)
         except:
+            pass
+        return []
+
+    def restart_pm2_process(self, service_name):
+        """Restart PM2 processes for a service, with fallback to re-register if PM2 list is empty.
+        Uses cooldown and max attempts like restart_service()."""
+        now = time.time()
+        attempts, last_attempt = self.restart_attempts.get(service_name, (0, 0))
+
+        # Check cooldown
+        if now - last_attempt < SERVICE_RESTART_COOLDOWN:
+            log.debug(f"PM2 service {service_name} in cooldown, skipping restart")
+            return False
+
+        # Check max attempts
+        if attempts >= SERVICE_RESTART_MAX_ATTEMPTS:
+            log.warning(f"PM2 service {service_name} exceeded max restart attempts ({attempts})")
+            alerts.add(
+                "service_restart_failed",
+                "critical",
+                f"PM2 service {service_name} failed after {attempts} restart attempts",
+                {"service": service_name, "attempts": attempts}
+            )
+            return False
+
+        pm2_names = SERVICES.get(service_name, {}).get("pm2_names", [service_name])
+        processes = self._get_pm2_processes()
+        registered_names = {p.get("name", "").lower() for p in processes}
+
+        # Check if any of the expected PM2 processes are registered
+        any_registered = any(n.lower() in registered_names for n in pm2_names)
+
+        if any_registered:
+            # Processes exist in PM2 — just restart them
+            log.info(f"Restarting PM2 processes for {service_name}: {pm2_names} (attempt {attempts + 1})")
+            for pm2_name in pm2_names:
+                try:
+                    result = subprocess.run(
+                        ["pm2", "restart", pm2_name],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if result.returncode != 0:
+                        log.error(f"pm2 restart {pm2_name} failed: {result.stderr.strip()}")
+                except Exception as e:
+                    log.error(f"Error running pm2 restart {pm2_name}: {e}")
+        else:
+            # PM2 process list is empty or processes not registered — re-register from scratch
+            log.warning(f"PM2 processes for {service_name} not registered, attempting to re-register (attempt {attempts + 1})")
+            shinobi_dir = self._find_shinobi_dir()
+            if not shinobi_dir:
+                log.error(f"Cannot find Shinobi directory to re-register PM2 processes")
+                self.restart_attempts[service_name] = (attempts + 1, now)
+                return False
+
+            for pm2_name in pm2_names:
+                script = shinobi_dir / f"{pm2_name}.js"
+                if not script.exists():
+                    log.error(f"PM2 script not found: {script}")
+                    continue
+                try:
+                    result = subprocess.run(
+                        ["pm2", "start", str(script), "--name", pm2_name],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if result.returncode != 0:
+                        log.error(f"pm2 start {script} failed: {result.stderr.strip()}")
+                    else:
+                        log.info(f"PM2 process {pm2_name} registered from {script}")
+                except Exception as e:
+                    log.error(f"Error running pm2 start for {pm2_name}: {e}")
+
+            # Save PM2 process list so it persists across reboots
+            try:
+                subprocess.run(["pm2", "save"], capture_output=True, timeout=10)
+                log.info("PM2 process list saved")
+            except:
+                log.warning("Failed to save PM2 process list")
+
+        self.restart_attempts[service_name] = (attempts + 1, now)
+
+        # Wait and verify
+        time.sleep(5)
+        port = SERVICES.get(service_name, {}).get("port")
+        if port and self.check_port(port):
+            log.info(f"PM2 service {service_name} recovered successfully")
+            alerts.add(
+                "service_restarted",
+                "info",
+                f"PM2 service {service_name} was restarted",
+                {"service": service_name, "attempt": attempts + 1}
+            )
+            return True
+        elif self.check_pm2_process(service_name):
+            log.info(f"PM2 service {service_name} processes online (port not yet ready)")
+            return True
+        else:
+            log.error(f"PM2 service {service_name} failed to recover after attempt {attempts + 1}")
             return False
 
     def restart_service(self, service_name):
@@ -373,7 +495,13 @@ class ServiceGuardian:
             self.service_status[service_name] = is_running
 
             # Check for status changes
-            if prev_status is not None and prev_status != is_running:
+            if prev_status is None and not is_running:
+                # First check after startup — service already down
+                severity = "critical" if config.get("critical") else "warning"
+                log.warning(f"Service {service_name} found down on startup")
+                alerts.add("service_down", severity, f"Service {service_name} found down on startup")
+                status_changed = True
+            elif prev_status is not None and prev_status != is_running:
                 status_changed = True
                 if is_running:
                     log.info(f"Service {service_name} is now running")
@@ -1050,7 +1178,7 @@ class ResourceMonitor:
         try:
             result = subprocess.run(
                 ['speedtest-cli', '--simple', '--no-upload', '--secure'],
-                capture_output=True, text=True, timeout=60
+                capture_output=True, text=True, timeout=120
             )
             if result.returncode == 0:
                 for line in result.stdout.strip().split('\n'):
@@ -1063,7 +1191,7 @@ class ResourceMonitor:
                 subprocess.run(['pip3', 'install', 'speedtest-cli'], capture_output=True, timeout=30)
                 result = subprocess.run(
                     ['speedtest-cli', '--simple', '--no-upload', '--secure'],
-                    capture_output=True, text=True, timeout=60
+                    capture_output=True, text=True, timeout=120
                 )
                 if result.returncode == 0:
                     for line in result.stdout.strip().split('\n'):

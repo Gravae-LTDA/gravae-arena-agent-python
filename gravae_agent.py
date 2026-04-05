@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.2.9"
+VERSION = "3.3.0"
 
 # Centralized logging
 try:
@@ -4622,6 +4622,79 @@ def _ensure_shinobi_running():
         print(f"[Shinobi] Health check error: {e}")
 
 
+def _fix_mariadb_user_hosts():
+    """Ensure MariaDB user 'majesticflame' exists for both 'localhost' and '127.0.0.1'.
+
+    The Shinobi installer creates the user with one host (usually 127.0.0.1), but
+    MariaDB treats localhost (Unix socket) and 127.0.0.1 (TCP) as different hosts.
+    When skip_name_resolve=ON or reverse DNS is slow/broken, connections via the
+    other host fail with Access Denied. This ensures both work.
+
+    Runs on startup with a delay to wait for MariaDB to be ready.
+    """
+    import time
+    time.sleep(15)  # Wait for MariaDB to be ready
+    try:
+        # Read Shinobi conf.json to get DB credentials
+        conf_path = None
+        for p in ['/home/Shinobi/conf.json', '/opt/shinobi/conf.json']:
+            if os.path.exists(p):
+                conf_path = p
+                break
+        if not conf_path:
+            return
+
+        with open(conf_path, 'r') as f:
+            conf = json.loads(f.read())
+        db = conf.get('db', {})
+        db_user = db.get('user', 'majesticflame')
+        db_pass = db.get('password', '')
+        db_name = db.get('database', 'ccio')
+
+        # Check which hosts already exist for this user
+        result = subprocess.run(
+            ['sudo', 'mysql', '-u', 'root', '-N', '-e',
+             f"SELECT host FROM mysql.user WHERE user='{db_user}';"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return
+
+        existing_hosts = {h.strip() for h in result.stdout.strip().split('\n') if h.strip()}
+
+        needs_fix = False
+        for host in ['localhost', '127.0.0.1']:
+            if host not in existing_hosts:
+                needs_fix = True
+                # Build the IDENTIFIED BY clause
+                if db_pass:
+                    identified = f"IDENTIFIED BY '{db_pass}'"
+                else:
+                    identified = "IDENTIFIED BY ''"
+
+                sql = f"CREATE USER IF NOT EXISTS '{db_user}'@'{host}' {identified}; GRANT ALL PRIVILEGES ON `{db_name}`.* TO '{db_user}'@'{host}';"
+                res = subprocess.run(
+                    ['sudo', 'mysql', '-u', 'root', '-e', sql],
+                    capture_output=True, text=True, timeout=10
+                )
+                if res.returncode == 0:
+                    print(f"[MariaDB] Added user {db_user}@{host}")
+                else:
+                    print(f"[MariaDB] Failed to add {db_user}@{host}: {res.stderr.strip()}")
+
+        if needs_fix:
+            subprocess.run(
+                ['sudo', 'mysql', '-u', 'root', '-e', 'FLUSH PRIVILEGES;'],
+                capture_output=True, timeout=10
+            )
+            print("[MariaDB] Flushed privileges")
+        else:
+            print(f"[MariaDB] User {db_user} already has both localhost and 127.0.0.1 grants")
+
+    except Exception as e:
+        print(f"[MariaDB] User host fix error: {e}")
+
+
 def _fix_shinobi_monitors_stimeout():
     """Add RTSP timeout to all Shinobi monitors to prevent FFmpeg from hanging
     indefinitely when RTSP connections drop. Detects FFmpeg version to use the
@@ -4843,6 +4916,9 @@ def main():
 
     # Ensure Shinobi PM2 process is running (background, 10s delay)
     threading.Thread(target=_ensure_shinobi_running, daemon=True).start()
+
+    # Ensure MariaDB user works for both localhost and 127.0.0.1 (background, 15s delay)
+    threading.Thread(target=_fix_mariadb_user_hosts, daemon=True).start()
 
     # Fix Shinobi monitors: add RTSP timeout to prevent stale streams (background, 30s delay)
     threading.Thread(target=_fix_shinobi_monitors_stimeout, daemon=True).start()
