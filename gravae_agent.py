@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 
 # Centralized logging
 try:
@@ -86,7 +86,12 @@ def _get_button_daemon_path():
     user = CONFIG.get('arenaUser', 'gravae')
     arena_type = CONFIG.get('arenaType', 'gravae')
     type_name = 'Replayme' if arena_type == 'replayme' else 'Gravae'
-    return f'/home/{user}/Documents/{type_name}/button-daemon.js'
+    base = f'/home/{user}/Documents/{type_name}'
+    # Python daemon takes priority (new standard)
+    py_path = f'{base}/button-daemon.py'
+    if os.path.exists(py_path):
+        return py_path
+    return f'{base}/button-daemon.js'
 
 def get_local_ip():
     try:
@@ -241,6 +246,41 @@ def get_button_daemon_status():
         return {"running": result.stdout.strip() == 'active', "service": "gravae-buttons"}
     except:
         return {"running": False}
+
+def get_button_mapping():
+    """Parse BTN_TRIGGERS from button-daemon.py to return GPIO->monitor mapping."""
+    daemon_path = _get_button_daemon_path()
+    if not os.path.exists(daemon_path):
+        return None
+    try:
+        with open(daemon_path, 'r') as f:
+            content = f.read()
+        # Extract BTN_TRIGGERS dict using regex
+        import re
+        match = re.search(r'BTN_TRIGGERS\s*=\s*\{(.+?)\n\}', content, re.DOTALL)
+        if not match:
+            return None
+        triggers_block = match.group(1)
+        # Parse each GPIO entry: gpio_num: [('url', 'label'), ...]
+        mapping = []
+        # Find all gpio entries
+        gpio_pattern = re.findall(r'(\d+)\s*:\s*\[(.*?)\]', triggers_block, re.DOTALL)
+        for gpio_str, urls_block in gpio_pattern:
+            gpio = int(gpio_str)
+            # Extract monitor IDs from URLs: /motion/GROUP_KEY/MONITOR_ID?
+            monitors = re.findall(r'/motion/[^/]+/([^?]+)\?', urls_block)
+            # Extract labels
+            labels = re.findall(r"',\s*'([^']+)'\)", urls_block)
+            label = labels[0] if labels else (monitors[0] if monitors else f'GPIO{gpio}')
+            mapping.append({
+                "gpio": gpio,
+                "label": label,
+                "monitors": monitors,
+            })
+        return mapping
+    except Exception as e:
+        log.error(f"Failed to parse button mapping: {e}")
+        return None
 
 def get_full_system_info():
     return {
@@ -4467,6 +4507,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/hardware/info': lambda: {"model": get_device_model(), "serial": get_device_serial(), "os": get_os_info(), "gpio": get_gpio_info()},
             '/gpio/info': get_gpio_info,
             '/buttons/status': get_button_daemon_status,
+            '/buttons/mapping': lambda: {"mapping": get_button_mapping(), "running": get_button_daemon_status().get("running", False)},
             '/buttons/legacy': find_legacy_botao,
             '/update/backup-status': lambda: {
                 "hasBackup": os.path.exists(os.path.join(AGENT_PATH, 'gravae_agent.py' + BACKUP_SUFFIX)),
