@@ -30,7 +30,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -232,29 +232,66 @@ class ServiceGuardian:
         # Shinobi runs via pm2, check port 8080
         return self.check_port(8080)
 
-    def check_pm2_process(self, service_name):
-        """Check if PM2 processes for a service are running.
-        Uses pm2_names from SERVICES config to find the correct process names."""
+    def _get_arena_user(self):
+        """Detect the arena user (gravae or replayme) from device config or home dirs."""
+        try:
+            if CONFIG_PATH.exists():
+                config = json.loads(CONFIG_PATH.read_text())
+                return config.get("arenaUser", "gravae")
+        except:
+            pass
+        if Path("/home/replayme").exists():
+            return "replayme"
+        return "gravae"
+
+    def _run_pm2_jlist(self):
+        """Run pm2 jlist, trying as root first then as the arena user."""
+        # Try as root (Phoenix runs as root)
         try:
             result = subprocess.run(
                 ["pm2", "jlist"],
                 capture_output=True, text=True, timeout=10
             )
             if result.returncode == 0 and result.stdout.strip():
-                processes = json.loads(result.stdout)
-                if not processes:
+                procs = json.loads(result.stdout)
+                if procs:
+                    return procs
+        except:
+            pass
+        # Try as arena user (Shinobi PM2 may run under gravae/replayme)
+        user = self._get_arena_user()
+        try:
+            result = subprocess.run(
+                ["sudo", "-u", user, "pm2", "jlist"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                procs = json.loads(result.stdout)
+                if procs:
+                    return procs
+        except:
+            pass
+        return []
+
+    def check_pm2_process(self, service_name):
+        """Check if PM2 processes for a service are running.
+        Uses pm2_names from SERVICES config to find the correct process names.
+        Checks both root and arena user PM2 instances."""
+        try:
+            processes = self._run_pm2_jlist()
+            if not processes:
+                return False
+            pm2_names = SERVICES.get(service_name, {}).get("pm2_names", [service_name])
+            for target_name in pm2_names:
+                found = False
+                for proc in processes:
+                    if proc.get("name", "").lower() == target_name.lower():
+                        if proc.get("pm2_env", {}).get("status") == "online":
+                            found = True
+                            break
+                if not found:
                     return False
-                pm2_names = SERVICES.get(service_name, {}).get("pm2_names", [service_name])
-                for target_name in pm2_names:
-                    found = False
-                    for proc in processes:
-                        if proc.get("name", "").lower() == target_name.lower():
-                            if proc.get("pm2_env", {}).get("status") == "online":
-                                found = True
-                                break
-                    if not found:
-                        return False
-                return True
+            return True
         except:
             pass
         return False
@@ -278,17 +315,8 @@ class ServiceGuardian:
         return None
 
     def _get_pm2_processes(self):
-        """Get list of PM2 processes"""
-        try:
-            result = subprocess.run(
-                ["pm2", "jlist"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return json.loads(result.stdout)
-        except:
-            pass
-        return []
+        """Get list of PM2 processes (checks both root and arena user)"""
+        return self._run_pm2_jlist()
 
     def restart_pm2_process(self, service_name):
         """Restart PM2 processes for a service, with fallback to re-register if PM2 list is empty.
@@ -316,16 +344,28 @@ class ServiceGuardian:
         processes = self._get_pm2_processes()
         registered_names = {p.get("name", "").lower() for p in processes}
 
+        # Detect which user owns the PM2 processes (root or arena user)
+        pm2_user = None
+        for proc in processes:
+            if proc.get("name", "").lower() in [n.lower() for n in pm2_names]:
+                pm2_user = proc.get("pm2_env", {}).get("username")
+                break
+        # Build pm2 command prefix: use sudo -u if PM2 runs as non-root
+        def pm2_cmd(args):
+            if pm2_user and pm2_user != "root":
+                return ["sudo", "-u", pm2_user, "pm2"] + args
+            return ["pm2"] + args
+
         # Check if any of the expected PM2 processes are registered
         any_registered = any(n.lower() in registered_names for n in pm2_names)
 
         if any_registered:
             # Processes exist in PM2 — just restart them
-            log.info(f"Restarting PM2 processes for {service_name}: {pm2_names} (attempt {attempts + 1})")
+            log.info(f"Restarting PM2 processes for {service_name}: {pm2_names} as user={pm2_user or 'root'} (attempt {attempts + 1})")
             for pm2_name in pm2_names:
                 try:
                     result = subprocess.run(
-                        ["pm2", "restart", pm2_name],
+                        pm2_cmd(["restart", pm2_name]),
                         capture_output=True, text=True, timeout=30
                     )
                     if result.returncode != 0:
@@ -334,12 +374,26 @@ class ServiceGuardian:
                     log.error(f"Error running pm2 restart {pm2_name}: {e}")
         else:
             # PM2 process list is empty or processes not registered — re-register from scratch
-            log.warning(f"PM2 processes for {service_name} not registered, attempting to re-register (attempt {attempts + 1})")
+            # Detect user: check who owns the Shinobi directory
             shinobi_dir = self._find_shinobi_dir()
             if not shinobi_dir:
                 log.error(f"Cannot find Shinobi directory to re-register PM2 processes")
                 self.restart_attempts[service_name] = (attempts + 1, now)
                 return False
+
+            owner = None
+            try:
+                import pwd
+                owner = pwd.getpwuid(shinobi_dir.stat().st_uid).pw_name
+            except:
+                owner = self._get_arena_user()
+
+            def pm2_cmd_new(args):
+                if owner and owner != "root":
+                    return ["sudo", "-u", owner, "pm2"] + args
+                return ["pm2"] + args
+
+            log.warning(f"PM2 processes for {service_name} not registered, re-registering as user={owner or 'root'} (attempt {attempts + 1})")
 
             for pm2_name in pm2_names:
                 script = shinobi_dir / f"{pm2_name}.js"
@@ -348,7 +402,7 @@ class ServiceGuardian:
                     continue
                 try:
                     result = subprocess.run(
-                        ["pm2", "start", str(script), "--name", pm2_name],
+                        pm2_cmd_new(["start", str(script), "--name", pm2_name]),
                         capture_output=True, text=True, timeout=30
                     )
                     if result.returncode != 0:
@@ -360,7 +414,7 @@ class ServiceGuardian:
 
             # Save PM2 process list so it persists across reboots
             try:
-                subprocess.run(["pm2", "save"], capture_output=True, timeout=10)
+                subprocess.run(pm2_cmd_new(["save"]), capture_output=True, timeout=10)
                 log.info("PM2 process list saved")
             except:
                 log.warning("Failed to save PM2 process list")
