@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.3.1"
+VERSION = "3.3.2"
 
 # Centralized logging
 try:
@@ -4589,6 +4589,70 @@ def _fix_dangerous_settings():
 
     # 3. Fix cloudflared service (Type=notify → Type=simple, add --protocol http2)
     _fix_cloudflared_service()
+
+    # 4. Fix corrupted Shinobi PM2 cwd (coaching install bug)
+    # If camera.js has pm_cwd != /home/Shinobi, it crash-loops trying to read
+    # /opt/gravae-agent/languages/en_CA.json. Delete + re-register with correct cwd.
+    _fix_shinobi_pm2_cwd()
+
+
+def _fix_shinobi_pm2_cwd():
+    """Detect and fix corrupted Shinobi PM2 cwd.
+
+    Bug: phoenix_daemon.py used to call `pm2 start /home/Shinobi/camera.js` without
+    cwd=, so the subprocess inherited the agent's cwd (/opt/gravae-agent). PM2 saved
+    pm_cwd=/opt/gravae-agent in its dump. Shinobi resolves s.location.languages from
+    process.cwd() and crashes trying to read /opt/gravae-agent/languages/en_CA.json.
+    """
+    try:
+        shinobi_dir = None
+        for candidate in ['/home/Shinobi', '/opt/Shinobi']:
+            if os.path.exists(os.path.join(candidate, 'camera.js')):
+                shinobi_dir = candidate
+                break
+        if not shinobi_dir:
+            return
+
+        result = subprocess.run(
+            ['sudo', 'pm2', 'jlist'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return
+
+        procs = json.loads(result.stdout)
+        corrupted = []
+        for p in procs:
+            name = p.get('name', '')
+            if name.lower() not in ('camera', 'cron'):
+                continue
+            pm2_env = p.get('pm2_env', {}) or {}
+            pm_cwd = pm2_env.get('pm_cwd', '')
+            if pm_cwd and pm_cwd != shinobi_dir:
+                corrupted.append(name)
+
+        if not corrupted:
+            return
+
+        print(f"[Startup] FIXED: PM2 cwd corrupted for {corrupted}, re-registering with cwd={shinobi_dir}")
+
+        for name in corrupted:
+            subprocess.run(['sudo', 'pm2', 'delete', name], capture_output=True, timeout=10)
+
+        for name in corrupted:
+            script = os.path.join(shinobi_dir, f'{name}.js')
+            if not os.path.exists(script):
+                continue
+            subprocess.run(
+                ['sudo', 'pm2', 'start', script, '--name', name],
+                capture_output=True, timeout=30,
+                cwd=shinobi_dir
+            )
+
+        subprocess.run(['sudo', 'pm2', 'save'], capture_output=True, timeout=10, cwd=shinobi_dir)
+        print(f"[Startup] PM2 cwd fix complete, dump saved")
+    except Exception as e:
+        print(f"[Startup] Failed to check/fix Shinobi PM2 cwd: {e}")
 
 
 def _get_ffmpeg_timeout_flag():

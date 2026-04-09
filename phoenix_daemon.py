@@ -401,9 +401,14 @@ class ServiceGuardian:
                     log.error(f"PM2 script not found: {script}")
                     continue
                 try:
+                    # CRITICAL: cwd must be shinobi_dir so PM2 saves pm_cwd=/home/Shinobi.
+                    # Shinobi resolves s.location.languages from process.cwd(), so a wrong
+                    # cwd (e.g. /opt/gravae-agent) makes camera.js crash loop trying to read
+                    # /opt/gravae-agent/languages/en_CA.json.
                     result = subprocess.run(
                         pm2_cmd_new(["start", str(script), "--name", pm2_name]),
-                        capture_output=True, text=True, timeout=30
+                        capture_output=True, text=True, timeout=30,
+                        cwd=str(shinobi_dir)
                     )
                     if result.returncode != 0:
                         log.error(f"pm2 start {script} failed: {result.stderr.strip()}")
@@ -414,7 +419,7 @@ class ServiceGuardian:
 
             # Save PM2 process list so it persists across reboots
             try:
-                subprocess.run(pm2_cmd_new(["save"]), capture_output=True, timeout=10)
+                subprocess.run(pm2_cmd_new(["save"]), capture_output=True, timeout=10, cwd=str(shinobi_dir))
                 log.info("PM2 process list saved")
             except:
                 log.warning("Failed to save PM2 process list")
