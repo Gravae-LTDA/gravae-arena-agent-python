@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.3.2"
+VERSION = "3.3.3"
 
 # Centralized logging
 try:
@@ -4689,7 +4689,16 @@ def _get_ffmpeg_timeout_flag():
 
 def _ensure_shinobi_running():
     """Check if Shinobi PM2 process is running, restart if needed.
-    Runs in a background thread on startup with a short delay."""
+    Runs in a background thread on startup with a short delay.
+
+    Order matters: we resurrect FIRST (if empty), then check for pm_cwd
+    corruption in the freshly loaded state. The early-startup call from
+    _fix_dangerous_settings() runs too early — pm2 God daemon may be cold
+    (pm2-root.service failed/not yet resurrected), so jlist returns [] and
+    the corruption check has nothing to see. Running the check here, after
+    resurrect has had a chance to populate state, catches dumps that were
+    saved with bad cwd from older agent versions.
+    """
     import time
     time.sleep(10)  # Wait for system to settle
     try:
@@ -4720,9 +4729,19 @@ def _ensure_shinobi_running():
             print("[Shinobi] No Shinobi/camera PM2 process found, trying pm2 restart all...")
             subprocess.run(['sudo', 'pm2', 'restart', 'all'], capture_output=True, timeout=30)
         elif not processes:
-            # PM2 has no processes - try to resurrect
+            # PM2 has no processes - try to resurrect (loads /root/.pm2/dump.pm2)
             print("[Shinobi] PM2 has no processes, trying pm2 resurrect...")
             subprocess.run(['sudo', 'pm2', 'resurrect'], capture_output=True, timeout=30)
+            # Give PM2 a moment to boot the resurrected processes before we
+            # inspect them for cwd corruption.
+            time.sleep(3)
+
+        # Always re-run the cwd corruption check at this point. The early call
+        # from _fix_dangerous_settings() runs before pm2 resurrect has loaded
+        # anything, so it never sees corrupted state. By the time we're here
+        # (10s+ after startup, possibly after an explicit resurrect above), the
+        # corrupted dump — if any — is loaded and detectable.
+        _fix_shinobi_pm2_cwd()
     except Exception as e:
         print(f"[Shinobi] Health check error: {e}")
 
