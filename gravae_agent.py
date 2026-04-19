@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.3.3"
+VERSION = "3.3.5"
 
 # Centralized logging
 try:
@@ -4742,8 +4742,69 @@ def _ensure_shinobi_running():
         # (10s+ after startup, possibly after an explicit resurrect above), the
         # corrupted dump — if any — is loaded and detectable.
         _fix_shinobi_pm2_cwd()
+        _fix_shinobi_detector_field_types()
     except Exception as e:
         print(f"[Shinobi] Health check error: {e}")
+
+
+def _fix_shinobi_detector_field_types():
+    # Shinobi's libs/ffmpeg/builders.js gates detectorStream.m3u8 output with
+    # `e.details.detector === '1' && e.details.detector_trigger === '1'`. Some
+    # write paths store these as integer 1, so 1 !== '1' fails silently:
+    # sip event recording spawns ffmpeg against a nonexistent m3u8 and no MP4
+    # ever lands on disk even though motion events are logged.
+    try:
+        db_config = get_shinobi_db_config()
+        if not db_config:
+            return
+
+        mysql_env = dict(os.environ)
+        mysql_env['MYSQL_PWD'] = db_config.get('password') or ''
+        mysql_cmd = [
+            'mysql',
+            '-u', db_config.get('user', 'majesticflame'),
+            '-h', db_config.get('host', '127.0.0.1'),
+            db_config.get('database', 'ccio'),
+            '-N', '-s', '-e',
+        ]
+
+        check_sql = (
+            "SELECT COUNT(*) FROM Monitors WHERE "
+            "JSON_TYPE(JSON_EXTRACT(details, '$.detector')) = 'INTEGER' OR "
+            "JSON_TYPE(JSON_EXTRACT(details, '$.detector_trigger')) = 'INTEGER';"
+        )
+        check = subprocess.run(mysql_cmd + [check_sql], env=mysql_env,
+                               capture_output=True, text=True, timeout=10)
+        if check.returncode != 0:
+            return  # DB not reachable yet, skip silently
+        try:
+            affected = int((check.stdout or '0').strip())
+        except ValueError:
+            return
+        if affected == 0:
+            return
+
+        fix_sql = (
+            "UPDATE Monitors SET details = JSON_REPLACE(details, "
+            "'$.detector', JSON_UNQUOTE(JSON_EXTRACT(details, '$.detector')), "
+            "'$.detector_trigger', JSON_UNQUOTE(JSON_EXTRACT(details, '$.detector_trigger'))) "
+            "WHERE JSON_TYPE(JSON_EXTRACT(details, '$.detector')) = 'INTEGER' "
+            "OR JSON_TYPE(JSON_EXTRACT(details, '$.detector_trigger')) = 'INTEGER';"
+        )
+        result = subprocess.run(mysql_cmd + [fix_sql], env=mysql_env,
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            print(f"[Shinobi] detector type fix UPDATE failed: {result.stderr[:200]}")
+            return
+
+        print(f"[Shinobi] FIXED: coerced detector/detector_trigger to string on {affected} monitor(s)")
+        # Shinobi only reads monitor details at startup / restart, so the fix
+        # only takes effect on the running ffmpeg after we bounce it.
+        subprocess.run(['sudo', 'pm2', 'restart', 'camera'],
+                       capture_output=True, text=True, timeout=30)
+        print("[Shinobi] Restarted camera PM2 so detector stream output picks up the fixed types")
+    except Exception as e:
+        print(f"[Shinobi] detector type fix error: {e}")
 
 
 def _fix_mariadb_user_hosts():

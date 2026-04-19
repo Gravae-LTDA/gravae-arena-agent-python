@@ -30,7 +30,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.14.0"
+VERSION = "1.14.1"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -719,6 +719,102 @@ class ShinobiMonitorWatcher:
                             "current_status": status
                         }
                     )
+
+# === Shinobi Crash-Loop Detector ===
+# Detects the "silent event-recording death" bug in Shinobi CE where
+# libs/events/utils.js (~line 645) writes 'q' to a closed ffmpeg stdin after
+# the event-based recording timeout fires. The write emits EPIPE asynchronously,
+# bypasses the try/catch, and is swallowed by Shinobi's global uncaughtException
+# handler — leaving `activeMonitor.eventBasedRecording[fileTime]` in a corrupted
+# state. Subsequent motion triggers register events but never spawn a new ffmpeg,
+# so no videos are saved until camera.js is restarted.
+class ShinobiCrashLoopDetector:
+    LOG_PATH = Path("/root/.pm2/logs/camera-error.log")
+    STATE_FILE = LOG_DIR / "shinobi_epipe.state"
+    RESTART_COOLDOWN = 15 * 60  # 15 min between auto-restarts
+    MAX_CHUNK_BYTES = 2 * 1024 * 1024  # cap read to 2MB per check
+
+    def __init__(self, service_guardian):
+        self.guardian = service_guardian
+        self.last_restart = 0
+        # On first run (no persisted offset), skip the existing log backlog —
+        # we only want to react to NEW crashes, not re-trigger on historical
+        # EPIPE entries from before the detector was deployed.
+        persisted = self._load_offset()
+        if persisted is None:
+            try:
+                self.last_offset = self.LOG_PATH.stat().st_size if self.LOG_PATH.exists() else 0
+                self._save_offset(self.last_offset)
+                log.info(f"[shinobi-epipe] first run, seeking to end of log (offset={self.last_offset})")
+            except Exception:
+                self.last_offset = 0
+        else:
+            self.last_offset = persisted
+
+    def _load_offset(self):
+        try:
+            if self.STATE_FILE.exists():
+                return int(self.STATE_FILE.read_text().strip())
+        except Exception:
+            pass
+        return None
+
+    def _save_offset(self, offset):
+        try:
+            self.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.STATE_FILE.write_text(str(offset))
+        except Exception as e:
+            log.debug(f"[shinobi-epipe] failed to persist offset: {e}")
+
+    def check(self):
+        if not self.LOG_PATH.exists():
+            return False
+        try:
+            size = self.LOG_PATH.stat().st_size
+            # Handle log rotation / truncation
+            if size < self.last_offset:
+                self.last_offset = 0
+            if size == self.last_offset:
+                return False
+
+            read_from = self.last_offset
+            # Cap the chunk we read so a huge backlog doesn't OOM Phoenix
+            if size - read_from > self.MAX_CHUNK_BYTES:
+                read_from = size - self.MAX_CHUNK_BYTES
+
+            with open(self.LOG_PATH, "rb") as f:
+                f.seek(read_from)
+                chunk = f.read(size - read_from).decode("utf-8", errors="replace")
+            self.last_offset = size
+            self._save_offset(self.last_offset)
+
+            # Fingerprint: all three markers must appear in the new window.
+            # Keeps false-positives at zero — generic EPIPE in other code paths
+            # won't trigger a restart.
+            if ("Uncaught Exception" in chunk
+                    and "EPIPE" in chunk
+                    and "events/utils.js" in chunk):
+                now = time.time()
+                if now - self.last_restart < self.RESTART_COOLDOWN:
+                    log.warning("[shinobi-epipe] detected again within cooldown; skipping restart")
+                    return False
+                log.warning("[shinobi-epipe] Shinobi event-recording crash detected — restarting camera.js")
+                alerts.add(
+                    "shinobi_epipe_recovery",
+                    "warning",
+                    "Shinobi event-recording crash detected (EPIPE em events/utils.js) — camera.js reiniciado automaticamente",
+                    {"log_path": str(self.LOG_PATH)}
+                )
+                ok = self.guardian.restart_pm2_process("shinobi")
+                if ok:
+                    self.last_restart = now
+                    log.info("[shinobi-epipe] camera.js restart completed")
+                else:
+                    log.error("[shinobi-epipe] camera.js restart failed")
+                return bool(ok)
+        except Exception as e:
+            log.debug(f"[shinobi-epipe] check error: {e}")
+        return False
 
 # === Connectivity Sentinel ===
 class ConnectivitySentinel:
@@ -1590,6 +1686,7 @@ class PhoenixDaemon:
         self.webhook = WebhookSender()
         self.watchdog = HardwareWatchdog()
         self.shinobi_watcher = None  # Lazy loaded to save memory
+        self.shinobi_epipe_detector = ShinobiCrashLoopDetector(self.service_guardian)
 
         # Setup signal handlers
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -1704,12 +1801,14 @@ class PhoenixDaemon:
         last_connectivity_check = 0
         last_resource_check = 0
         last_monitor_check = 0
+        last_shinobi_epipe_check = 0
         last_webhook_send = 0
         last_alert_cleanup = 0
         last_gc = 0
         last_voltage_check = 0
         last_speed_test = 0
         SPEED_TEST_INTERVAL = 4 * 60 * 60  # 4 hours
+        SHINOBI_EPIPE_CHECK_INTERVAL = 120  # 2 minutes
 
         while self.running:
             now = time.time()
@@ -1734,6 +1833,16 @@ class PhoenixDaemon:
                     except Exception as e:
                         log.debug(f"Monitor check error: {e}")
                     last_monitor_check = now
+
+                # Shinobi EPIPE crash-loop recovery (every 2 minutes)
+                # Detects the libs/events/utils.js event-recording bug that
+                # leaves Shinobi silently dropping motion-triggered recordings.
+                if now - last_shinobi_epipe_check >= SHINOBI_EPIPE_CHECK_INTERVAL:
+                    try:
+                        self.shinobi_epipe_detector.check()
+                    except Exception as e:
+                        log.debug(f"Shinobi EPIPE check error: {e}")
+                    last_shinobi_epipe_check = now
 
                 # Resource check (every 5 minutes)
                 if now - last_resource_check >= 300:
