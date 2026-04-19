@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.3.5"
+VERSION = "3.3.6"
 
 # Centralized logging
 try:
@@ -3731,6 +3731,67 @@ def get_phoenix_logs(lines=100):
     except Exception as e:
         return {"logs": [], "error": str(e)}
 
+def get_phoenix_history(days=10):
+    """Get persisted offline events from Phoenix's offline_events table.
+
+    Phoenix v1.14.2+ writes a row every time connectivity transitions. Rows
+    left with end_at=NULL across a Phoenix restart are backfilled as
+    cause='power' (Pi rebooted = only way Phoenix exits without a clean
+    mark_online). The OPS ticket Device tab consumes this via
+    /api/tickets/offline-history/[id]?days=N.
+    """
+    try:
+        days = max(1, min(30, int(days)))
+    except (TypeError, ValueError):
+        days = 10
+
+    if not os.path.exists(PHOENIX_ALERT_DB):
+        return {"events": [], "days": days, "note": "phoenix alert db not present yet"}
+
+    try:
+        import sqlite3
+        from datetime import datetime, timedelta
+        conn = sqlite3.connect(PHOENIX_ALERT_DB)
+        # Table exists only when Phoenix v1.14.2+ has run at least once.
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='offline_events'"
+        )
+        if cur.fetchone() is None:
+            conn.close()
+            return {
+                "events": [],
+                "days": days,
+                "note": "offline_events table not yet created — phoenix may still be on pre-1.14.2",
+            }
+
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        cursor = conn.execute(
+            "SELECT start_at, end_at, cause, evidence FROM offline_events "
+            "WHERE start_at >= ? ORDER BY id DESC",
+            (cutoff,),
+        )
+        events = []
+        for start_at, end_at, cause, evidence in cursor:
+            duration = None
+            if end_at:
+                try:
+                    duration = (datetime.fromisoformat(end_at)
+                                - datetime.fromisoformat(start_at)).total_seconds()
+                except Exception:
+                    duration = None
+            events.append({
+                "startAt": start_at,
+                "endAt": end_at,
+                "durationSeconds": duration,
+                "cause": cause or "unknown",
+                "evidence": evidence,
+            })
+        conn.close()
+        return {"events": events, "days": days}
+    except Exception as e:
+        return {"events": [], "days": days, "error": str(e)}
+
+
 def get_button_history():
     """Get recent button press history from Shinobi events and button daemon logs"""
     button_presses = []
@@ -4457,6 +4518,11 @@ class AgentHandler(BaseHTTPRequestHandler):
 
         if path == '/update/check':
             self._send_json(check_for_updates())
+            return
+
+        if path == '/phoenix/history':
+            days = query.get('days', ['10'])[0]
+            self._send_json(get_phoenix_history(days))
             return
 
         if path == '/update/status':

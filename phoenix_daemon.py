@@ -30,7 +30,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.14.1"
+VERSION = "1.14.2"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -201,6 +201,142 @@ class AlertQueue:
         conn.close()
 
 alerts = AlertQueue()
+
+# === Offline Event Tracker ===
+# Persists (start_at, end_at, cause) transitions so OPS can show
+# "historico de offline" on the ticket Device tab. Causes:
+#   - power:   Pi was off. Detected when Phoenix starts up and finds an
+#              open event still in the DB → we only get here if the process
+#              died without a clean shutdown, which for a Pi basically means
+#              power loss. Also classifies events that span a boot.
+#   - network: Pi stayed up but lost connectivity (ping/http to external
+#              targets failed). Detected via ConnectivitySentinel transitions.
+#   - unknown: fallback when we can't classify.
+class OfflineEventTracker:
+    def __init__(self, db_path=ALERT_DB):
+        self.db_path = db_path
+        self._init_db()
+        self._close_dangling_as_power()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS offline_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_at TEXT NOT NULL,
+                end_at TEXT,
+                cause TEXT NOT NULL DEFAULT 'unknown',
+                evidence TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def _close_dangling_as_power(self):
+        # Phoenix just booted. Any offline_event with end_at=NULL was
+        # left open by the previous process → Pi rebooted → assume power.
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute(
+                "SELECT id, start_at FROM offline_events WHERE end_at IS NULL"
+            )
+            rows = cur.fetchall()
+            if rows:
+                now_iso = datetime.now().isoformat()
+                evidence = f"phoenix restart detected at {now_iso}; end inferred"
+                conn.execute(
+                    "UPDATE offline_events SET end_at = ?, cause = 'power', "
+                    "evidence = COALESCE(evidence || ' | ', '') || ? "
+                    "WHERE end_at IS NULL",
+                    (now_iso, evidence),
+                )
+                conn.commit()
+                for row_id, start_at in rows:
+                    log.info(f"[offline-tracker] closed dangling event id={row_id} "
+                             f"start={start_at} as cause=power")
+            conn.close()
+        except Exception as e:
+            log.debug(f"[offline-tracker] _close_dangling_as_power error: {e}")
+
+    def mark_offline(self, evidence=""):
+        # Idempotent: only inserts if there isn't an already-open event.
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute(
+                "SELECT id FROM offline_events WHERE end_at IS NULL LIMIT 1"
+            )
+            if cur.fetchone() is None:
+                conn.execute(
+                    "INSERT INTO offline_events (start_at, cause, evidence) "
+                    "VALUES (?, 'network', ?)",
+                    (datetime.now().isoformat(), evidence or "connectivity probe failed"),
+                )
+                conn.commit()
+                log.info("[offline-tracker] offline event opened (cause=network)")
+            conn.close()
+        except Exception as e:
+            log.debug(f"[offline-tracker] mark_offline error: {e}")
+
+    def mark_online(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "UPDATE offline_events SET end_at = ? WHERE end_at IS NULL",
+                (datetime.now().isoformat(),),
+            )
+            conn.commit()
+            conn.close()
+            log.info("[offline-tracker] offline event closed (connectivity restored)")
+        except Exception as e:
+            log.debug(f"[offline-tracker] mark_online error: {e}")
+
+    def list_events(self, days=10):
+        days = max(1, min(30, int(days)))
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            cursor = conn.execute(
+                "SELECT start_at, end_at, cause, evidence FROM offline_events "
+                "WHERE start_at >= ? ORDER BY id DESC",
+                (cutoff,),
+            )
+            events = []
+            for start_at, end_at, cause, evidence in cursor:
+                duration = None
+                if end_at:
+                    try:
+                        duration = (datetime.fromisoformat(end_at)
+                                    - datetime.fromisoformat(start_at)).total_seconds()
+                    except Exception:
+                        duration = None
+                events.append({
+                    "startAt": start_at,
+                    "endAt": end_at,
+                    "durationSeconds": duration,
+                    "cause": cause or "unknown",
+                    "evidence": evidence,
+                })
+            conn.close()
+            return events
+        except Exception as e:
+            log.debug(f"[offline-tracker] list_events error: {e}")
+            return []
+
+    def cleanup_old(self, days=60):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            conn.execute(
+                "DELETE FROM offline_events WHERE end_at IS NOT NULL AND end_at < ?",
+                (cutoff,),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            log.debug(f"[offline-tracker] cleanup_old error: {e}")
+
+offline_tracker = OfflineEventTracker()
 
 # === Service Guardian ===
 class ServiceGuardian:
@@ -1822,7 +1958,16 @@ class PhoenixDaemon:
 
                 # Connectivity check (every minute)
                 if now - last_connectivity_check >= CONNECTIVITY_CHECK_INTERVAL:
+                    prev_online = self.connectivity.is_online
                     self.connectivity.update()
+                    # Mirror transitions into offline_events so OPS can show
+                    # "histórico de offline" on the ticket Device tab.
+                    if prev_online and not self.connectivity.is_online:
+                        offline_tracker.mark_offline(
+                            evidence="ping+http targets unreachable"
+                        )
+                    elif not prev_online and self.connectivity.is_online:
+                        offline_tracker.mark_online()
                     last_connectivity_check = now
 
                 # Shinobi monitor check (every 5 minutes, only when online)
@@ -1885,6 +2030,7 @@ class PhoenixDaemon:
                 # Alert cleanup (daily)
                 if now - last_alert_cleanup >= 86400:
                     alerts.cleanup_old()
+                    offline_tracker.cleanup_old(days=60)
                     last_alert_cleanup = now
 
                 # Garbage collection (every 10 minutes to free memory)
