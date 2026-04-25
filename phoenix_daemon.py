@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Phoenix Daemon v1.10.0
+Phoenix Daemon v1.15.0
 Self-healing module for Gravae Arena Agent
 
 Features:
 - Service Guardian: Monitors and restarts failed services
 - Connectivity Sentinel: Tracks internet connectivity with escalating recovery
+- DHCP Fallback (nmcli + dhcpcd): After 2h offline on a static IP, switch to DHCP
+  to recover from network reconfigurations; auto-revert if it doesn't help.
 - Safe Reboot: After 4h offline, reboot up to 3x/day with boot-loop protection
 - Alert Queue: Stores alerts offline, syncs when back online
 - Persistent Logging: Structured logs with rotation
 
-SAFETY: Phoenix will NEVER modify network configuration (dhcpcd.conf / nmcli).
-Reboot only after 4h offline, max 3/day, and only if uptime > 5min (anti boot-loop).
+SAFETY GUARDS:
+- DHCP fallback: max 1 attempt per 24h (persisted across reboots), kill-switch
+  honored at /etc/gravae/no_network_change, auto-revert on failure.
+- Reboot escalation: only after 4h offline, max 3/day, uptime > 5min.
+- Network config edits (nmcli/dhcpcd) backup the previous state before touching it.
 """
 
 import os
@@ -30,7 +35,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.14.2"
+VERSION = "1.15.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -54,6 +59,9 @@ MIN_UPTIME_BEFORE_REBOOT = 300       # 5 minutes: don't reboot if system just bo
 REBOOT_STATE_FILE = LOG_DIR / "reboot_state.json"
 NETWORK_BACKUP_FILE = Path("/etc/gravae/network-backup.json")
 NETWORK_CHANGE_KILLSWITCH = Path("/etc/gravae/no_network_change")
+DHCP_FALLBACK_STATE_FILE = LOG_DIR / "dhcp_fallback_state.json"
+DHCP_FALLBACK_COOLDOWN_HOURS = 24  # Anti boot-loop: at most 1 dhcp fallback per 24h
+DHCPCD_BACKUP = Path("/etc/dhcpcd.conf.gravae-backup")
 
 # Shinobi directories (try both common locations)
 SHINOBI_DIRS = [Path("/home/Shinobi"), Path("/opt/shinobi")]
@@ -962,7 +970,10 @@ class ConnectivitySentinel:
         self.actions_taken = []
         self.reboot_timestamps = []  # timestamps of reboots in last 24h
         self.dhcp_fallback_attempted = False  # Only one DHCP fallback per offline event
+        self._dhcp_fallback_last_attempt = None  # persisted across reboots for cooldown
+        self._dhcp_fallback_method = None  # 'nmcli' or 'dhcpcd', set when fallback runs
         self._load_reboot_state()
+        self._load_dhcp_fallback_state()
 
     def ping(self, host):
         try:
@@ -1079,16 +1090,194 @@ class ConnectivitySentinel:
             pass
         return interface
 
-    def _is_static_ip(self, interface):
-        """Check if an interface is configured with a static IP."""
+    def _is_networkmanager_running(self):
+        """Check if NetworkManager service is active. Returns False on dhcpcd-based Pis."""
+        try:
+            result = subprocess.run(
+                ['systemctl', 'is-active', 'NetworkManager'],
+                capture_output=True, text=True, timeout=5
+            )
+            return result.stdout.strip() == 'active'
+        except:
+            return False
+
+    def _is_static_ip_nmcli(self, interface):
+        """Check static IP via NetworkManager (only valid when NM is running)."""
         try:
             result = subprocess.run(
                 ['nmcli', '-t', '-f', 'IP4.METHOD', 'device', 'show', interface],
                 capture_output=True, text=True, timeout=5
             )
+            if result.returncode != 0:
+                return False
             return 'manual' in result.stdout.lower()
         except:
             return False
+
+    def _dhcpcd_static_block_lines(self, interface):
+        """Locate the 'interface <iface>' block in /etc/dhcpcd.conf containing a
+        'static ip_address=' directive. Returns (start_idx, end_idx) where end is
+        exclusive (next 'interface' line or EOF). (None, None) if absent.
+        """
+        if not DHCPCD_CONF.exists():
+            return None, None
+        try:
+            lines = DHCPCD_CONF.read_text().splitlines()
+            block_start = None
+            for i, raw in enumerate(lines):
+                stripped = raw.strip()
+                if stripped.startswith('#'):
+                    continue
+                if stripped.startswith('interface '):
+                    block_start = i if stripped == f'interface {interface}' else None
+                elif block_start is not None and stripped.startswith('static ip_address='):
+                    end = len(lines)
+                    for j in range(block_start + 1, len(lines)):
+                        s2 = lines[j].strip()
+                        if s2.startswith('interface ') and not s2.startswith('#'):
+                            end = j
+                            break
+                    return block_start, end
+            return None, None
+        except Exception as e:
+            log.debug(f"[dhcpcd-fallback] read failed: {e}")
+            return None, None
+
+    def _dhcpcd_has_static(self, interface):
+        """True if dhcpcd.conf has a 'static ip_address=' inside an 'interface <iface>' block."""
+        s, _ = self._dhcpcd_static_block_lines(interface)
+        return s is not None
+
+    def _is_static_ip(self, interface):
+        """Detect static IP across both supported backends (nmcli + dhcpcd)."""
+        if self._is_networkmanager_running() and self._is_static_ip_nmcli(interface):
+            return True
+        return self._dhcpcd_has_static(interface)
+
+    def _dhcpcd_get_static_config(self, interface):
+        """Extract current static config from dhcpcd.conf for backup/alerts."""
+        config = {
+            'method': 'dhcpcd',
+            'interface': interface,
+            'timestamp': datetime.now().isoformat(),
+        }
+        s, e = self._dhcpcd_static_block_lines(interface)
+        if s is None:
+            return config
+        try:
+            block = DHCPCD_CONF.read_text().splitlines()[s:e]
+            for line in block:
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    continue
+                if stripped.startswith('static ip_address='):
+                    config['ip'] = stripped.split('=', 1)[1].strip()
+                elif stripped.startswith('static routers='):
+                    config['gateway'] = stripped.split('=', 1)[1].strip()
+                elif stripped.startswith('static domain_name_servers='):
+                    config['dns'] = stripped.split('=', 1)[1].strip()
+        except Exception as e:
+            log.warning(f"[dhcpcd-fallback] could not parse static block: {e}")
+        return config
+
+    def _switch_dhcpcd_to_auto(self, interface):
+        """Comment out the static block for `interface` in /etc/dhcpcd.conf, save a
+        binary backup to DHCPCD_BACKUP, and restart dhcpcd. Idempotent — if already
+        commented, returns False (nothing to do).
+        """
+        import shutil
+        s, end = self._dhcpcd_static_block_lines(interface)
+        if s is None:
+            log.warning(f"[dhcpcd-fallback] no static block for {interface}, nothing to do")
+            return False
+        try:
+            shutil.copy2(DHCPCD_CONF, DHCPCD_BACKUP)
+            log.info(f"[dhcpcd-fallback] dhcpcd.conf backed up to {DHCPCD_BACKUP}")
+        except Exception as e:
+            log.error(f"[dhcpcd-fallback] backup failed: {e}")
+            return False
+        try:
+            lines = DHCPCD_CONF.read_text().splitlines(keepends=True)
+            for i in range(s, min(end, len(lines))):
+                stripped = lines[i].lstrip()
+                if stripped.startswith('#'):
+                    continue
+                if (stripped.startswith('interface ')
+                        or stripped.startswith('static ip_address=')
+                        or stripped.startswith('static routers=')
+                        or stripped.startswith('static domain_name_servers=')):
+                    lines[i] = f'# [phoenix-dhcp-fallback] {lines[i]}'
+            DHCPCD_CONF.write_text(''.join(lines))
+            log.info(f"[dhcpcd-fallback] commented static block for {interface}")
+        except Exception as e:
+            log.error(f"[dhcpcd-fallback] failed to rewrite dhcpcd.conf: {e}")
+            # Try to restore the backup we just made
+            try:
+                shutil.copy2(DHCPCD_BACKUP, DHCPCD_CONF)
+            except Exception:
+                pass
+            return False
+        try:
+            subprocess.run(['systemctl', 'restart', 'dhcpcd'],
+                          capture_output=True, timeout=30)
+            return True
+        except Exception as e:
+            log.error(f"[dhcpcd-fallback] dhcpcd restart failed: {e}")
+            return False
+
+    def _restore_dhcpcd_static(self):
+        """Restore /etc/dhcpcd.conf from DHCPCD_BACKUP and restart dhcpcd."""
+        import shutil
+        if not DHCPCD_BACKUP.exists():
+            log.warning("[dhcpcd-fallback] no backup file to restore")
+            return False
+        try:
+            shutil.copy2(DHCPCD_BACKUP, DHCPCD_CONF)
+            subprocess.run(['systemctl', 'restart', 'dhcpcd'],
+                          capture_output=True, timeout=30)
+            log.info("[dhcpcd-fallback] static config restored from backup")
+            return True
+        except Exception as e:
+            log.error(f"[dhcpcd-fallback] restore failed: {e}")
+            return False
+
+    def _load_dhcp_fallback_state(self):
+        """Load persistent DHCP fallback state. If last attempt was within
+        DHCP_FALLBACK_COOLDOWN_HOURS, mark `dhcp_fallback_attempted=True` so we
+        don't retry across a reboot — the only loop guard for this escalation.
+        """
+        try:
+            if DHCP_FALLBACK_STATE_FILE.exists():
+                data = json.loads(DHCP_FALLBACK_STATE_FILE.read_text())
+                ts = data.get('last_attempt_at')
+                if ts:
+                    self._dhcp_fallback_last_attempt = datetime.fromisoformat(ts)
+                    self._dhcp_fallback_method = data.get('method')
+                    age_h = (datetime.now() - self._dhcp_fallback_last_attempt).total_seconds() / 3600
+                    if age_h < DHCP_FALLBACK_COOLDOWN_HOURS:
+                        self.dhcp_fallback_attempted = True
+                        log.info(
+                            f"[dhcp-fallback] cooldown active "
+                            f"({age_h:.1f}h since last {self._dhcp_fallback_method or 'attempt'}; "
+                            f"min={DHCP_FALLBACK_COOLDOWN_HOURS}h)"
+                        )
+        except Exception as e:
+            log.debug(f"[dhcp-fallback] could not load state: {e}")
+
+    def _save_dhcp_fallback_state(self, method, outcome):
+        """Persist last attempt timestamp + outcome (cross-reboot cooldown)."""
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            DHCP_FALLBACK_STATE_FILE.write_text(json.dumps({
+                'last_attempt_at': datetime.now().isoformat(),
+                'method': method,
+                'outcome': outcome,
+                'version': VERSION,
+            }, indent=2))
+            self._dhcp_fallback_last_attempt = datetime.now()
+            self._dhcp_fallback_method = method
+        except Exception as e:
+            log.error(f"[dhcp-fallback] could not save state: {e}")
 
     def _get_current_network_config(self, interface, conn_name):
         """Get current network configuration for backup."""
@@ -1159,7 +1348,10 @@ class ConnectivitySentinel:
 
     def try_dhcp_fallback(self):
         """Try switching to DHCP when static IP has no connectivity.
-        Only once per offline event. Restores static config if DHCP doesn't help.
+        Dispatches to nmcli (NetworkManager) or dhcpcd backend automatically.
+        At most one attempt per 24h (cooldown persisted in DHCP_FALLBACK_STATE_FILE)
+        — that's the loop guard against repeated reboot-then-flap cycles.
+        Restores the previous static config if DHCP doesn't help.
         """
         if self.dhcp_fallback_attempted:
             return False
@@ -1172,24 +1364,43 @@ class ConnectivitySentinel:
             return False
 
         interface = self._get_primary_interface()
-        if not self._is_static_ip(interface):
-            log.info(f"[dhcp-fallback] Interface {interface} is already DHCP, skipping")
+        nm_running = self._is_networkmanager_running()
+        nm_static = nm_running and self._is_static_ip_nmcli(interface)
+        dhcpcd_static = self._dhcpcd_has_static(interface)
+
+        if not nm_static and not dhcpcd_static:
+            log.info(f"[dhcp-fallback] Interface {interface} is already DHCP "
+                     f"(nm_running={nm_running}), skipping")
             return False
 
-        self.dhcp_fallback_attempted = True
-        conn_name = self._get_nm_connection_name(interface)
+        # Prefer the backend that actually has the static config.
+        method = 'nmcli' if nm_static else 'dhcpcd'
         offline_min = self.get_offline_minutes()
+        self.dhcp_fallback_attempted = True
         log.warning(f"[dhcp-fallback] Attempting after {offline_min:.0f}min offline "
-                    f"(interface={interface}, connection={conn_name})")
+                    f"(interface={interface}, method={method})")
+
+        if method == 'nmcli':
+            outcome = self._try_dhcp_fallback_nmcli(interface, offline_min)
+        else:
+            outcome = self._try_dhcp_fallback_dhcpcd(interface, offline_min)
+
+        self._save_dhcp_fallback_state(method, 'success' if outcome else 'failed')
+        return outcome
+
+    def _try_dhcp_fallback_nmcli(self, interface, offline_min):
+        """nmcli-based DHCP fallback (legacy path, used on NetworkManager Pis)."""
+        conn_name = self._get_nm_connection_name(interface)
+        log.info(f"[dhcp-fallback/nmcli] connection={conn_name}")
 
         # Backup current config
         backup = self._get_current_network_config(interface, conn_name)
         try:
             Path("/etc/gravae").mkdir(parents=True, exist_ok=True)
             NETWORK_BACKUP_FILE.write_text(json.dumps(backup, indent=2))
-            log.info(f"[dhcp-fallback] Config backed up to {NETWORK_BACKUP_FILE}")
+            log.info(f"[dhcp-fallback/nmcli] Config backed up to {NETWORK_BACKUP_FILE}")
         except Exception as e:
-            log.error(f"[dhcp-fallback] Failed to save backup, aborting: {e}")
+            log.error(f"[dhcp-fallback/nmcli] Failed to save backup, aborting: {e}")
             alerts.add("dhcp_fallback_error", "warning",
                 f"DHCP fallback aborted: could not save backup ({e})",
                 {"offline_minutes": offline_min})
@@ -1208,29 +1419,73 @@ class ConnectivitySentinel:
                           capture_output=True, text=True, timeout=10)
             subprocess.run(['sudo', 'nmcli', 'connection', 'up', conn_name],
                           capture_output=True, text=True, timeout=10)
-            log.info("[dhcp-fallback] Switched to DHCP, waiting 60s...")
+            log.info("[dhcp-fallback/nmcli] Switched to DHCP, waiting 60s...")
         except Exception as e:
-            log.error(f"[dhcp-fallback] Failed to switch to DHCP: {e}")
+            log.error(f"[dhcp-fallback/nmcli] Failed to switch to DHCP: {e}")
             self._restore_static_config(backup)
             return False
 
         time.sleep(60)
 
         if self.check_connectivity():
-            log.warning("[dhcp-fallback] RESTORED connectivity!")
+            log.warning("[dhcp-fallback/nmcli] RESTORED connectivity!")
             alerts.add("dhcp_fallback_success", "warning",
-                f"Fallback DHCP restaurou conectividade após {offline_min:.0f}min offline. "
+                f"Fallback DHCP (nmcli) restaurou conectividade após {offline_min:.0f}min offline. "
                 f"Config anterior salva em {NETWORK_BACKUP_FILE}",
-                {"offline_minutes": offline_min, "backup": str(NETWORK_BACKUP_FILE)})
-            self.actions_taken.append(("dhcp_fallback_success", datetime.now().isoformat()))
+                {"offline_minutes": offline_min, "method": "nmcli",
+                 "backup": str(NETWORK_BACKUP_FILE)})
+            self.actions_taken.append(("dhcp_fallback_nmcli_success", datetime.now().isoformat()))
             return True
         else:
-            log.warning("[dhcp-fallback] Did NOT restore connectivity, reverting")
+            log.warning("[dhcp-fallback/nmcli] Did NOT restore connectivity, reverting")
             self._restore_static_config(backup)
             alerts.add("dhcp_fallback_failed", "warning",
-                f"DHCP fallback falhou após {offline_min:.0f}min offline. Config restaurada.",
-                {"offline_minutes": offline_min})
-            self.actions_taken.append(("dhcp_fallback_failed", datetime.now().isoformat()))
+                f"DHCP fallback (nmcli) falhou após {offline_min:.0f}min offline. Config restaurada.",
+                {"offline_minutes": offline_min, "method": "nmcli"})
+            self.actions_taken.append(("dhcp_fallback_nmcli_failed", datetime.now().isoformat()))
+            return False
+
+    def _try_dhcp_fallback_dhcpcd(self, interface, offline_min):
+        """dhcpcd-based DHCP fallback for Pis without NetworkManager.
+        Comments the static block, restarts dhcpcd, validates connectivity.
+        Reverts the file from .gravae-backup if it didn't help.
+        """
+        # Save semantic backup (JSON) for alerting/observability
+        backup = self._dhcpcd_get_static_config(interface)
+        try:
+            Path("/etc/gravae").mkdir(parents=True, exist_ok=True)
+            NETWORK_BACKUP_FILE.write_text(json.dumps(backup, indent=2))
+            log.info(f"[dhcp-fallback/dhcpcd] semantic backup -> {NETWORK_BACKUP_FILE}")
+        except Exception as e:
+            log.warning(f"[dhcp-fallback/dhcpcd] could not save semantic backup: {e}")
+
+        if not self._switch_dhcpcd_to_auto(interface):
+            log.error("[dhcp-fallback/dhcpcd] switch to DHCP failed, attempting restore")
+            self._restore_dhcpcd_static()
+            alerts.add("dhcp_fallback_error", "warning",
+                "DHCP fallback (dhcpcd) abortado: erro ao reescrever dhcpcd.conf",
+                {"offline_minutes": offline_min, "method": "dhcpcd"})
+            return False
+
+        log.info("[dhcp-fallback/dhcpcd] dhcpcd restarted, waiting 60s for lease...")
+        time.sleep(60)
+
+        if self.check_connectivity():
+            log.warning("[dhcp-fallback/dhcpcd] RESTORED connectivity!")
+            alerts.add("dhcp_fallback_success", "warning",
+                f"Fallback DHCP (dhcpcd) restaurou conectividade após {offline_min:.0f}min offline. "
+                f"Backup do dhcpcd.conf em {DHCPCD_BACKUP}",
+                {"offline_minutes": offline_min, "method": "dhcpcd",
+                 "backup": str(DHCPCD_BACKUP), "previous_static": backup})
+            self.actions_taken.append(("dhcp_fallback_dhcpcd_success", datetime.now().isoformat()))
+            return True
+        else:
+            log.warning("[dhcp-fallback/dhcpcd] Did NOT restore connectivity, reverting")
+            self._restore_dhcpcd_static()
+            alerts.add("dhcp_fallback_failed", "warning",
+                f"DHCP fallback (dhcpcd) falhou após {offline_min:.0f}min offline. Config restaurada.",
+                {"offline_minutes": offline_min, "method": "dhcpcd"})
+            self.actions_taken.append(("dhcp_fallback_dhcpcd_failed", datetime.now().isoformat()))
             return False
 
     def _load_reboot_state(self):
