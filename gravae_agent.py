@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.3.7"
+VERSION = "3.4.0"
 
 # Centralized logging
 try:
@@ -1884,6 +1884,313 @@ def setup_ftp_events_async():
         except Exception as e:
             print(f"[FTP Events Async] Exception: {e}")
     threading.Thread(target=_run, daemon=True).start()
+
+# ─── Per-monitor configuration (v3) ──────────────────────────────────
+#
+# Lets the OPS panel edit Shinobi monitor details directly via SQL,
+# bypassing Shinobi's `configureMonitor` endpoint which silently
+# re-coerces detector boolean strings ('1') to integers (1) and
+# disables sip event recording.
+#
+# IMPORTANT: This whitelist MUST stay in sync with
+# src/lib/shinobi-monitor-schema.ts in the OPS repo.
+# Both ends coerce the same way; OPS rejects unknown keys, agent
+# rejects them again as defense-in-depth.
+
+# (col=top-level Monitors column, otherwise nested in details JSON)
+_MONITOR_FIELDS = {
+    # connection (column-level)
+    'name':            {'col': True,  'type': 'string'},
+    'mode':            {'col': True,  'type': 'enum',   'enum': ['start','stop','idle']},
+    'type':            {'col': True,  'type': 'enum',   'enum': ['h264','mjpeg','local','jpeg']},
+    'host':            {'col': True,  'type': 'string'},
+    'port':            {'col': True,  'type': 'int',    'min': 1, 'max': 65535},
+    'path':            {'col': True,  'type': 'string'},
+    'ext':             {'col': True,  'type': 'enum',   'enum': ['mp4','mkv','webm']},
+    # connection (details)
+    'protocol':        {'type': 'enum', 'enum': ['rtsp','rtmp','http','udp']},
+    'muser':           {'type': 'string'},
+    'mpass':           {'type': 'string'},
+    'rtsp_transport':  {'type': 'enum', 'enum': ['tcp','udp']},
+    # live HLS
+    'stream_type':     {'type': 'enum', 'enum': ['hls','mjpeg','mp4','b64','flv']},
+    'stream_vcodec':   {'type': 'enum', 'enum': ['copy','libx264','auto']},
+    'stream_acodec':   {'type': 'enum', 'enum': ['aac','copy','ac3','no']},
+    'hls_time':        {'type': 'str-int', 'min': 1, 'max': 10},
+    'hls_list_size':   {'type': 'str-int', 'min': 2, 'max': 60},
+    # record (continuous)
+    'vcodec':          {'type': 'enum', 'enum': ['copy','libx264','auto']},
+    'acodec':          {'type': 'enum', 'enum': ['ac3','aac','copy','no']},
+    'cutoff':          {'type': 'str-int', 'min': 1, 'max': 60},
+    'max_keep_days':   {'type': 'str-int', 'min': 1, 'max': 365},
+    # detector (sip event recording) — locks enforce invariants
+    'detector':                       {'type': 'str-bool', 'lock': '1'},
+    'detector_trigger':               {'type': 'str-bool', 'lock': '1'},
+    'detector_record_method':         {'type': 'enum',     'enum': ['sip','hot'], 'lock': 'sip'},
+    'detector_use_motion':            {'type': 'str-bool', 'lock': '0'},
+    'detector_buffer_seconds_before': {'type': 'str-int',  'min': 0, 'max': 300},
+    'detector_send_video_length':     {'type': 'str-int',  'min': 1, 'max': 600},
+    'detector_buffer_vcodec':         {'type': 'enum', 'enum': ['copy','auto','libx264']},
+    'detector_buffer_acodec':         {'type': 'enum', 'enum': ['ac3','aac','copy','no']},
+    'detector_save':                  {'type': 'str-bool'},
+    'detector_send_frames':           {'type': 'str-bool'},
+    'detector_timeout':               {'type': 'string'},
+    # advanced
+    'aduration':                   {'type': 'int', 'min': 0},
+    'probesize':                   {'type': 'int', 'min': 0},
+    'wall_clock_timestamp_ignore': {'type': 'str-bool'},
+    'watchdog_reset':              {'type': 'str-bool'},
+    'crf':                         {'type': 'string'},
+    'cust_input':                  {'type': 'string'},
+    'cust_stream':                 {'type': 'string'},
+    'cust_record':                 {'type': 'string'},
+}
+
+
+def _coerce_monitor_field(key, raw):
+    """Coerce + validate a single field value. Returns the canonical value or raises."""
+    f = _MONITOR_FIELDS.get(key)
+    if not f:
+        raise ValueError(f"unknown field: {key}")
+    if 'lock' in f:
+        return f['lock']
+    if raw is None or raw == '':
+        return None
+    t = f['type']
+    if t in ('string', 'password'):
+        return str(raw)
+    if t == 'int':
+        n = int(raw)
+        if 'min' in f and n < f['min']:
+            raise ValueError(f"{key} < min {f['min']}")
+        if 'max' in f and n > f['max']:
+            raise ValueError(f"{key} > max {f['max']}")
+        return n
+    if t == 'str-int':
+        n = int(raw)
+        if 'min' in f and n < f['min']:
+            raise ValueError(f"{key} < min {f['min']}")
+        if 'max' in f and n > f['max']:
+            raise ValueError(f"{key} > max {f['max']}")
+        return str(n)
+    if t == 'str-bool':
+        s = str(raw).lower()
+        if s in ('1', 'true'):  return '1'
+        if s in ('0', 'false'): return '0'
+        raise ValueError(f"{key} must be boolean ('1'/'0')")
+    if t == 'enum':
+        s = str(raw)
+        if s not in f['enum']:
+            raise ValueError(f"{key} must be one of {f['enum']}")
+        return s
+    raise ValueError(f"{key}: unknown type {t}")
+
+
+def _sql_quote_str(v):
+    """Escape a value for inclusion inside a single-quoted SQL literal."""
+    return str(v).replace('\\', '\\\\').replace("'", "''")
+
+
+def _shinobi_mysql_cmd_base():
+    db = get_shinobi_db_config() or {}
+    return [
+        'mysql',
+        '-u', db.get('user', 'majesticflame'),
+        '-h', db.get('host', '127.0.0.1'),
+        db.get('database', 'ccio'),
+    ], db.get('password', '')
+
+
+def _shinobi_mysql_query_json(sql, expect_array=False):
+    """Run a SELECT that returns a single column of JSON. Returns parsed value."""
+    base, pw = _shinobi_mysql_cmd_base()
+    env = os.environ.copy()
+    if pw:
+        env['MYSQL_PWD'] = pw
+    cmd = base + ['-N', '-B', '--raw', '-e', sql]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=20, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(f"mysql query failed: {result.stderr.strip()}")
+    out = result.stdout.strip()
+    if not out:
+        return [] if expect_array else None
+    try:
+        return json.loads(out)
+    except Exception as e:
+        raise RuntimeError(f"mysql json parse failed: {e}; out={out[:200]}")
+
+
+def _shinobi_mysql_exec(sql):
+    base, pw = _shinobi_mysql_cmd_base()
+    env = os.environ.copy()
+    if pw:
+        env['MYSQL_PWD'] = pw
+    cmd = base + ['-e', sql]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=20, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(f"mysql exec failed: {result.stderr.strip()}")
+    return True
+
+
+def shinobi_monitor_list(group_key=None):
+    gk = group_key or CONFIG.get('shinobiGroupKey')
+    if not gk:
+        return {"success": False, "error": "shinobiGroupKey missing in agent config"}
+    sql = (
+        "SELECT JSON_ARRAYAGG(JSON_OBJECT("
+        "'mid', mid, 'name', name, 'mode', mode, 'type', type, 'ext', ext, "
+        "'host', host, 'port', port, 'path', path"
+        f")) FROM Monitors WHERE ke = '{_sql_quote_str(gk)}'"
+    )
+    arr = _shinobi_mysql_query_json(sql, expect_array=True)
+    return {"success": True, "groupKey": gk, "monitors": arr or []}
+
+
+def shinobi_monitor_get(mid, group_key=None):
+    gk = group_key or CONFIG.get('shinobiGroupKey')
+    if not gk:
+        return {"success": False, "error": "shinobiGroupKey missing in agent config"}
+    sql = (
+        "SELECT JSON_OBJECT("
+        "'mid', mid, 'name', name, 'mode', mode, 'type', type, 'ext', ext, "
+        "'host', host, 'port', port, 'path', path, 'details', details"
+        f") FROM Monitors WHERE ke = '{_sql_quote_str(gk)}' AND mid = '{_sql_quote_str(mid)}'"
+    )
+    obj = _shinobi_mysql_query_json(sql)
+    if not obj:
+        return {"success": False, "error": f"monitor {mid} not found"}
+    return {"success": True, "monitor": obj}
+
+
+def _audit_monitor_change(mid, prev, columns, details_patch, who=None):
+    try:
+        log_dir = '/var/log/gravae'
+        os.makedirs(log_dir, exist_ok=True)
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "mid": mid,
+            "groupKey": CONFIG.get('shinobiGroupKey'),
+            "who": who,
+            "columns": columns,
+            "detailsPatch": details_patch,
+            "previousColumns": {k: prev.get(k) for k in columns.keys()},
+            "previousDetails": {k: (prev.get('details') or {}).get(k) for k in details_patch.keys()},
+        }
+        with open(os.path.join(log_dir, 'monitor-changes.log'), 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except Exception as e:
+        print(f"[monitor-audit] failed: {e}")
+
+
+def shinobi_monitor_update(mid, fields, who=None, group_key=None):
+    gk = group_key or CONFIG.get('shinobiGroupKey')
+    if not gk:
+        return {"success": False, "error": "shinobiGroupKey missing"}
+    if not isinstance(fields, dict) or not fields:
+        return {"success": False, "error": "fields must be a non-empty object"}
+
+    columns = {}
+    details_patch = {}
+    errors = []
+    for k, v in fields.items():
+        try:
+            value = _coerce_monitor_field(k, v)
+        except Exception as e:
+            errors.append(str(e))
+            continue
+        if _MONITOR_FIELDS[k].get('col'):
+            columns[k] = value
+        else:
+            details_patch[k] = value
+    if errors:
+        return {"success": False, "error": "; ".join(errors)}
+
+    prev_resp = shinobi_monitor_get(mid, group_key=gk)
+    if not prev_resp.get('success'):
+        return prev_resp
+    prev = prev_resp['monitor']
+
+    set_clauses = []
+    if details_patch:
+        json_str = json.dumps(details_patch)
+        set_clauses.append(f"details = JSON_MERGE_PATCH(details, '{_sql_quote_str(json_str)}')")
+    for col, val in columns.items():
+        if val is None:
+            set_clauses.append(f"`{col}` = NULL")
+        elif isinstance(val, (int, float)):
+            set_clauses.append(f"`{col}` = {val}")
+        else:
+            set_clauses.append(f"`{col}` = '{_sql_quote_str(val)}'")
+
+    if not set_clauses:
+        return {"success": True, "changed": False, "message": "no changes"}
+
+    sql = (
+        f"UPDATE Monitors SET {', '.join(set_clauses)} "
+        f"WHERE ke = '{_sql_quote_str(gk)}' AND mid = '{_sql_quote_str(mid)}'"
+    )
+    try:
+        _shinobi_mysql_exec(sql)
+    except Exception as e:
+        return {"success": False, "error": f"sql update failed: {e}"}
+
+    _audit_monitor_change(mid, prev, columns, details_patch, who)
+
+    return {
+        "success": True,
+        "changed": True,
+        "appliedColumns": columns,
+        "appliedDetails": details_patch,
+    }
+
+
+def shinobi_monitor_restart(mid, group_key=None):
+    """Force Shinobi to re-read the monitor's details from DB.
+
+    Strategy:
+      1. Try the per-monitor REST stop+start (uses agent's shinobiApiKey).
+         This is granular — only the targeted monitor briefly drops.
+      2. Fall back to `pm2 restart camera` if the API key lacks the
+         control_monitors permission (returns "Not Authorized").
+    """
+    gk = group_key or CONFIG.get('shinobiGroupKey')
+    api_key = CONFIG.get('shinobiApiKey')
+
+    # ── Path 1: granular REST stop+start ─────────────────────────────
+    if gk and api_key:
+        base_url = f"http://127.0.0.1:8080/{api_key}/monitor/{gk}/{mid}"
+        try:
+            with urllib.request.urlopen(f"{base_url}/stop", timeout=10) as r:
+                stop_body = r.read().decode()[:400]
+            granular_ok = '"ok":true' in stop_body.replace(' ', '') or '"ok": true' in stop_body
+            if granular_ok:
+                time.sleep(2)
+                with urllib.request.urlopen(f"{base_url}/start", timeout=15) as r:
+                    start_body = r.read().decode()[:400]
+                return {"success": True, "method": "granular", "stop": stop_body, "start": start_body}
+        except Exception as e:
+            print(f"[monitor-restart] granular failed: {e} — falling back to pm2")
+
+    # ── Path 2: pm2 restart camera (full Shinobi reload, ~3-5s) ──────
+    try:
+        result = subprocess.run(
+            ['pm2', 'restart', 'camera'],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return {"success": False, "method": "pm2", "error": result.stderr.strip()[:400]}
+        # Wait for Shinobi to come back up
+        for _ in range(20):
+            time.sleep(2)
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:8080/", timeout=3) as _:
+                    return {"success": True, "method": "pm2", "note": "full Shinobi restart (granular auth not available)"}
+            except Exception:
+                continue
+        return {"success": False, "method": "pm2", "error": "Shinobi did not come back within 40s"}
+    except Exception as e:
+        return {"success": False, "method": "pm2", "error": str(e)}
+
 
 def ensure_super_admin_token():
     """Ensure super.json has the correct password hash and a valid token.
@@ -4245,6 +4552,31 @@ class AgentHandler(BaseHTTPRequestHandler):
             setup_ftp_events_async()
             self._send_json({"success": True, "message": "FTP setup started in background"})
 
+        # ─── Shinobi monitor config (v3) ─────────────────────────────
+        elif path == '/shinobi/monitor/update':
+            mid = data.get('mid')
+            fields = data.get('fields')
+            who = data.get('who')
+            gk = data.get('groupKey')
+            if not mid or not isinstance(fields, dict):
+                self._send_json({"success": False, "error": "mid + fields required"}, 400)
+                return
+            try:
+                self._send_json(shinobi_monitor_update(mid, fields, who, group_key=gk))
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)}, 500)
+
+        elif path == '/shinobi/monitor/restart':
+            mid = data.get('mid')
+            gk = data.get('groupKey')
+            if not mid:
+                self._send_json({"success": False, "error": "mid required"}, 400)
+                return
+            try:
+                self._send_json(shinobi_monitor_restart(mid, group_key=gk))
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)}, 500)
+
         elif path == '/shinobi/ftp-status':
             # Check if Shinobi's FTP server is running
             shinobi_dir = _find_shinobi_dir()
@@ -4531,6 +4863,40 @@ class AgentHandler(BaseHTTPRequestHandler):
 
         if path == '/update/version':
             self._send_json({"version": VERSION})
+            return
+
+        # ─── Shinobi monitor config (v3) ──────────────────────────────
+        if path == '/shinobi/monitor/list':
+            gk = query.get('groupKey', [None])[0]
+            self._send_json(shinobi_monitor_list(group_key=gk))
+            return
+
+        if path == '/shinobi/monitor/get':
+            mid = query.get('mid', [None])[0]
+            gk = query.get('groupKey', [None])[0]
+            if not mid:
+                self._send_json({"success": False, "error": "mid required"}, 400)
+                return
+            self._send_json(shinobi_monitor_get(mid, group_key=gk))
+            return
+
+        if path == '/shinobi/monitor/changes':
+            try:
+                lines_n = int(query.get('limit', ['100'])[0])
+                lines_n = max(1, min(lines_n, 1000))
+                p = '/var/log/gravae/monitor-changes.log'
+                if not os.path.exists(p):
+                    self._send_json({"entries": []})
+                    return
+                with open(p) as f:
+                    lines = f.readlines()[-lines_n:]
+                entries = []
+                for ln in lines:
+                    try: entries.append(json.loads(ln))
+                    except: pass
+                self._send_json({"entries": entries})
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)}, 500)
             return
 
         # === Log Endpoints ===
