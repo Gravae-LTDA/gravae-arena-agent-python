@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 
 # Centralized logging
 try:
@@ -541,6 +541,31 @@ def check_ip_conflict(interface, ip):
         }
 
 
+def _strip_dhcpcd_interface_block(content, interface):
+    """Remove an existing 'interface <name>' block from dhcpcd.conf content.
+    A block runs from `interface <name>` until the next `interface ` directive,
+    a top-level comment, or a blank line.
+    """
+    out = []
+    inside = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('interface '):
+            iface = stripped.split(None, 1)[1] if ' ' in stripped else ''
+            inside = (iface == interface)
+            if not inside:
+                out.append(line)
+            continue
+        if inside:
+            if stripped == '' or stripped.startswith('#') or not stripped.startswith('static '):
+                inside = False
+                if stripped:
+                    out.append(line)
+            continue
+        out.append(line)
+    return '\n'.join(out)
+
+
 def configure_network_static(interface, ip, prefix, gateway, dns=None):
     """Configure static IP on an interface.
     Works with both NetworkManager (Bookworm+) and dhcpcd (Bullseye).
@@ -581,41 +606,47 @@ def configure_network_static(interface, ip, prefix, gateway, dns=None):
             # Use dhcpcd.conf for older systems (Bullseye)
             config_path = '/etc/dhcpcd.conf'
 
-            # Read current config
             try:
                 with open(config_path, 'r') as f:
-                    lines = f.readlines()
-            except:
-                lines = []
+                    content = f.read()
+            except FileNotFoundError:
+                content = ''
 
-            # Remove existing config for this interface
-            new_lines = []
-            skip_until_next_interface = False
-            for line in lines:
-                if line.strip().startswith('interface '):
-                    skip_until_next_interface = interface in line
-                    if not skip_until_next_interface:
-                        new_lines.append(line)
-                elif skip_until_next_interface and line.strip().startswith('interface '):
-                    skip_until_next_interface = False
-                    new_lines.append(line)
-                elif not skip_until_next_interface:
-                    new_lines.append(line)
+            # Recover from literal-\n garbage written by agent <= 3.4.0
+            if '\\n' in content:
+                content = content.replace('\\n', '\n')
 
-            # Add new static config
-            new_lines.append(f'\\ninterface {interface}\\n')
-            new_lines.append(f'static ip_address={ip}/{prefix}\\n')
-            new_lines.append(f'static routers={gateway}\\n')
+            # Strip any existing block for this interface
+            content = _strip_dhcpcd_interface_block(content, interface)
+
+            # Build static block with REAL newlines
+            block = [
+                '',
+                f'interface {interface}',
+                f'static ip_address={ip}/{prefix}',
+                f'static routers={gateway}',
+            ]
             if dns:
                 dns_str = ' '.join(dns) if isinstance(dns, list) else dns
-                new_lines.append(f'static domain_name_servers={dns_str}\\n')
+                block.append(f'static domain_name_servers={dns_str}')
 
-            # Write config
+            new_content = content.rstrip() + '\n' + '\n'.join(block) + '\n'
+
             with open('/tmp/dhcpcd.conf.new', 'w') as f:
-                f.writelines(new_lines)
+                f.write(new_content)
 
             subprocess.run(['sudo', 'mv', '/tmp/dhcpcd.conf.new', config_path], check=True, timeout=5)
             subprocess.run(['sudo', 'systemctl', 'restart', 'dhcpcd'], capture_output=True, timeout=30)
+
+            # Verify the new IP took effect
+            try:
+                check = subprocess.run(['ip', '-4', '-o', 'addr', 'show', interface],
+                                       capture_output=True, text=True, timeout=5)
+                if ip not in check.stdout:
+                    return {'success': False, 'method': 'dhcpcd',
+                            'error': f'dhcpcd restarted but {ip} not on {interface}: {check.stdout.strip()}'}
+            except Exception:
+                pass
 
             return {'success': True, 'method': 'dhcpcd', 'message': 'Static IP configured, dhcpcd restarted'}
 
@@ -1448,7 +1479,7 @@ def _cleanup_existing_coaching_account(email):
     print(f"[Coaching Cleanup] Cleanup complete for {email}")
 
 
-def setup_coaching_shinobi(arena_name, password=None):
+def setup_coaching_shinobi(arena_name, password=None, email=None, group_key=None, recording_mode=False):
     """Create a separate Shinobi account for Coaching Review and clone all OPS monitors.
 
     Flow:
@@ -1484,11 +1515,18 @@ def setup_coaching_shinobi(arena_name, password=None):
 
     print(f"[Coaching Shinobi] Found {len(ops_monitors)} OPS monitors to clone")
 
-    # Step 2: Create coaching Shinobi account
-    safe_name = arena_name.lower().replace(' ', '-')[:30]
-    coaching_group_key = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(12))
-    coaching_email = f"coaching-{safe_name}@gravae.local"
-    coaching_password = _coaching_password_override or ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
+    # Step 2: Create Shinobi account.
+    # Legacy /coaching/setup-shinobi keeps the original random coaching account
+    # behavior. The new recording flow opts in to deterministic credentials.
+    if recording_mode:
+        coaching_group_key = group_key or f"RECORDING{ops_group_key}"
+        coaching_email = email or "recording@gravae.io"
+        coaching_password = password or "Gravae123"
+    else:
+        safe_name = arena_name.lower().replace(' ', '-')[:30]
+        coaching_group_key = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(12))
+        coaching_email = f"coaching-{safe_name}@gravae.local"
+        coaching_password = _coaching_password_override or ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
 
     result = setup_shinobi_account(coaching_group_key, coaching_email, coaching_password)
     if not result.get('success'):
@@ -1530,16 +1568,57 @@ def setup_coaching_shinobi(arena_name, password=None):
         if test_result.returncode != 0:
             return {"success": False, "error": f"Cannot connect to Shinobi DB: {test_result.stderr[:200]}"}
 
-        # Delete existing coaching monitors
-        run_sql(f"DELETE FROM Monitors WHERE ke='{coaching_gk}'")
+        def sql_escape(value):
+            return str(value).replace("\\", "\\\\").replace("'", "\\'")
 
-        # Clone monitors via INSERT...SELECT (preserves all fields including details JSON)
-        # Note: shto/shfr columns may not exist in all Shinobi versions, so we exclude them
-        clone_sql = (
-            f"INSERT INTO Monitors (ke, mid, name, type, ext, protocol, host, path, port, fps, mode, width, height, details) "
-            f"SELECT '{coaching_gk}', mid, CONCAT('Coaching - ', name), type, ext, protocol, host, path, port, fps, 'stop', width, height, details "
-            f"FROM Monitors WHERE ke='{ops_group_key}'"
-        )
+        ops_group_key_sql = sql_escape(ops_group_key)
+        coaching_gk_sql = sql_escape(coaching_gk)
+
+        # Delete existing cloned monitors.
+        run_sql(f"DELETE FROM Monitors WHERE ke='{coaching_gk_sql}'")
+
+        if recording_mode:
+            # Clone all monitor columns dynamically because Shinobi schemas vary
+            # between installs. Override only ownership, ID, display name and mode.
+            columns_result = run_sql("SHOW COLUMNS FROM Monitors")
+            if columns_result.returncode != 0:
+                return {"success": False, "error": f"Could not inspect Monitors columns: {columns_result.stderr[:200]}"}
+
+            columns = []
+            for line in columns_result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                columns.append(line.split('\t')[0])
+
+            if not columns:
+                return {"success": False, "error": "No columns found in Shinobi Monitors table"}
+
+            insert_columns = ', '.join(f"`{col}`" for col in columns)
+            select_expressions = []
+            for col in columns:
+                if col == 'ke':
+                    select_expressions.append(f"'{coaching_gk_sql}'")
+                elif col == 'mid':
+                    select_expressions.append("CONCAT('recording_', `mid`)")
+                elif col == 'name':
+                    select_expressions.append("CONCAT('recording_', `mid`, '_', `name`)")
+                elif col == 'mode':
+                    select_expressions.append("'stop'")
+                else:
+                    select_expressions.append(f"`{col}`")
+
+            clone_sql = (
+                f"INSERT INTO Monitors ({insert_columns}) "
+                f"SELECT {', '.join(select_expressions)} "
+                f"FROM Monitors WHERE ke='{ops_group_key_sql}'"
+            )
+        else:
+            # Legacy clone path used by existing coaching setup.
+            clone_sql = (
+                f"INSERT INTO Monitors (ke, mid, name, type, ext, protocol, host, path, port, fps, mode, width, height, details) "
+                f"SELECT '{coaching_gk_sql}', mid, CONCAT('Coaching - ', name), type, ext, protocol, host, path, port, fps, 'stop', width, height, details "
+                f"FROM Monitors WHERE ke='{ops_group_key_sql}'"
+            )
         clone_result = run_sql(clone_sql, timeout=15)
 
         if clone_result.returncode != 0:
@@ -1551,7 +1630,7 @@ def setup_coaching_shinobi(arena_name, password=None):
             return {"success": False, "error": f"MySQL clone failed: {err_msg}"}
 
         # Verify cloned monitors
-        verify_sql = f"SELECT mid, host, protocol FROM Monitors WHERE ke='{coaching_gk}';"
+        verify_sql = f"SELECT mid, name, host, protocol FROM Monitors WHERE ke='{coaching_gk_sql}';"
         verify_result = subprocess.run(
             mysql_cmd_base + ['-N', '-B', '-e', verify_sql],
             env=mysql_env, capture_output=True, text=True, timeout=10
@@ -1562,9 +1641,11 @@ def setup_coaching_shinobi(arena_name, password=None):
                 continue
             parts = line.split('\t')
             mid = parts[0] if len(parts) > 0 else '?'
-            host = parts[1] if len(parts) > 1 else '?'
-            cloned.append({"mid": mid, "name": mid})
-            print(f"[Coaching Shinobi] Cloned: {mid} host={host}")
+            name = parts[1] if len(parts) > 1 else mid
+            host = parts[2] if len(parts) > 2 else '?'
+            source_mid = mid.replace('recording_', '', 1) if mid.startswith('recording_') else mid
+            cloned.append({"mid": mid, "name": name, "sourceMid": source_mid})
+            print(f"[Coaching Shinobi] Cloned: {mid} name={name} host={host}")
 
     except Exception as e:
         print(f"[Coaching Shinobi] Clone failed: {e}")
@@ -3792,16 +3873,24 @@ def get_phoenix_status():
     except:
         status["connectivity"] = False
 
-    # Speed test results from Phoenix ResourceMonitor
+    # Speed test results from Phoenix ResourceMonitor (Phoenix v1.16.0+ measures
+    # both download and upload — upload é o gargalo real pra arenas Gravae).
     try:
-        phoenix_log = "/var/log/gravae/phoenix.log"
-        # Read from Phoenix shared state file if available
         speed_file = "/tmp/gravae_speed_test.json"
         if os.path.exists(speed_file):
             with open(speed_file) as f:
                 speed_data = json.load(f)
-            status["resources"]["download_speed_mbps"] = speed_data.get("speed_mbps")
+            # New keys (v1.16.0)
+            if "download_mbps" in speed_data:
+                status["resources"]["download_speed_mbps"] = speed_data.get("download_mbps")
+            else:
+                # Backwards compat: Phoenix < v1.16 só salvava speed_mbps (download)
+                status["resources"]["download_speed_mbps"] = speed_data.get("speed_mbps")
+            if speed_data.get("upload_mbps") is not None:
+                status["resources"]["upload_speed_mbps"] = speed_data.get("upload_mbps")
             status["resources"]["slow_internet"] = speed_data.get("slow", False)
+            # very_slow flag: OPS lê isso pra criar anomaly very_slow_internet
+            status["resources"]["very_slow"] = speed_data.get("very_slow", False)
     except:
         pass
 
@@ -4822,6 +4911,20 @@ class AgentHandler(BaseHTTPRequestHandler):
             result = setup_coaching_shinobi(arena_name, password=data.get('password'))
             self._send_json(result)
 
+        elif path == '/coaching/setup-recording-shinobi':
+            arena_name = data.get('arenaName', 'unknown')
+            if not arena_name:
+                self._send_json({"success": False, "error": "arenaName is required"}, 400)
+                return
+            result = setup_coaching_shinobi(
+                arena_name,
+                password=data.get('password'),
+                email=data.get('email'),
+                group_key=data.get('groupKey'),
+                recording_mode=True,
+            )
+            self._send_json(result)
+
         elif path.startswith('/coaching/') and _coaching_module:
             _coaching_module.handle_request(self, 'POST', path, data)
 
@@ -5027,6 +5130,25 @@ def _fix_dangerous_settings():
     # /opt/gravae-agent/languages/en_CA.json. Delete + re-register with correct cwd.
     _fix_shinobi_pm2_cwd()
 
+    # 5. Recover dhcpcd.conf from literal \n garbage written by agent <= 3.4.0.
+    # Symptom: file is one long line with `\ninterface eth0\nstatic ...` literals,
+    # dhcpcd silently ignores it, Pi falls back to DHCP, FTP-camera arenas break
+    # whenever the router gives a different lease.
+    try:
+        config_path = '/etc/dhcpcd.conf'
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                content = f.read()
+            if '\\n' in content:
+                fixed = content.replace('\\n', '\n')
+                with open('/tmp/dhcpcd.conf.fix', 'w') as f:
+                    f.write(fixed)
+                subprocess.run(['sudo', 'mv', '/tmp/dhcpcd.conf.fix', config_path], check=True)
+                subprocess.run(['sudo', 'systemctl', 'restart', 'dhcpcd'], capture_output=True)
+                print("[Startup] FIXED: dhcpcd.conf had literal \\n strings, restored real newlines + restarted dhcpcd")
+    except Exception as e:
+        print(f"[Startup] Failed to fix dhcpcd.conf: {e}")
+
 
 def _fix_shinobi_pm2_cwd():
     """Detect and fix corrupted Shinobi PM2 cwd.
@@ -5088,35 +5210,14 @@ def _fix_shinobi_pm2_cwd():
 
 
 def _get_ffmpeg_timeout_flag():
-    """Detect the correct RTSP timeout flag for the installed FFmpeg version.
-    - FFmpeg < 7: -stimeout (microseconds)
-    - FFmpeg >= 7: -timeout (microseconds), -stimeout was removed
-    Retries up to 3 times to handle slow boot.
+    """Return the RTSP timeout flag for ffmpeg.
+    Always returns '-timeout': it is accepted by every ffmpeg in production
+    (FFmpeg >=5 supports both, >=7 removed -stimeout). Sierra and other
+    legacy arenas had Shinobi monitors falling repeatedly because '-stimeout'
+    is rejected/deprecated on their ffmpeg builds — '-timeout' is the safe
+    universal flag.
     """
-    import re
-    for attempt in range(3):
-        try:
-            result = subprocess.run(
-                ['/usr/bin/ffmpeg', '-version'],
-                capture_output=True, text=True, timeout=10
-            )
-            first_line = result.stdout.split('\n')[0] if result.stdout else ''
-            match = re.search(r'version\s+(\d+)\.', first_line)
-            if match:
-                major = int(match.group(1))
-                flag = '-timeout' if major >= 7 else '-stimeout'
-                print(f"[Shinobi] FFmpeg {major}.x detected, using {flag}")
-                return flag
-            else:
-                print(f"[Shinobi] Could not parse ffmpeg version: {first_line[:80]}")
-        except Exception as e:
-            print(f"[Shinobi] ffmpeg version check attempt {attempt+1} failed: {e}")
-        if attempt < 2:
-            import time
-            time.sleep(5)
-    # Default to -stimeout (safe for Bullseye which is 90% of devices)
-    print("[Shinobi] ffmpeg version detection failed, defaulting to -stimeout")
-    return '-stimeout'
+    return '-timeout'
 
 
 def _ensure_shinobi_running():

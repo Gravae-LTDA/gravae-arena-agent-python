@@ -264,6 +264,9 @@ class UploadQueue:
                  r2_bucket, multipart_id, total_bytes, uploaded_bytes,
                  retry_count) = row
 
+                if local_path.endswith('.m3u8') and not self._segments_completed(session_id):
+                    continue
+
                 try:
                     log.info(f"Uploading: {os.path.basename(local_path)} "
                              f"({total_bytes} bytes, retry={retry_count})",
@@ -290,6 +293,22 @@ class UploadQueue:
             if not processed_any:
                 # All items are in retry cooldown or queue is empty
                 time.sleep(5)
+
+    def _segments_completed(self, session_id):
+        """Manifest can only upload after every segment for the session is in R2."""
+        db = _get_db()
+        try:
+            row = db.execute(
+                '''SELECT COUNT(*)
+                   FROM uploads
+                   WHERE session_id = ?
+                     AND local_path NOT LIKE '%.m3u8'
+                     AND status != 'completed' ''',
+                (session_id,)
+            ).fetchone()
+            return (row[0] if row else 0) == 0
+        finally:
+            db.close()
 
     def _process_upload(self, row_id, session_id, file_id, local_path,
                         r2_key, r2_bucket, multipart_id, total_bytes, uploaded_bytes):

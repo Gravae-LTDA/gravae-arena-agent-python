@@ -35,7 +35,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -1641,8 +1641,12 @@ class ResourceMonitor:
         self.last_voltage_check = 0  # Timestamp for daily voltage check
         self.last_speed_test = 0  # Timestamp for speed test
         self.download_speed_mbps = None  # Last measured download speed
-        self.slow_internet = False  # True if < 30 Mbps
-        self.very_slow_internet = False  # True if < 10 Mbps
+        self.upload_speed_mbps = None    # Last measured upload speed (v1.16.0)
+        # Thresholds (v1.16.0): upload é o gargalo real pra arenas Gravae
+        # (gravam vídeo pra cloud). slow se download < 30 OU upload < 5;
+        # very_slow se download < 10 OU upload < 1.
+        self.slow_internet = False
+        self.very_slow_internet = False
 
     def get_throttled(self):
         """Check Raspberry Pi throttling/voltage status via vcgencmd.
@@ -1716,61 +1720,97 @@ class ResourceMonitor:
         except:
             return None
 
-    def check_speed(self):
-        """Speed test via speedtest-cli (accurate, multi-connection)."""
-        mbps = None
-
-        # Try speedtest-cli first (most accurate)
+    def _run_speedtest(self):
+        """Run speedtest-cli measuring download AND upload. Returns (download_mbps, upload_mbps) or (None, None)."""
         try:
             result = subprocess.run(
-                ['speedtest-cli', '--simple', '--no-upload', '--secure'],
-                capture_output=True, text=True, timeout=120
+                ['speedtest-cli', '--simple', '--secure'],
+                capture_output=True, text=True, timeout=180
             )
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
-                    if line.startswith('Download:'):
-                        mbps = round(float(line.split()[1]), 1)
-                        break
         except FileNotFoundError:
-            # Install speedtest-cli if not available
+            # Install speedtest-cli and retry once
             try:
                 subprocess.run(['pip3', 'install', 'speedtest-cli'], capture_output=True, timeout=30)
                 result = subprocess.run(
-                    ['speedtest-cli', '--simple', '--no-upload', '--secure'],
-                    capture_output=True, text=True, timeout=120
+                    ['speedtest-cli', '--simple', '--secure'],
+                    capture_output=True, text=True, timeout=180
                 )
-                if result.returncode == 0:
-                    for line in result.stdout.strip().split('\n'):
-                        if line.startswith('Download:'):
-                            mbps = round(float(line.split()[1]), 1)
-                            break
-            except:
-                log.debug("Failed to install speedtest-cli")
+            except Exception as e:
+                log.debug(f"Failed to install/run speedtest-cli: {e}")
+                return None, None
         except Exception as e:
             log.debug(f"speedtest-cli failed: {e}")
+            return None, None
 
-        if mbps is not None:
-            self.download_speed_mbps = mbps
-            was_slow = self.slow_internet
-            was_very_slow = self.very_slow_internet
-            self.slow_internet = mbps < 30.0
-            self.very_slow_internet = mbps < 10.0
-            if self.very_slow_internet and not was_very_slow:
-                alerts.add("very_slow_internet", "critical", f"Internet muito lenta: {mbps} Mbps", {"speed_mbps": mbps})
-            elif self.slow_internet and not was_slow:
-                alerts.add("slow_internet", "warning", f"Internet lenta: {mbps} Mbps", {"speed_mbps": mbps})
-            elif not self.slow_internet and was_slow:
-                alerts.add("internet_recovered", "info", f"Internet normalizada: {mbps} Mbps", {"speed_mbps": mbps})
-            label = '(muito lenta!)' if self.very_slow_internet else '(lenta)' if self.slow_internet else '(ok)'
-            log.info(f"Speed test: {mbps} Mbps {label}")
+        if result.returncode != 0:
+            return None, None
+
+        download = None
+        upload = None
+        for line in result.stdout.strip().split('\n'):
             try:
-                import json as _json
-                with open('/tmp/gravae_speed_test.json', 'w') as _f:
-                    _json.dump({"speed_mbps": mbps, "slow": self.slow_internet, "very_slow": self.very_slow_internet, "timestamp": time.time()}, _f)
-            except:
+                if line.startswith('Download:'):
+                    download = round(float(line.split()[1]), 2)
+                elif line.startswith('Upload:'):
+                    upload = round(float(line.split()[1]), 2)
+            except (IndexError, ValueError):
                 pass
-        else:
+        return download, upload
+
+    def check_speed(self):
+        """Speed test via speedtest-cli measuring both download and upload (v1.16.0).
+
+        Thresholds chosen for Gravae arenas which upload video to cloud:
+          - slow_internet:      download < 30 Mbps  OR  upload < 5 Mbps
+          - very_slow_internet: download < 10 Mbps  OR  upload < 1 Mbps
+        Upload é o gargalo real — antes a gente só media download e perdia
+        casos como a Azulina (download 7 Mbps OK pra operar, upload 0.28 Mbps
+        inviabiliza envio de vídeo).
+        """
+        download, upload = self._run_speedtest()
+        if download is None and upload is None:
             log.warning("Speed test failed")
+            self.last_speed_test = time.time()
+            return
+
+        self.download_speed_mbps = download
+        self.upload_speed_mbps = upload
+        was_slow = self.slow_internet
+        was_very_slow = self.very_slow_internet
+
+        d_slow = download is not None and download < 30.0
+        u_slow = upload is not None and upload < 5.0
+        d_very = download is not None and download < 10.0
+        u_very = upload is not None and upload < 1.0
+        self.slow_internet = d_slow or u_slow
+        self.very_slow_internet = d_very or u_very
+
+        speed_str = f"↓{download} Mbps / ↑{upload} Mbps"
+        if self.very_slow_internet and not was_very_slow:
+            alerts.add("very_slow_internet", "critical", f"Internet muito lenta: {speed_str}",
+                       {"download_mbps": download, "upload_mbps": upload})
+        elif self.slow_internet and not was_slow:
+            alerts.add("slow_internet", "warning", f"Internet lenta: {speed_str}",
+                       {"download_mbps": download, "upload_mbps": upload})
+        elif not self.slow_internet and was_slow:
+            alerts.add("internet_recovered", "info", f"Internet normalizada: {speed_str}",
+                       {"download_mbps": download, "upload_mbps": upload})
+
+        label = '(muito lenta!)' if self.very_slow_internet else '(lenta)' if self.slow_internet else '(ok)'
+        log.info(f"Speed test: {speed_str} {label}")
+        try:
+            import json as _json
+            with open('/tmp/gravae_speed_test.json', 'w') as _f:
+                _json.dump({
+                    "download_mbps": download,
+                    "upload_mbps": upload,
+                    "speed_mbps": download,  # backwards compat (gravae_agent < v3.5)
+                    "slow": self.slow_internet,
+                    "very_slow": self.very_slow_internet,
+                    "timestamp": time.time(),
+                }, _f)
+        except Exception:
+            pass
         self.last_speed_test = time.time()
 
     def check_resources(self):
@@ -2198,7 +2238,7 @@ class PhoenixDaemon:
         last_gc = 0
         last_voltage_check = 0
         last_speed_test = 0
-        SPEED_TEST_INTERVAL = 4 * 60 * 60  # 4 hours
+        SPEED_TEST_INTERVAL = 6 * 60 * 60  # 6 hours (v1.16.0: era 4h)
         SHINOBI_EPIPE_CHECK_INTERVAL = 120  # 2 minutes
 
         while self.running:

@@ -5,16 +5,19 @@ Integrates with the existing gravae_agent.py HTTP handler.
 """
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
 import urllib.request
 import urllib.error
+import uuid
 from datetime import datetime, timezone
 
 from coaching_config import get_config, is_configured, update_config, save_config
 from coaching_shinobi import (
-    start_recording, stop_recording, find_recent_videos
+    start_recording, stop_recording, find_recent_videos,
+    _ensure_monitor_watching, get_monitor_rtsp_url,
 )
 from coaching_upload import UploadQueue
 
@@ -27,6 +30,8 @@ except ImportError:
 
 POLL_INTERVAL = 10  # seconds
 HLS_DIR = "/var/lib/gravae-coaching/hls"
+SEGMENT_DURATION_SECONDS = 6
+SEGMENT_WATCH_INTERVAL = 2
 
 
 def _remux_to_hls(video_files, output_dir, segment_duration=6):
@@ -147,6 +152,10 @@ class CoachingReviewModule:
         """Stop all threads gracefully."""
         log.info("Stopping module...")
         self._stop_event.set()
+        with self._lock:
+            sessions = list(self._active_sessions.items())
+        for session_id, session in sessions:
+            self._stop_ffmpeg_session(session_id, session, mark_uploading=False)
         if self._poll_thread and self._poll_thread.is_alive():
             self._poll_thread.join(timeout=10)
         if self._upload_thread and self._upload_thread.is_alive():
@@ -157,10 +166,26 @@ class CoachingReviewModule:
         """Get module status for the /coaching/status endpoint."""
         cfg = get_config()
         with self._lock:
-            active = dict(self._active_sessions)
+            active = {
+                sid: {
+                    'sessionId': s.get('sessionId'),
+                    'cameraId': s.get('cameraId'),
+                    'shinobiMonitorId': s.get('shinobiMonitorId'),
+                    'startedAt': s.get('startedAt'),
+                    'recordingId': s.get('recordingId'),
+                    'hlsDir': s.get('hlsDir'),
+                    'ffmpegRunning': bool(s.get('ffmpegProc') and s.get('ffmpegProc').poll() is None),
+                    'segmentsEnqueued': len(s.get('seenSegments', set())),
+                    'cloudRegistered': bool(s.get('recordingId')),
+                }
+                for sid, s in self._active_sessions.items()
+            }
             hls = {sid: {
-                'fileId': info['file_id'],
-                'totalSize': info['total_size'],
+                'fileId': info.get('file_id'),
+                'recordingId': info.get('recording_id'),
+                'totalSize': info.get('total_size', 0),
+                'needsRegistration': info.get('needs_registration', False),
+                'manifestEnqueued': info.get('manifest_enqueued', False),
                 'progress': self._upload_queue.get_session_progress(sid),
             } for sid, info in self._hls_uploads.items()}
 
@@ -714,7 +739,7 @@ class CoachingReviewModule:
     def _handle_cancel(self, handler, session_id):
         """Handle POST /coaching/cancel/:sessionId."""
         with self._lock:
-            session = self._active_sessions.get(session_id)
+            session = self._active_sessions.pop(session_id, None)
 
         if not session:
             handler._send_json(
@@ -722,12 +747,14 @@ class CoachingReviewModule:
             )
             return True
 
+        proc = session.get('ffmpegProc')
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
         monitor_id = session.get('shinobiMonitorId')
         if monitor_id:
             stop_recording(monitor_id)
-
-        with self._lock:
-            self._active_sessions.pop(session_id, None)
 
         self._update_session_status(session_id, 'canceled')
         handler._send_json({"success": True, "message": f"Session {session_id} canceled"})
@@ -744,6 +771,16 @@ class CoachingReviewModule:
                 self._poll_once()
             except Exception as e:
                 log.error(f"Poll error: {e}")
+
+            try:
+                self._stop_expired_sessions()
+            except Exception as e:
+                log.error(f"Local stop check error: {e}")
+
+            try:
+                self._recover_pending_hls_sessions()
+            except Exception as e:
+                log.error(f"Pending HLS recovery error: {e}")
 
             # Check HLS upload progress and report to API
             try:
@@ -772,6 +809,43 @@ class CoachingReviewModule:
             sessions = dict(self._hls_uploads)
 
         for session_id, info in sessions.items():
+            if info.get('needs_registration'):
+                session = info.get('session') or {}
+                if self._ensure_session_registered(session_id, session):
+                    self._scan_session_segments(session_id, session)
+                    manifest_enqueued = self._enqueue_final_manifest(session_id, session)
+                    with self._lock:
+                        if session_id in self._hls_uploads:
+                            self._hls_uploads[session_id].update({
+                                'file_id': session.get('fileId'),
+                                'recording_id': session.get('recordingId'),
+                                'r2_prefix': session.get('r2Prefix'),
+                                'needs_registration': False,
+                                'manifest_enqueued': manifest_enqueued,
+                                'total_size': self._hls_total_size(session.get('hlsDir')),
+                                'session': session,
+                            })
+                    info = {
+                        **info,
+                        'file_id': session.get('fileId'),
+                        'recording_id': session.get('recordingId'),
+                        'r2_prefix': session.get('r2Prefix'),
+                        'needs_registration': False,
+                        'manifest_enqueued': manifest_enqueued,
+                        'total_size': self._hls_total_size(session.get('hlsDir')),
+                    }
+                else:
+                    log.warning(f"Session {session_id} waiting for internet/cloud registration")
+                    continue
+
+            if not info.get('manifest_enqueued'):
+                session = info.get('session') or {}
+                if session.get('recordingId') and self._enqueue_final_manifest(session_id, session):
+                    with self._lock:
+                        if session_id in self._hls_uploads:
+                            self._hls_uploads[session_id]['manifest_enqueued'] = True
+                    info = {**info, 'manifest_enqueued': True}
+
             progress_info = self._upload_queue.get_session_progress(session_id)
             if not progress_info or progress_info['total'] == 0:
                 continue
@@ -813,6 +887,98 @@ class CoachingReviewModule:
         self._recover_orphaned_uploads()
 
     _recovered_sessions = set()  # Track already-recovered sessions to avoid repeats
+
+    def _recover_pending_hls_sessions(self):
+        """Rebuild in-memory upload tracking from SQLite/local HLS after restart."""
+        with self._lock:
+            tracked = set(self._hls_uploads.keys()) | set(self._active_sessions.keys())
+
+        # Re-track queued uploads that are not complete yet, so completion can
+        # still notify the cloud after an agent restart.
+        try:
+            from coaching_upload import _get_db
+            db = _get_db()
+            try:
+                rows = db.execute('''
+                    SELECT session_id,
+                           COUNT(*) as total,
+                           SUM(total_bytes) as total_bytes,
+                           MIN(CASE WHEN file_id NOT LIKE '_noreport_%' THEN file_id END) as file_id,
+                           MIN(r2_key) as any_key
+                    FROM uploads
+                    WHERE status IN ('pending', 'uploading', 'completed')
+                    GROUP BY session_id
+                ''').fetchall()
+            finally:
+                db.close()
+        except Exception as e:
+            log.warning(f"Could not inspect upload DB for recovery: {e}")
+            rows = []
+
+        with self._lock:
+            for session_id, _total, total_bytes, file_id, any_key in rows:
+                if session_id in tracked or not any_key or not str(any_key).startswith('proxy/'):
+                    continue
+                parts = str(any_key).split('/')
+                if len(parts) < 2:
+                    continue
+                recording_id = parts[1]
+                self._hls_uploads[session_id] = {
+                    'file_id': file_id or f"hls_{session_id}",
+                    'recording_id': recording_id,
+                    'r2_prefix': f"proxy/{recording_id}",
+                    'total_size': total_bytes or 0,
+                    'hls_dir': os.path.join(HLS_DIR, session_id),
+                    'mp4_paths': [],
+                    'needs_registration': False,
+                    'manifest_enqueued': True,
+                    'session': {
+                        'sessionId': session_id,
+                        'recordingId': recording_id,
+                        'fileId': file_id or f"hls_{session_id}",
+                        'r2Prefix': f"proxy/{recording_id}",
+                        'hlsDir': os.path.join(HLS_DIR, session_id),
+                        'seenSegments': set(),
+                        'segmentSizes': {},
+                    },
+                }
+                tracked.add(session_id)
+                log.info(f"Recovered queued HLS upload tracking: session={session_id}")
+
+        # Re-track local HLS dirs that never got cloud registration/upload rows.
+        if not os.path.isdir(HLS_DIR):
+            return
+
+        with self._lock:
+            tracked = set(self._hls_uploads.keys()) | set(self._active_sessions.keys())
+
+        for session_id in os.listdir(HLS_DIR):
+            hls_dir = os.path.join(HLS_DIR, session_id)
+            if session_id in tracked or not os.path.isdir(hls_dir):
+                continue
+            if not os.path.exists(os.path.join(hls_dir, 'manifest.m3u8')):
+                continue
+
+            session = {
+                'sessionId': session_id,
+                'hlsDir': hls_dir,
+                'seenSegments': set(),
+                'segmentSizes': {},
+            }
+            with self._lock:
+                if session_id not in self._hls_uploads and session_id not in self._active_sessions:
+                    self._hls_uploads[session_id] = {
+                        'file_id': None,
+                        'recording_id': None,
+                        'r2_prefix': None,
+                        'total_size': self._hls_total_size(hls_dir),
+                        'hls_dir': hls_dir,
+                        'mp4_paths': [],
+                        'needs_registration': True,
+                        'manifest_enqueued': False,
+                        'session': session,
+                    }
+                    log.info(f"Recovered local HLS directory waiting for cloud: session={session_id}")
 
     def _recover_orphaned_uploads(self):
         """Find sessions where all uploads completed but status was never
@@ -932,8 +1098,31 @@ class CoachingReviewModule:
             elif action == 'stop':
                 self._handle_stop_job(job)
 
+    def _stop_expired_sessions(self):
+        """Stop recordings locally when their planned duration ends.
+        This is the offline safety net: if the internet is down and the cloud
+        stop job cannot arrive, the Pi still closes the recording on time and
+        keeps the HLS files queued on disk."""
+        now = time.time()
+        expired = []
+        with self._lock:
+            for session_id, session in list(self._active_sessions.items()):
+                stop_at = session.get('localStopAt')
+                if stop_at and now >= stop_at:
+                    expired.append((session_id, self._active_sessions.pop(session_id)))
+
+        for session_id, session in expired:
+            monitor_id = session.get('shinobiMonitorId')
+            log.info(f"Local stop fired for session={session_id} monitor={monitor_id}")
+            if monitor_id:
+                try:
+                    stop_recording(monitor_id)
+                except Exception as e:
+                    log.warning(f"Failed to stop Shinobi monitor {monitor_id}: {e}")
+            self._stop_ffmpeg_session(session_id, session, mark_uploading=True)
+
     def _handle_start_job(self, job):
-        """Handle a 'start' recording job."""
+        """Handle a 'start' recording job with offline-safe live HLS capture."""
         session_id = job['sessionId']
 
         with self._lock:
@@ -943,16 +1132,59 @@ class CoachingReviewModule:
         monitor_id = job.get('shinobiMonitorId')
         duration = job.get('durationMinutes', 120)
         camera_id = job.get('cameraId')
+        local_stop_at = record_start = time.time()
+        try:
+            local_stop_at = record_start + (float(duration) * 60)
+        except Exception:
+            local_stop_at = record_start + (120 * 60)
 
         log.info(f"Starting recording: session={session_id} "
                  f"monitor={monitor_id} duration={duration}min")
 
-        # Record the start time before initiating recording
-        record_start = time.time()
+        hls_output_dir = os.path.join(HLS_DIR, session_id)
+        os.makedirs(hls_output_dir, exist_ok=True)
 
-        result = start_recording(monitor_id, duration)
+        try:
+            _ensure_monitor_watching(monitor_id)
+            rtsp_url = get_monitor_rtsp_url(monitor_id)
+            if not rtsp_url:
+                raise RuntimeError(f"Could not resolve RTSP URL for monitor {monitor_id}")
 
-        if result.get('success'):
+            manifest_path = os.path.join(hls_output_dir, 'manifest.m3u8')
+            segment_pattern = os.path.join(hls_output_dir, 'seg_%06d.ts')
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-hide_banner',
+                '-loglevel', 'warning',
+                '-rtsp_transport', 'tcp',
+                '-i', rtsp_url,
+                '-codec', 'copy',
+                '-f', 'hls',
+                '-hls_time', str(SEGMENT_DURATION_SECONDS),
+                '-hls_playlist_type', 'event',
+                '-hls_segment_filename', segment_pattern,
+                manifest_path,
+            ]
+
+            proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            time.sleep(3)
+            if proc.poll() is not None:
+                stderr = ''
+                try:
+                    stderr = proc.stderr.read().decode('utf-8', errors='replace')[-1000:]
+                except Exception:
+                    pass
+                raise RuntimeError(f"ffmpeg exited immediately: {stderr or proc.returncode}")
+
+            recording_info = self._try_register_hls_recording(session_id)
+            recording_id = recording_info.get('recording_id') if recording_info else None
+            file_id = recording_info.get('file_id') if recording_info else None
+            r2_prefix = f"proxy/{recording_id}" if recording_id else None
+
             with self._lock:
                 self._active_sessions[session_id] = {
                     'sessionId': session_id,
@@ -961,14 +1193,35 @@ class CoachingReviewModule:
                     'startedAt': datetime.now(timezone.utc).isoformat(),
                     'recordStartTime': record_start,
                     'durationMinutes': duration,
+                    'localStopAt': local_stop_at,
+                    'ffmpegProc': proc,
+                    'hlsDir': hls_output_dir,
+                    'recordingId': recording_id,
+                    'fileId': file_id,
+                    'r2Prefix': r2_prefix,
+                    'seenSegments': set(),
+                    'segmentSizes': {},
                 }
+
+            watcher = threading.Thread(
+                target=self._segment_watcher_loop,
+                args=(session_id,),
+                daemon=True,
+                name=f"hls-watch-{session_id[:8]}",
+            )
+            watcher.start()
+            with self._lock:
+                if session_id in self._active_sessions:
+                    self._active_sessions[session_id]['watcherThread'] = watcher
+
             self._update_session_status(session_id, 'running')
-        else:
-            log.error(f"Failed to start recording: {result.get('error')}")
-            self._update_session_status(session_id, 'failed', result.get('error'))
+            log.info(f"Live HLS capture started: session={session_id} pid={proc.pid}")
+        except Exception as e:
+            log.error(f"Failed to start live HLS recording: {e}")
+            self._update_session_status(session_id, 'failed', str(e))
 
     def _handle_stop_job(self, job):
-        """Handle a 'stop' recording job — stop recording, remux to HLS, enqueue upload."""
+        """Handle a 'stop' recording job — stop ffmpeg and keep/upload HLS files."""
         session_id = job['sessionId']
         monitor_id = job.get('shinobiMonitorId')
 
@@ -985,71 +1238,189 @@ class CoachingReviewModule:
             stop_recording(monitor_id)
 
         log.info(f"Recording stopped: session={session_id}")
-        self._update_session_status(session_id, 'processing')
+        self._stop_ffmpeg_session(session_id, session, mark_uploading=True)
 
-        # Find video files created during this session
-        record_start = session.get('recordStartTime', 0) if session else 0
-        videos = find_recent_videos(monitor_id, after_time=record_start)
+    def _segment_watcher_loop(self, session_id):
+        """Watch live HLS output and enqueue finalized segments without blocking recording."""
+        log.info(f"HLS watcher started: session={session_id}")
+        while not self._stop_event.is_set():
+            with self._lock:
+                session = self._active_sessions.get(session_id)
+            if not session:
+                break
 
-        if not videos:
-            log.error(f"No video files found for session {session_id}")
-            self._update_session_status(session_id, 'failed', 'No video files found')
-            return
+            try:
+                if not session.get('recordingId'):
+                    self._ensure_session_registered(session_id, session)
+                self._scan_session_segments(session_id, session)
+            except Exception as e:
+                log.warning(f"HLS watcher error for {session_id}: {e}")
 
-        # Remux MP4 to HLS segments (codec copy — no re-encoding)
-        hls_output_dir = os.path.join(HLS_DIR, session_id)
-        hls_result = _remux_to_hls(videos, hls_output_dir)
+            self._stop_event.wait(SEGMENT_WATCH_INTERVAL)
 
-        if not hls_result:
-            log.error(f"HLS remux failed for session {session_id}")
-            self._update_session_status(session_id, 'failed', 'HLS remux failed')
-            return
+        log.info(f"HLS watcher stopped: session={session_id}")
 
-        self._update_session_status(session_id, 'uploading')
+    def _scan_session_segments(self, session_id, session):
+        """Enqueue closed .ts segments. If offline/unregistered, keep files local."""
+        hls_dir = session.get('hlsDir')
+        recording_id = session.get('recordingId')
+        file_id = session.get('fileId')
+        r2_prefix = session.get('r2Prefix')
+        if not hls_dir or not os.path.isdir(hls_dir):
+            return 0
 
-        # Register recording with the cloud API (single manifest entry)
-        recording_info = self._register_recording(session_id, [{
-            'filename': 'manifest.m3u8',
-            'size': hls_result['total_size'],
-            'format': 'hls',
-            'segmentCount': len(hls_result['segments']),
-        }])
-
-        if not recording_info:
-            log.error(f"Failed to register recording for session {session_id}")
-            return
-
-        recording_id = recording_info.get('id')
-        files = recording_info.get('files', [])
-        file_id = files[0].get('id') if files else f"hls_{session_id}"
-
-        # Upload HLS to proxy bucket with proxy/{recordingId}/ prefix
-        # so the stream endpoint can serve them directly (no worker needed)
+        seen = session.setdefault('seenSegments', set())
+        sizes = session.setdefault('segmentSizes', {})
+        enqueued = 0
         cfg = get_config()
-        r2_prefix = f"proxy/{recording_id}"
         proxy_bucket = cfg.get('r2BucketProxy', 'coachingreview-proxy')
 
-        # Track HLS upload for progress reporting
+        for filename in sorted(os.listdir(hls_dir)):
+            if not filename.endswith('.ts') or filename in seen:
+                continue
+
+            path = os.path.join(hls_dir, filename)
+            try:
+                current_size = os.path.getsize(path)
+            except OSError:
+                continue
+
+            previous_size = sizes.get(filename)
+            sizes[filename] = current_size
+            if previous_size is None or current_size != previous_size or current_size <= 0:
+                continue
+
+            if not recording_id or not file_id or not r2_prefix:
+                # No cloud record yet. Leave the closed segment on disk and try
+                # registration again later; recording itself keeps running.
+                continue
+
+            segment_file_id = f"_noreport_{file_id}_{filename}"
+            r2_key = f"{r2_prefix}/{filename}"
+            if self._upload_queue.enqueue(session_id, segment_file_id, path, r2_key, proxy_bucket):
+                seen.add(filename)
+                enqueued += 1
+                log.info(f"Enqueued HLS segment: session={session_id} file={filename}")
+
+        return enqueued
+
+    def _stop_ffmpeg_session(self, session_id, session, mark_uploading=True):
+        """Stop local HLS capture. Upload may continue later if the internet is down."""
+        if not session:
+            return
+
+        proc = session.get('ffmpegProc')
+        if proc and proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                log.warning(f"ffmpeg did not exit cleanly for {session_id}; killing")
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception as e:
+                log.warning(f"Failed to stop ffmpeg for {session_id}: {e}")
+
+        # Give ffmpeg a moment to write the final segment and #EXT-X-ENDLIST.
+        time.sleep(2)
+
+        self._ensure_session_registered(session_id, session)
+        self._scan_session_segments(session_id, session)
+
+        hls_dir = session.get('hlsDir')
+        total_size = self._hls_total_size(hls_dir)
         with self._lock:
             self._hls_uploads[session_id] = {
-                'file_id': file_id,
-                'recording_id': recording_id,
-                'r2_prefix': r2_prefix,
-                'total_size': hls_result['total_size'],
-                'hls_dir': hls_output_dir,
-                'mp4_paths': [v['path'] for v in videos],
+                'file_id': session.get('fileId'),
+                'recording_id': session.get('recordingId'),
+                'r2_prefix': session.get('r2Prefix'),
+                'total_size': total_size,
+                'hls_dir': hls_dir,
+                'mp4_paths': [],
+                'needs_registration': not bool(session.get('recordingId')),
+                'manifest_enqueued': False,
+                'session': session,
             }
 
-        # Enqueue HLS segments + manifest for upload to proxy bucket
-        enqueued = self._upload_queue.enqueue_hls(
-            session_id=session_id,
-            file_id=file_id,
-            hls_dir=hls_output_dir,
-            r2_prefix=r2_prefix,
-            r2_bucket=proxy_bucket,
-        )
+        if session.get('recordingId'):
+            self._enqueue_final_manifest(session_id, session)
+            with self._lock:
+                if session_id in self._hls_uploads:
+                    self._hls_uploads[session_id]['manifest_enqueued'] = True
 
-        log.info(f"Enqueued {enqueued} HLS files for upload (session {session_id})")
+        if mark_uploading:
+            self._update_session_status(session_id, 'uploading')
+
+    def _ensure_session_registered(self, session_id, session):
+        """Try to create the cloud Recording. Failure is non-fatal/offline-safe."""
+        if session.get('recordingId'):
+            return True
+
+        recording_info = self._try_register_hls_recording(session_id)
+        if not recording_info:
+            return False
+
+        session['recordingId'] = recording_info['recording_id']
+        session['fileId'] = recording_info['file_id']
+        session['r2Prefix'] = f"proxy/{recording_info['recording_id']}"
+        log.info(f"Cloud recording registered: session={session_id} recording={session['recordingId']}")
+        return True
+
+    def _try_register_hls_recording(self, session_id):
+        recording_info = self._register_recording(session_id, [{
+            'filename': 'manifest.m3u8',
+            'size': 0,
+            'format': 'hls',
+        }])
+        if not recording_info:
+            return None
+
+        files = recording_info.get('files', [])
+        file_id = files[0].get('id') if files else f"hls_{session_id}"
+        return {
+            'recording_id': recording_info.get('id'),
+            'file_id': file_id,
+        } if recording_info.get('id') else None
+
+    def _enqueue_final_manifest(self, session_id, session):
+        hls_dir = session.get('hlsDir')
+        file_id = session.get('fileId')
+        r2_prefix = session.get('r2Prefix')
+        if not hls_dir or not file_id or not r2_prefix:
+            return False
+
+        # Catch any segment that stabilized only after the last scan.
+        for _ in range(2):
+            self._scan_session_segments(session_id, session)
+            time.sleep(1)
+
+        manifest_path = os.path.join(hls_dir, 'manifest.m3u8')
+        if not os.path.exists(manifest_path):
+            log.error(f"Manifest not found for session {session_id}: {manifest_path}")
+            return False
+
+        cfg = get_config()
+        proxy_bucket = cfg.get('r2BucketProxy', 'coachingreview-proxy')
+        return bool(self._upload_queue.enqueue(
+            session_id,
+            file_id,
+            manifest_path,
+            f"{r2_prefix}/manifest.m3u8",
+            proxy_bucket,
+        ))
+
+    def _hls_total_size(self, hls_dir):
+        if not hls_dir or not os.path.isdir(hls_dir):
+            return 0
+        total = 0
+        for filename in os.listdir(hls_dir):
+            path = os.path.join(hls_dir, filename)
+            if os.path.isfile(path) and (filename.endswith('.ts') or filename.endswith('.m3u8')):
+                try:
+                    total += os.path.getsize(path)
+                except OSError:
+                    pass
+        return total
 
     # ── Upload Loop ───────────────────────────────────────────────────────────
 

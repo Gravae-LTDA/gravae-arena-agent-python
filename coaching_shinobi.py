@@ -139,6 +139,58 @@ def _ensure_monitor_watching(monitor_id):
     return True
 
 
+def get_monitor_rtsp_url(monitor_id):
+    """Extract the RTSP URL from a Shinobi monitor without re-encoding.
+    Prefer details.auto_host when Shinobi has the full ONVIF URL, then fall
+    back to host/port/path plus optional credentials."""
+    api_key, group_key = _get_shinobi_creds()
+    if not api_key or not group_key:
+        return None
+
+    info = _shinobi_get(f"/{api_key}/monitor/{group_key}/{monitor_id}", timeout=10)
+    monitor = info[0] if isinstance(info, list) and info else info
+    if not isinstance(monitor, dict):
+        log.error(f"Unexpected monitor response for {monitor_id}")
+        return None
+
+    details = monitor.get('details', {})
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except Exception:
+            details = {}
+
+    auto_host = details.get('auto_host', '')
+    if auto_host and str(auto_host).startswith('rtsp://'):
+        return auto_host
+
+    protocol = monitor.get('protocol') or details.get('protocol') or 'rtsp'
+    host = monitor.get('host') or details.get('host') or ''
+    port = monitor.get('port') or details.get('port') or ''
+    path = monitor.get('path') or details.get('path') or ''
+    user = monitor.get('muser') or details.get('muser') or ''
+    password = monitor.get('mpass') or details.get('mpass') or ''
+
+    if not host:
+        log.error(f"Monitor {monitor_id} has no host/auto_host")
+        return None
+
+    if str(host).startswith('rtsp://'):
+        return host
+
+    auth = ''
+    if user:
+        auth = str(user)
+        if password:
+            auth += f":{password}"
+        auth += '@'
+
+    port_part = f":{port}" if port else ''
+    path = str(path or '').lstrip('/')
+    path_part = f"/{path}" if path else ''
+    return f"{protocol}://{auth}{host}{port_part}{path_part}"
+
+
 def start_recording(monitor_id, duration_minutes):
     """Start recording on a Shinobi monitor for a given duration.
     Uses Shinobi's built-in timed recording API.
