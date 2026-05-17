@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 
 # Centralized logging
 try:
@@ -1067,13 +1067,20 @@ ExecStart=/opt/gravae-agent/recovery.sh
         print(f"[SafeUpdate] Failed to install recovery service: {e}")
 
 def _startup_health_check():
-    """Background thread: if we're running after an update, wait 60s then mark as healthy."""
+    """Background thread: if we're running after an update, wait 60s then mark as healthy.
+    Also re-applies the RTSP timeout flag to any Shinobi monitor that's missing it —
+    closes the gap where a monitor added between updates wouldn't get the flag (the
+    boot-only `_fix_shinobi_monitors_stimeout` had already early-returned 30s into
+    the previous boot). This is the post-update reconciliation pass."""
     if not os.path.exists(UPDATE_FLAG_FILE):
         return
     print(f"[SafeUpdate] Post-update health check started (60s countdown)")
     time.sleep(60)
     # If we got here, the agent has been running for 60s = healthy
     _clear_update_backup()
+    # Re-apply RTSP timeout flag to any monitor that drifted (e.g. created on
+    # the OPS configurator since the last update).
+    _apply_stimeout_to_monitors(source="post-update")
 
 def perform_update():
     """Perform update - tries git pull first, falls back to direct download from GitHub"""
@@ -5312,26 +5319,22 @@ def _fix_mariadb_user_hosts():
         print(f"[MariaDB] User host fix error: {e}")
 
 
-def _fix_shinobi_monitors_stimeout():
-    """Add RTSP timeout to all Shinobi monitors to prevent FFmpeg from hanging
-    indefinitely when RTSP connections drop. Detects FFmpeg version to use the
-    correct flag (-stimeout for FFmpeg <7, -timeout for FFmpeg >=7).
-    Uses MySQL JSON_SET to update only the cust_input field.
-    Runs in a background thread on startup with a delay to let Shinobi start."""
-    import time
-    time.sleep(30)  # Wait for Shinobi to be ready
-
+def _apply_stimeout_to_monitors(source="startup"):
+    """Synchronous core: scan Monitors for missing/wrong RTSP timeout flag and patch.
+    Returns count of monitors updated (0 if all already correct, -1 on error).
+    `source` is a short tag included in log lines so we can distinguish startup
+    runs from post-update runs."""
     group_key = CONFIG.get('shinobiGroupKey')
     if not group_key:
-        return
+        return -1
 
     try:
         timeout_flag = _get_ffmpeg_timeout_flag()
 
         db_config = get_shinobi_db_config()
         if not db_config:
-            print("[Shinobi] Cannot read DB config for timeout fix")
-            return
+            print(f"[Shinobi/{source}] Cannot read DB config for timeout fix")
+            return -1
 
         db_name = db_config.get('database', 'ccio')
         env = os.environ.copy()
@@ -5351,7 +5354,7 @@ def _fix_shinobi_monitors_stimeout():
 
         count = int(check.stdout.strip()) if check.returncode == 0 and check.stdout.strip() else 0
         if count == 0:
-            return  # All monitors already have the correct timeout
+            return 0  # All monitors already have the correct timeout
 
         # Update all monitors that need fixing in one query
         result = subprocess.run(
@@ -5367,11 +5370,25 @@ def _fix_shinobi_monitors_stimeout():
         if result.returncode == 0:
             # Restart Shinobi to apply the new FFmpeg flags
             subprocess.run(['sudo', 'pm2', 'restart', 'all'], capture_output=True, timeout=30)
-            print(f"[Shinobi] Added '{timeout_flag} 5000000' to {count} monitor(s), restarted Shinobi")
+            print(f"[Shinobi/{source}] Added '{timeout_flag} 5000000' to {count} monitor(s), restarted Shinobi")
+            return count
         else:
-            print(f"[Shinobi] Failed to update monitors: {result.stderr}")
+            print(f"[Shinobi/{source}] Failed to update monitors: {result.stderr}")
+            return -1
     except Exception as e:
-        print(f"[Shinobi] timeout fix error: {e}")
+        print(f"[Shinobi/{source}] timeout fix error: {e}")
+        return -1
+
+
+def _fix_shinobi_monitors_stimeout():
+    """Background thread on every boot: wait 30s for Shinobi, then patch the
+    RTSP timeout flag on any monitor missing it (-stimeout for ffmpeg <7,
+    -timeout for ffmpeg >=7). The original at-boot pass; the post-update path
+    runs a second pass inside `_startup_health_check` after the safe-update
+    countdown to also catch monitors created between updates."""
+    import time
+    time.sleep(30)  # Wait for Shinobi to be ready
+    _apply_stimeout_to_monitors(source="startup")
 
 
 def get_phoenix_monitors():
