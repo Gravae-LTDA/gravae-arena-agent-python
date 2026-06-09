@@ -35,7 +35,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.0"
+VERSION = "1.15.1"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -2004,6 +2004,10 @@ class WebhookSender:
 
         headers = {
             "Authorization": f"Bearer {WEBHOOK_SECRET}",
+            # Cloudflare blocks the default Python-urllib User-Agent with error
+            # 1010 (HTTP 403) as if it were a bot, so every webhook silently
+            # failed fleet-wide. A non-library User-Agent passes the bot check.
+            "User-Agent": "curl/7.88.1",
             "X-Phoenix-Timestamp": str(int(time.time())),
             "X-Phoenix-Event-Id": str(uuid.uuid4()),
             "Content-Type": "application/json",
