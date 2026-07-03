@@ -26,7 +26,13 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.5.1"
+VERSION = "3.5.2"
+
+# PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
+# com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
+_PM2_HOME = "/root/.pm2"
+def _pm2_env():
+    return {**os.environ, "PM2_HOME": _PM2_HOME, "HOME": "/root"}
 
 # Centralized logging
 try:
@@ -1735,7 +1741,7 @@ def _restart_shinobi():
     restarted = False
     for name in pm2_names:
         result = subprocess.run(['pm2', 'restart', name],
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, timeout=30, env=_pm2_env())
         if result.returncode == 0:
             print(f"[FTP Events] Restarted Shinobi via pm2 ({name})")
             restarted = True
@@ -2175,7 +2181,7 @@ def shinobi_monitor_restart(mid, group_key=None):
     try:
         result = subprocess.run(
             ['pm2', 'restart', 'camera'],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=_pm2_env(),
         )
         if result.returncode != 0:
             return {"success": False, "method": "pm2", "error": result.stderr.strip()[:400]}
@@ -2278,7 +2284,7 @@ def ensure_super_admin_token():
             # Shinobi reads super.json only at startup — must restart for new token to work
             print("[Shinobi Super] Restarting Shinobi to load updated super.json...")
             try:
-                result = subprocess.run(['sudo', 'pm2', 'restart', 'all'], capture_output=True, text=True, timeout=15)
+                result = subprocess.run(['pm2', 'restart', 'all'], capture_output=True, text=True, timeout=15, env=_pm2_env())
                 if result.returncode == 0:
                     print("[Shinobi Super] Shinobi restarted via pm2")
                 else:
@@ -5046,8 +5052,8 @@ def _fix_shinobi_pm2_cwd():
             return
 
         result = subprocess.run(
-            ['sudo', 'pm2', 'jlist'],
-            capture_output=True, text=True, timeout=10
+            ['pm2', 'jlist'],
+            capture_output=True, text=True, timeout=10, env=_pm2_env()
         )
         if result.returncode != 0 or not result.stdout.strip():
             return
