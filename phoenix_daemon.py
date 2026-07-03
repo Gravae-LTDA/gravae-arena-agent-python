@@ -35,7 +35,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.3"
+VERSION = "1.15.4"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -465,12 +465,19 @@ class ServiceGuardian:
         return self._run_pm2_jlist()
 
     def _cleanup_duplicate_pm2_daemons(self):
-        """Kill any PM2 God daemon NOT running under the canonical PM2_HOME (/root/.pm2).
+        """Keep ONLY the canonical PM2 God daemon and kill every other one.
 
-        Fixes Bug6 at the source: stray daemons (usually spawned under
-        /home/<arena_user>/.pm2 by an old `sudo -u <user> pm2` call) hold orphan
-        camera/cron processes and break resurrection on reboot. PM2 encodes its home
-        in the God Daemon process title: "PM2 v<ver>: God Daemon (/home/x/.pm2)"."""
+        Fixes Bug6 at the source. Duplicates come in two flavours, both handled here:
+          - cross-home: spawned under /home/<user>/.pm2 by an old `sudo -u <user> pm2`
+          - same-home orphan: a stale daemon left in /root/.pm2 after a socket reset
+        The canonical daemon is the PID recorded in <PM2_HOME>/pm2.pid (the one PM2 is
+        actually talking to). Everything else is stray and gets SIGKILLed."""
+        canonical_pid = None
+        try:
+            with open(os.path.join(PM2_HOME, "pm2.pid")) as fh:
+                canonical_pid = int(fh.read().strip())
+        except Exception:
+            canonical_pid = None
         try:
             result = subprocess.run(
                 ["ps", "-eo", "pid,args"],
@@ -479,28 +486,42 @@ class ServiceGuardian:
         except Exception as e:
             log.debug(f"[pm2-dedup] ps failed: {e}")
             return
-        killed = 0
+        daemons = []  # list of (pid, home)
         for line in result.stdout.splitlines():
             if "God Daemon" not in line or "PM2" not in line:
                 continue
-            # Extract the home path from the trailing "(...)" of the process title.
+            try:
+                pid = int(line.split(None, 1)[0])
+            except Exception:
+                continue
             home = None
             if line.rstrip().endswith(")") and "(" in line:
                 home = line[line.rfind("(") + 1:line.rfind(")")].strip()
-            if not home or home == PM2_HOME:
-                continue  # canonical daemon (or home unknown) — leave it alone
+            daemons.append((pid, home))
+        if len(daemons) <= 1:
+            return
+        # Decide the single daemon to KEEP.
+        keep = None
+        if canonical_pid and any(pid == canonical_pid for pid, _ in daemons):
+            keep = canonical_pid
+        else:
+            root_ones = [pid for pid, home in daemons if home == PM2_HOME]
+            keep = root_ones[0] if root_ones else daemons[0][0]
+        killed = 0
+        for pid, home in daemons:
+            if pid == keep:
+                continue
             try:
-                pid = int(line.split(None, 1)[0])
                 os.kill(pid, signal.SIGKILL)
                 killed += 1
-                log.warning(f"[pm2-dedup] killed stray PM2 daemon pid={pid} home={home}")
+                log.warning(f"[pm2-dedup] killed stray PM2 daemon pid={pid} home={home} (kept pid={keep})")
             except Exception as e:
-                log.error(f"[pm2-dedup] failed to kill stray daemon '{line.strip()}': {e}")
+                log.error(f"[pm2-dedup] failed to kill stray daemon pid={pid}: {e}")
         if killed:
             alerts.add(
                 "pm2_duplicate_cleaned",
                 "warning",
-                f"Removed {killed} stray PM2 daemon(s) not under {PM2_HOME}",
+                f"Removed {killed} stray PM2 daemon(s), kept canonical pid={keep}",
                 {"killed": killed}
             )
 
