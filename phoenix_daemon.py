@@ -35,7 +35,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.1"
+VERSION = "1.15.2"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -65,6 +65,17 @@ DHCPCD_BACKUP = Path("/etc/dhcpcd.conf.gravae-backup")
 
 # Shinobi directories (try both common locations)
 SHINOBI_DIRS = [Path("/home/Shinobi"), Path("/opt/shinobi")]
+
+# PM2: Shinobi's canonical PM2 lives as root under a single PM2_HOME.
+# Running pm2 without a fixed PM2_HOME, or as the arena user (`sudo -u <user> pm2`),
+# spawns a SECOND PM2 God daemon under a different home (e.g. /home/<user>/.pm2).
+# Those stray daemons are the root cause of Bug6 (multiple pm2 daemons): they hold
+# orphan camera/cron processes and break resurrection on reboot. Always pin root + this home.
+PM2_HOME = "/root/.pm2"
+
+def _pm2_env():
+    """Environment for every pm2 subprocess call: pin root's canonical PM2_HOME."""
+    return {**os.environ, "PM2_HOME": PM2_HOME, "HOME": "/root"}
 
 # Connectivity check targets
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
@@ -389,31 +400,22 @@ class ServiceGuardian:
         return "gravae"
 
     def _run_pm2_jlist(self):
-        """Run pm2 jlist, trying as root first then as the arena user."""
-        # Try as root (Phoenix runs as root)
+        """Run `pm2 jlist` as root under the canonical PM2_HOME.
+
+        Never falls back to `sudo -u <arena_user> pm2`: that spawns a second PM2
+        God daemon under /home/<user>/.pm2 just to list — the root cause of Bug6
+        (multiple pm2 daemons). Stray daemons are cleaned by _cleanup_duplicate_pm2_daemons()."""
         try:
             result = subprocess.run(
                 ["pm2", "jlist"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10,
+                env=_pm2_env()
             )
             if result.returncode == 0 and result.stdout.strip():
                 procs = json.loads(result.stdout)
                 if procs:
                     return procs
-        except:
-            pass
-        # Try as arena user (Shinobi PM2 may run under gravae/replayme)
-        user = self._get_arena_user()
-        try:
-            result = subprocess.run(
-                ["sudo", "-u", user, "pm2", "jlist"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                procs = json.loads(result.stdout)
-                if procs:
-                    return procs
-        except:
+        except Exception:
             pass
         return []
 
@@ -459,8 +461,48 @@ class ServiceGuardian:
         return None
 
     def _get_pm2_processes(self):
-        """Get list of PM2 processes (checks both root and arena user)"""
+        """Get list of PM2 processes from the canonical root PM2_HOME."""
         return self._run_pm2_jlist()
+
+    def _cleanup_duplicate_pm2_daemons(self):
+        """Kill any PM2 God daemon NOT running under the canonical PM2_HOME (/root/.pm2).
+
+        Fixes Bug6 at the source: stray daemons (usually spawned under
+        /home/<arena_user>/.pm2 by an old `sudo -u <user> pm2` call) hold orphan
+        camera/cron processes and break resurrection on reboot. PM2 encodes its home
+        in the God Daemon process title: "PM2 v<ver>: God Daemon (/home/x/.pm2)"."""
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "pid,args"],
+                capture_output=True, text=True, timeout=10
+            )
+        except Exception as e:
+            log.debug(f"[pm2-dedup] ps failed: {e}")
+            return
+        killed = 0
+        for line in result.stdout.splitlines():
+            if "God Daemon" not in line or "PM2" not in line:
+                continue
+            # Extract the home path from the trailing "(...)" of the process title.
+            home = None
+            if line.rstrip().endswith(")") and "(" in line:
+                home = line[line.rfind("(") + 1:line.rfind(")")].strip()
+            if not home or home == PM2_HOME:
+                continue  # canonical daemon (or home unknown) — leave it alone
+            try:
+                pid = int(line.split(None, 1)[0])
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+                log.warning(f"[pm2-dedup] killed stray PM2 daemon pid={pid} home={home}")
+            except Exception as e:
+                log.error(f"[pm2-dedup] failed to kill stray daemon '{line.strip()}': {e}")
+        if killed:
+            alerts.add(
+                "pm2_duplicate_cleaned",
+                "warning",
+                f"Removed {killed} stray PM2 daemon(s) not under {PM2_HOME}",
+                {"killed": killed}
+            )
 
     def restart_pm2_process(self, service_name):
         """Restart PM2 processes for a service, with fallback to re-register if PM2 list is empty.
@@ -485,59 +527,42 @@ class ServiceGuardian:
             return False
 
         pm2_names = SERVICES.get(service_name, {}).get("pm2_names", [service_name])
+
+        # Repair/prevent Bug6 before doing anything: remove any PM2 God daemon that
+        # is NOT the canonical /root/.pm2 one, so we always act on a single daemon.
+        self._cleanup_duplicate_pm2_daemons()
+
         processes = self._get_pm2_processes()
         registered_names = {p.get("name", "").lower() for p in processes}
-
-        # Detect which user owns the PM2 processes (root or arena user)
-        pm2_user = None
-        for proc in processes:
-            if proc.get("name", "").lower() in [n.lower() for n in pm2_names]:
-                pm2_user = proc.get("pm2_env", {}).get("username")
-                break
-        # Build pm2 command prefix: use sudo -u if PM2 runs as non-root
-        def pm2_cmd(args):
-            if pm2_user and pm2_user != "root":
-                return ["sudo", "-u", pm2_user, "pm2"] + args
-            return ["pm2"] + args
 
         # Check if any of the expected PM2 processes are registered
         any_registered = any(n.lower() in registered_names for n in pm2_names)
 
         if any_registered:
-            # Processes exist in PM2 — just restart them
-            log.info(f"Restarting PM2 processes for {service_name}: {pm2_names} as user={pm2_user or 'root'} (attempt {attempts + 1})")
+            # Processes exist in PM2 — just restart them (always root + canonical PM2_HOME)
+            log.info(f"Restarting PM2 processes for {service_name}: {pm2_names} (attempt {attempts + 1})")
             for pm2_name in pm2_names:
                 try:
                     result = subprocess.run(
-                        pm2_cmd(["restart", pm2_name]),
-                        capture_output=True, text=True, timeout=30
+                        ["pm2", "restart", pm2_name],
+                        capture_output=True, text=True, timeout=30,
+                        env=_pm2_env()
                     )
                     if result.returncode != 0:
                         log.error(f"pm2 restart {pm2_name} failed: {result.stderr.strip()}")
                 except Exception as e:
                     log.error(f"Error running pm2 restart {pm2_name}: {e}")
         else:
-            # PM2 process list is empty or processes not registered — re-register from scratch
-            # Detect user: check who owns the Shinobi directory
+            # PM2 process list is empty or processes not registered — re-register from scratch.
+            # Always register as root under the canonical PM2_HOME (never `sudo -u <user>`,
+            # which would spawn a second God daemon under that user's home = Bug6).
             shinobi_dir = self._find_shinobi_dir()
             if not shinobi_dir:
                 log.error(f"Cannot find Shinobi directory to re-register PM2 processes")
                 self.restart_attempts[service_name] = (attempts + 1, now)
                 return False
 
-            owner = None
-            try:
-                import pwd
-                owner = pwd.getpwuid(shinobi_dir.stat().st_uid).pw_name
-            except:
-                owner = self._get_arena_user()
-
-            def pm2_cmd_new(args):
-                if owner and owner != "root":
-                    return ["sudo", "-u", owner, "pm2"] + args
-                return ["pm2"] + args
-
-            log.warning(f"PM2 processes for {service_name} not registered, re-registering as user={owner or 'root'} (attempt {attempts + 1})")
+            log.warning(f"PM2 processes for {service_name} not registered, re-registering as root (attempt {attempts + 1})")
 
             for pm2_name in pm2_names:
                 script = shinobi_dir / f"{pm2_name}.js"
@@ -550,9 +575,9 @@ class ServiceGuardian:
                     # cwd (e.g. /opt/gravae-agent) makes camera.js crash loop trying to read
                     # /opt/gravae-agent/languages/en_CA.json.
                     result = subprocess.run(
-                        pm2_cmd_new(["start", str(script), "--name", pm2_name]),
+                        ["pm2", "start", str(script), "--name", pm2_name],
                         capture_output=True, text=True, timeout=30,
-                        cwd=str(shinobi_dir)
+                        cwd=str(shinobi_dir), env=_pm2_env()
                     )
                     if result.returncode != 0:
                         log.error(f"pm2 start {script} failed: {result.stderr.strip()}")
@@ -563,9 +588,10 @@ class ServiceGuardian:
 
             # Save PM2 process list so it persists across reboots
             try:
-                subprocess.run(pm2_cmd_new(["save"]), capture_output=True, timeout=10, cwd=str(shinobi_dir))
+                subprocess.run(["pm2", "save"], capture_output=True, timeout=10,
+                               cwd=str(shinobi_dir), env=_pm2_env())
                 log.info("PM2 process list saved")
-            except:
+            except Exception:
                 log.warning("Failed to save PM2 process list")
 
         self.restart_attempts[service_name] = (attempts + 1, now)
