@@ -35,7 +35,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.2"
+VERSION = "1.15.3"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -2200,6 +2200,12 @@ class PhoenixDaemon:
         # Clean up legacy files from older versions
         self._cleanup_legacy_files()
 
+        # Bug6 self-heal: kill any duplicate PM2 God daemons on startup (also periodic below).
+        try:
+            self.service_guardian._cleanup_duplicate_pm2_daemons()
+        except Exception:
+            pass
+
         # sd_notify kept for backwards compatibility (no-op if service is Type=simple)
         def sd_notify(msg):
             try:
@@ -2238,6 +2244,7 @@ class PhoenixDaemon:
 
                 # Service check (every 2 minutes)
                 if now - last_service_check >= CHECK_INTERVAL:
+                    self.service_guardian._cleanup_duplicate_pm2_daemons()
                     self.service_guardian.check_all_services_v2()
                     last_service_check = now
 
