@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.5.2"
+VERSION = "3.6.0"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -4421,6 +4421,40 @@ def discover_cameras():
         print(f"[CameraDiscovery] ONVIF found {len(results) - sadp_dhip_count} additional devices")
     except Exception as e:
         print(f"[CameraDiscovery] ONVIF error: {e}")
+
+    # 4. Reolink scan - Reolink nao responde SADP/DHIP e sai de fabrica com ONVIF OFF,
+    #    entao some das descobertas acima. Varre o /24 local pela api.cgi do Reolink
+    #    (assinatura: JSON com "cmd":"GetDevInfo" + rspCode).
+    try:
+        import urllib.request
+        from concurrent.futures import ThreadPoolExecutor
+        if local_ip and local_ip.count('.') == 3:
+            subnet = local_ip.rsplit('.', 1)[0]
+            existing = {r['ip'] for r in results}
+            def _probe_reolink(n):
+                ip = subnet + '.' + str(n)
+                if ip in existing:
+                    return None
+                try:
+                    with urllib.request.urlopen('http://' + ip + '/cgi-bin/api.cgi?cmd=GetDevInfo', timeout=2) as resp:
+                        body = resp.read(600).decode('utf-8', 'ignore')
+                    if '"cmd"' in body and 'GetDevInfo' in body:
+                        model = ''
+                        try:
+                            model = json.loads(body)[0].get('value', {}).get('DevInfo', {}).get('model', '')
+                        except Exception:
+                            pass
+                        return {'ip': ip, 'brand': 'Reolink', 'model': model, 'mac': ''}
+                except Exception:
+                    return None
+                return None
+            with ThreadPoolExecutor(max_workers=50) as ex:
+                for cam in ex.map(_probe_reolink, range(1, 255)):
+                    if cam and cam['ip'] not in {r['ip'] for r in results}:
+                        results.append(cam)
+            print("[CameraDiscovery] Reolink scan done")
+    except Exception as e:
+        print("[CameraDiscovery] Reolink scan error: " + str(e))
 
     print(f"[CameraDiscovery] Total found: {len(results)} cameras")
     return {"success": True, "cameras": results}
