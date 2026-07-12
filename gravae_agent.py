@@ -1772,6 +1772,55 @@ def _restart_shinobi():
     print("[FTP Events] Warning: Shinobi did not respond after 60s")
     return True  # continue anyway
 
+def ensure_journald_persistent():
+    """Ensure systemd-journald keeps logs across reboots (Storage=persistent).
+
+    Many RPi images ship journald as volatile, so every reboot wipes the journal.
+    That erases the button daemon's [PRESS]/[HTTP] history and agent logs right
+    when they're needed to diagnose a freeze that the customer 'fixed' by
+    power-cycling -- making the press-vs-event cross-check impossible after the
+    fact. Persistent storage keeps that history so a recurrence can be proven
+    instead of guessed. Idempotent: only acts when not already persistent.
+    """
+    time.sleep(25)  # let the system settle before restarting journald
+    try:
+        conf = "/etc/systemd/journald.conf"
+        try:
+            with open(conf, "r") as f:
+                cur = f.read()
+        except Exception:
+            cur = ""
+        already = any(l.strip() == "Storage=persistent" for l in cur.splitlines())
+        if already and os.path.isdir("/var/log/journal"):
+            return
+        subprocess.run(["sudo", "mkdir", "-p", "/var/log/journal"], check=False, timeout=10)
+        lines = cur.splitlines()
+        replaced = False
+        for i, l in enumerate(lines):
+            if l.lstrip("#").strip().startswith("Storage="):
+                lines[i] = "Storage=persistent"
+                replaced = True
+                break
+        if not replaced:
+            lines.append("Storage=persistent")
+        new_conf = "\n".join(lines) + "\n"
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix="_journald.conf") as tf:
+            tf.write(new_conf)
+            tmp = tf.name
+        subprocess.run(["sudo", "cp", tmp, conf], check=False, timeout=10)
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        subprocess.run(["sudo", "systemd-tmpfiles", "--create", "--prefix", "/var/log/journal"],
+                       check=False, timeout=15)
+        subprocess.run(["sudo", "systemctl", "restart", "systemd-journald"], check=False, timeout=20)
+        print("[journald] Set Storage=persistent and restarted systemd-journald")
+    except Exception as e:
+        print(f"[journald] ensure persistent failed: {e}")
+
+
 def setup_ftp_events():
     """Install ftp-srv and enable FTP event server in Shinobi for alarm input cameras.
     This runs in the foreground. For background execution, use setup_ftp_events_async().
@@ -5545,6 +5594,10 @@ def main():
 
     # Fix Shinobi monitors: add RTSP timeout to prevent stale streams (background, 30s delay)
     threading.Thread(target=_fix_shinobi_monitors_stimeout, daemon=True).start()
+
+    # Keep journald logs across reboots so button/agent history survives a
+    # power-cycle and freezes can be diagnosed (press-vs-event). Idempotent.
+    threading.Thread(target=ensure_journald_persistent, daemon=True).start()
 
     # Start coaching review module if configured
     if _coaching_module and _coaching_module.is_configured():
