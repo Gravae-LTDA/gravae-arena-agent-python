@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.5.5"
+VERSION = "3.5.6"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -1820,6 +1820,36 @@ def ensure_journald_persistent():
         print("[journald] Set Storage=persistent and restarted systemd-journald")
     except Exception as e:
         print(f"[journald] ensure persistent failed: {e}")
+
+
+def ensure_shinobi_probe_disabled():
+    """Ensure probeMonitorOnStart:false in Shinobi's conf.json.
+
+    Root cause of the recurring "aperto retorna 200 mas nao gera evento/video" bug:
+    with probeMonitorOnStart ON (Shinobi's factory default), every monitor (re)start
+    runs a 2s ffprobe first; if it fails/times out (network blip, camera reconnecting)
+    Shinobi aborts registering the monitor in s.group[].activeMonitors -- the stream
+    keeps running but button triggers hit /motion/, return HTTP 200, and are silently
+    dropped ("No Monitor Found, Ignoring Request"). Only a full camera.js restart
+    re-registers, so "reinicia e volta mas repete". Runs on every agent start
+    (idempotent) so it covers fresh installs (removes the factory default), updates on
+    existing arenas, and SD swaps.
+    """
+    time.sleep(22)  # let Shinobi settle after boot before possibly restarting it
+    try:
+        shinobi_dir = _find_shinobi_dir()
+        conf_path = os.path.join(shinobi_dir, 'conf.json')
+        if not os.path.exists(conf_path):
+            return
+        with open(conf_path, 'r') as f:
+            conf = json.load(f)
+        if conf.get('probeMonitorOnStart') is False:
+            return  # already disabled, nothing to do
+        if _modify_conf_json(shinobi_dir, {'probeMonitorOnStart': False}):
+            print("[Shinobi] Set probeMonitorOnStart=false in conf.json; restarting Shinobi")
+            _restart_shinobi()
+    except Exception as e:
+        print(f"[Shinobi] ensure probeMonitorOnStart failed: {e}")
 
 
 def setup_ftp_events():
@@ -5614,6 +5644,11 @@ def main():
     # Keep journald logs across reboots so button/agent history survives a
     # power-cycle and freezes can be diagnosed (press-vs-event). Idempotent.
     threading.Thread(target=ensure_journald_persistent, daemon=True).start()
+
+    # Ensure Shinobi probeMonitorOnStart=false so a failed 2s ffprobe on a monitor
+    # (re)start can no longer unregister it from activeMonitors (aperto 200 sem
+    # evento). Idempotent: cobre install de fabrica, update e troca de SD.
+    threading.Thread(target=ensure_shinobi_probe_disabled, daemon=True).start()
 
     # Ultra Watch: retoma o modo observacao se estava ativo antes do restart.
     threading.Thread(target=observation_mode.resume_if_enabled, daemon=True).start()
