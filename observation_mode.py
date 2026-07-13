@@ -2,11 +2,12 @@
 Ultra Watch (Modo Observação) — módulo orquestrado pelo gravae_agent.
 
 Loop de alta frequência (default 45s) que, quando ATIVO, manda heartbeat pro OPS
-e roda checks; cada anomalia vira um POST /report (autenticado por HMAC com o
-segredo por-device). Estado persiste em /etc/gravae/observation.json (sobrevive a
-restart). NUNCA mexe em rede/reboot.
+e roda checks locais baratos (Pi 3B friendly); cada anomalia vira um POST /report
+(autenticado por HMAC com o segredo por-device). Estado persiste em
+/etc/gravae/observation.json (sobrevive a restart). NUNCA mexe em rede/reboot.
 
 Fase 1: heartbeat + service_down + press_without_video.
+Fase 2: monitor_died + camera_frozen + gpio_idle_24h + gpio_stuck.
 """
 import os
 import re
@@ -21,14 +22,24 @@ import urllib.error
 from datetime import datetime, timezone
 
 STATE_PATH = "/etc/gravae/observation.json"
+DEVICE_PATH = "/etc/gravae/device.json"
 DEFAULT_INTERVAL = 45
-OBS_VERSION = "1.0.0"
+OBS_VERSION = "1.1.0"
+
+# Fase 2 — parâmetros dos checks (conservadores p/ evitar falso-positivo).
+SNAP_EVERY = 6            # reamostra snapshot a cada N ciclos (~4.5min @ 45s)
+FROZEN_SAMPLES = 3        # nº de amostras idênticas seguidas p/ "congelado" (~13min)
+GPIO_STUCK_PER_3MIN = 40  # apertos no mesmo GPIO em 3min ⇒ botão preso/bouncing
+IDLE_HOURS = 24           # botão sem aperto há mais que isto...
+ACTIVE_RECENT_HOURS = 2   # ...enquanto a arena teve aperto nas últimas 2h
 
 _state = {}
 _thread = None
 _stop = threading.Event()
 _lock = threading.Lock()
-_consecutive = {}  # dedupKey -> ciclos consecutivos
+_consecutive = {}   # dedupKey -> ciclos consecutivos
+_snap = {}          # mid -> {"hash": str, "identical": int}
+_cyc = 0            # contador de ciclos
 
 
 def _log(msg):
@@ -93,7 +104,7 @@ def _local_get(path):
 
 def get_serial():
     try:
-        with open("/etc/gravae/device.json") as f:
+        with open(DEVICE_PATH) as f:
             d = json.load(f)
             if d.get("deviceSerial"):
                 return d["deviceSerial"]
@@ -108,34 +119,26 @@ def get_serial():
     return "unknown"
 
 
-# ---------------------------------------------------------------- checks
-def check_service_down():
-    out = []
-    st = _local_get("/phoenix/status")
-    if not st:
-        return out
-    services = st.get("services", {}) or {}
-    for name, ok in services.items():
-        if ok is False:
-            out.append({
-                "type": "service_down",
-                "severity": "critical",
-                "detail": f"serviço {name} caído",
-                "evidence": {"service": name},
-                "dedupKey": f"service_down:{name}",
-            })
-    return out
+def _shinobi_creds():
+    try:
+        with open(DEVICE_PATH) as f:
+            d = json.load(f)
+        return d.get("shinobiApiKey"), d.get("shinobiGroupKey")
+    except Exception:
+        return None, None
 
 
+# ---------------------------------------------------------------- presses
 _PRESS_RE = re.compile(r"\[PRESS\]\s+\S+\s+-\s+GPIO(\d+)\s+-\s+(\S+)")
 
 
 def _recent_presses(minutes=3):
-    """{monitor_name: last_press_epoch} pelos logs [PRESS] do journald."""
+    """{monitor_name: {"last": epoch, "count": n}} pelos logs [PRESS] do journald."""
     out = {}
     try:
         res = subprocess.run(
-            ["journalctl", "-u", "gravae-buttons", "--since", f"-{minutes} min", "-o", "short-unix", "--no-pager"],
+            ["journalctl", "-u", "gravae-buttons", "--since", f"-{minutes} min",
+             "-o", "short-unix", "--no-pager"],
             capture_output=True, text=True, timeout=15,
         )
         for line in res.stdout.splitlines():
@@ -147,17 +150,35 @@ def _recent_presses(minutes=3):
             except Exception:
                 continue
             mon = m.group(2)
-            out[mon] = max(out.get(mon, 0), ts)
+            rec = out.setdefault(mon, {"last": 0.0, "count": 0})
+            rec["last"] = max(rec["last"], ts)
+            rec["count"] += 1
     except Exception:
         pass
     return out
 
 
-def check_press_without_video(tolerance=20):
+# ---------------------------------------------------------------- checks
+def check_service_down():
+    out = []
+    st = _local_get("/phoenix/status")
+    if not st:
+        return out
+    for name, ok in (st.get("services", {}) or {}).items():
+        if ok is False:
+            out.append({
+                "type": "service_down", "severity": "critical",
+                "detail": f"serviço {name} caído",
+                "evidence": {"service": name},
+                "dedupKey": f"service_down:{name}",
+            })
+    return out
+
+
+def check_press_without_video(presses, tolerance=20):
     """Aperto ([PRESS] no journald) sem vídeo/evento correspondente no Shinobi
     (detector travado). Reconcilia com os eventos de /phoenix/monitors."""
     out = []
-    presses = _recent_presses(3)
     if not presses:
         return out
     mons = _local_get("/phoenix/monitors")
@@ -173,12 +194,12 @@ def check_press_without_video(tolerance=20):
                 last_event[name] = t
             except Exception:
                 pass
-    for mon, ptime in presses.items():
+    for mon, rec in presses.items():
+        ptime = rec["last"]
         ev = last_event.get(mon, 0)
         if ptime - ev > tolerance:
             out.append({
-                "type": "press_without_video",
-                "severity": "high",
+                "type": "press_without_video", "severity": "high",
                 "detail": f"aperto em {mon} sem vídeo/evento correspondente",
                 "evidence": {"monitor": mon, "pressTs": ptime, "lastEventTs": ev, "matchedEvent": False},
                 "dedupKey": f"press_without_video:{mon}",
@@ -186,20 +207,147 @@ def check_press_without_video(tolerance=20):
     return out
 
 
+def check_monitor_died():
+    """Monitor Shinobi que deveria estar gravando (mode=start) mas morreu."""
+    out = []
+    mons = _local_get("/phoenix/monitors")
+    if not mons:
+        return out
+    for mo in (mons.get("monitors", []) or []):
+        if mo.get("mode") == "start" and str(mo.get("status", "")).lower() in ("died", "failed", "error"):
+            out.append({
+                "type": "monitor_died", "severity": "critical",
+                "detail": f"câmera {mo.get('name')} caiu (status={mo.get('status')})",
+                "evidence": {"mid": mo.get("mid"), "monitor": mo.get("name"), "status": mo.get("status")},
+                "dedupKey": f"monitor_died:{mo.get('mid')}",
+            })
+    return out
+
+
+def _snapshot(mid, api, gk):
+    url = f"http://127.0.0.1:8080/{api}/jpeg/{gk}/{mid}/s.jpg"
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            return r.read()
+    except Exception:
+        return None
+
+
+def check_camera_frozen():
+    """Stream congelado: mesmo frame por várias amostras seguidas. Reamostra o
+    snapshot a cada SNAP_EVERY ciclos; entre amostras mantém o veredito (pra
+    acumular consecutiveCount). Conservador (~13min de frame idêntico)."""
+    out = []
+    api, gk = _shinobi_creds()
+    if not api or not gk:
+        return out
+    mons = _local_get("/phoenix/monitors")
+    if not mons:
+        return out
+    online = [mo for mo in (mons.get("monitors", []) or []) if mo.get("isOnline")]
+    sample = (_cyc % SNAP_EVERY == 0)
+    for mo in online:
+        mid = mo.get("mid")
+        if not mid:
+            continue
+        st = _snap.setdefault(mid, {"hash": None, "identical": 0})
+        if sample:
+            img = _snapshot(mid, api, gk)
+            if img:
+                h = hashlib.md5(img).hexdigest()
+                st["identical"] = st["identical"] + 1 if st["hash"] == h else 0
+                st["hash"] = h
+        if st["identical"] >= FROZEN_SAMPLES:
+            out.append({
+                "type": "camera_frozen", "severity": "high",
+                "detail": f"câmera {mo.get('name')} possivelmente congelada (frame idêntico)",
+                "evidence": {"mid": mid, "monitor": mo.get("name"), "identicalSamples": st["identical"]},
+                "dedupKey": f"camera_frozen:{mid}",
+            })
+    # limpa estado de monitores que saíram do ar
+    alive = {mo.get("mid") for mo in online}
+    for mid in list(_snap):
+        if mid not in alive:
+            del _snap[mid]
+    return out
+
+
+def check_gpio_stuck(presses):
+    """Rajada implausível de apertos no mesmo GPIO = botão preso/bouncing."""
+    out = []
+    for mon, rec in (presses or {}).items():
+        if rec["count"] >= GPIO_STUCK_PER_3MIN:
+            out.append({
+                "type": "gpio_stuck", "severity": "high",
+                "detail": f"botão {mon} com {rec['count']} apertos em 3min (preso/bouncing?)",
+                "evidence": {"monitor": mon, "pressesIn3min": rec["count"]},
+                "dedupKey": f"gpio_stuck:{mon}",
+            })
+    return out
+
+
+def check_gpio_idle_24h():
+    """Botão conhecido sem aperto há >24h enquanto a arena está ativa (aperto nas
+    últimas 2h em outro botão) = provável problema físico. Usa lastPress persistido."""
+    out = []
+    last = _state.get("lastPress") or {}
+    if not last:
+        return out
+    now = time.time()
+    arena_active = any((now - float(ts)) < ACTIVE_RECENT_HOURS * 3600 for ts in last.values())
+    if not arena_active:
+        return out
+    for mon, ts in last.items():
+        hours = (now - float(ts)) / 3600.0
+        if hours >= IDLE_HOURS:
+            out.append({
+                "type": "gpio_idle_24h", "severity": "medium",
+                "detail": f"botão {mon} sem aperto há {int(hours)}h (arena ativa)",
+                "evidence": {"monitor": mon, "hoursSincePress": round(hours, 1)},
+                "dedupKey": f"gpio_idle_24h:{mon}",
+            })
+    return out
+
+
 # ---------------------------------------------------------------- loop
 def _cycle():
+    global _cyc
+    _cyc += 1
     serial = get_serial()
     secret = _state.get("secret")
     ops = _state.get("opsUrl")
     if not secret or not ops:
         return
+
     _post("/api/observation/heartbeat", {"ts": time.time(), "obsVersion": OBS_VERSION}, serial, secret, ops)
+
+    # apertos recentes (3min) — alimenta press_without_video, gpio_stuck e o
+    # lastPress persistido (base do gpio_idle_24h).
+    presses = _recent_presses(3)
+    if presses:
+        lp = _state.setdefault("lastPress", {})
+        changed = False
+        for mon, rec in presses.items():
+            if rec["last"] > float(lp.get(mon, 0)):
+                lp[mon] = rec["last"]
+                changed = True
+        if changed:
+            save_state()
+
     found = []
-    for fn in (check_service_down, check_press_without_video):
+    for fn, args in (
+        (check_service_down, ()),
+        (check_press_without_video, (presses,)),
+        (check_monitor_died, ()),
+        (check_camera_frozen, ()),
+        (check_gpio_stuck, (presses,)),
+        (check_gpio_idle_24h, ()),
+    ):
         try:
-            found.extend(fn())
+            found.extend(fn(*args))
         except Exception as e:
             _log(f"check {fn.__name__} erro: {e}")
+
     seen = set()
     for a in found:
         dk = a["dedupKey"]
@@ -235,7 +383,10 @@ def _loop():
 def enable(secret, ops_url, interval=DEFAULT_INTERVAL, until=None):
     global _thread, _state
     with _lock:
-        _state = {"enabled": True, "secret": secret, "opsUrl": ops_url, "interval": int(interval or DEFAULT_INTERVAL), "until": until}
+        prev_lp = _state.get("lastPress", {}) if _state.get("enabled") else {}
+        _state = {"enabled": True, "secret": secret, "opsUrl": ops_url,
+                  "interval": int(interval or DEFAULT_INTERVAL), "until": until,
+                  "lastPress": prev_lp}
         save_state()
         _stop.clear()
         if _thread is None or not _thread.is_alive():
