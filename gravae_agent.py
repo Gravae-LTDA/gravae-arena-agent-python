@@ -22,11 +22,12 @@ import uuid
 import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import observation_mode  # Ultra Watch (modo observação)
 from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.5.3"
+VERSION = "3.5.5"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -4505,6 +4506,21 @@ class AgentHandler(BaseHTTPRequestHandler):
         if not path.startswith('/terminal/'):
             log.info(f"POST {path}", extra={"content_length": length})
 
+        if path == '/observation/enable':
+            secret = data.get('secret')
+            ops = data.get('opsUrl')
+            if not secret or not ops:
+                self._send_json({"error": "secret e opsUrl obrigatorios"}, 400)
+                return
+            observation_mode.enable(secret, ops, data.get('interval', 45), data.get('until'))
+            self._send_json({"ok": True, **observation_mode.status()})
+            return
+
+        if path == '/observation/disable':
+            observation_mode.disable()
+            self._send_json({"ok": True, **observation_mode.status()})
+            return
+
         if path == '/terminal/create':
             session_id = create_terminal_session()
             self._send_json({"sessionId": session_id})
@@ -5598,6 +5614,9 @@ def main():
     # Keep journald logs across reboots so button/agent history survives a
     # power-cycle and freezes can be diagnosed (press-vs-event). Idempotent.
     threading.Thread(target=ensure_journald_persistent, daemon=True).start()
+
+    # Ultra Watch: retoma o modo observacao se estava ativo antes do restart.
+    threading.Thread(target=observation_mode.resume_if_enabled, daemon=True).start()
 
     # Start coaching review module if configured
     if _coaching_module and _coaching_module.is_configured():
