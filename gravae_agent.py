@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.5.6"
+VERSION = "3.5.7"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -1850,6 +1850,59 @@ def ensure_shinobi_probe_disabled():
             _restart_shinobi()
     except Exception as e:
         print(f"[Shinobi] ensure probeMonitorOnStart failed: {e}")
+
+
+def ensure_shinobi_fatalretry_patched():
+    """Restore Shinobi's fast (5s) monitor-start retry, dropping the 10-min penalty box.
+
+    Root cause of the fleet-wide "arena online (Watching) but silently not recording
+    after a reboot" bug. A recent Shinobi commit (5228559b, later 823b8148) added a
+    back-off in libs/monitor/utils.js: after 3 fast fatal errors a monitor's start
+    retry is delayed 10 minutes (originally 1 hour):
+
+        },activeMonitor.errorFatalCount >= 3 ? 1000 * 60 * 10 : 5000);
+
+    On boot the LAN/camera stays unreachable for ~40s while the Pi gets its IP, so the
+    monitor fails to start >=3 times within ~15s and lands in the penalty box. Meanwhile
+    the stream ffmpeg reconnects on its own (monitor shows "Watching") which flips
+    isStarted=true, so when the delayed retry finally fires launchMonitorProcesses
+    early-returns ("Monitor Already Started") and the SIP recording path is never
+    re-armed: button triggers return "Trigger Successful" but nothing records until a
+    manual `pm2 restart camera`. The older (Dec 2025) Shinobi retried every 5s and
+    recovered on its own -- confirmed by A/B + reproduced/fixed with this exact change.
+
+    Fix: drop the penalty box so the retry is always 5s. Idempotent: once the pattern
+    is gone this is a no-op. Runs on every agent start so it covers fresh installs on
+    the buggy Shinobi, updates on existing arenas, and SD swaps.
+    """
+    time.sleep(26)  # settle after boot; runs just after ensure_shinobi_probe_disabled
+    try:
+        shinobi_dir = _find_shinobi_dir()
+        utils_path = os.path.join(shinobi_dir, 'libs', 'monitor', 'utils.js')
+        if not os.path.exists(utils_path):
+            return
+        with open(utils_path, 'r') as f:
+            src = f.read()
+        # matches "activeMonitor.errorFatalCount >= 3 ? 1000 * 60 * <N> : 5000" (N = 10 or 60)
+        pattern = re.compile(
+            r'activeMonitor\.errorFatalCount\s*>=\s*3\s*\?\s*1000\s*\*\s*60\s*\*\s*\d+\s*:\s*5000'
+        )
+        if not pattern.search(src):
+            return  # already patched or not the buggy Shinobi -> no-op
+        patched = pattern.sub('5000', src)
+        bak = utils_path + '.bak-fatalretry'
+        if not os.path.exists(bak):
+            try:
+                with open(bak, 'w') as f:
+                    f.write(src)
+            except Exception:
+                pass
+        with open(utils_path, 'w') as f:
+            f.write(patched)
+        print("[Shinobi] Patched monitor-start retry penalty in utils.js -> always 5s; restarting Shinobi")
+        _restart_shinobi()
+    except Exception as e:
+        print(f"[Shinobi] ensure fatalretry patch failed: {e}")
 
 
 def setup_ftp_events():
@@ -5649,6 +5702,11 @@ def main():
     # (re)start can no longer unregister it from activeMonitors (aperto 200 sem
     # evento). Idempotent: cobre install de fabrica, update e troca de SD.
     threading.Thread(target=ensure_shinobi_probe_disabled, daemon=True).start()
+
+    # Restaura o retry de 5s do Shinobi (tira a penalty box de 10min que trava a
+    # gravacao apos reboot: monitor "Watching" mas /motion/ retorna 200 sem gravar).
+    # Idempotent: no-op se ja patchado ou versao nao-buggada do Shinobi.
+    threading.Thread(target=ensure_shinobi_fatalretry_patched, daemon=True).start()
 
     # Ultra Watch: retoma o modo observacao se estava ativo antes do restart.
     threading.Thread(target=observation_mode.resume_if_enabled, daemon=True).start()
