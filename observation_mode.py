@@ -24,7 +24,8 @@ from datetime import datetime, timezone
 STATE_PATH = "/etc/gravae/observation.json"
 DEVICE_PATH = "/etc/gravae/device.json"
 DEFAULT_INTERVAL = 45
-OBS_VERSION = "1.1.0"
+OBS_VERSION = "1.2.0"
+PM2_HOME = "/root/.pm2"
 
 # Fase 2 — parâmetros dos checks (conservadores p/ evitar falso-positivo).
 SNAP_EVERY = 6            # reamostra snapshot a cada N ciclos (~4.5min @ 45s)
@@ -33,6 +34,13 @@ GPIO_STUCK_PER_3MIN = 40  # apertos no mesmo GPIO em 3min ⇒ botão preso/bounc
 IDLE_HOURS = 24           # botão sem aperto há mais que isto...
 ACTIVE_RECENT_HOURS = 2   # ...enquanto a arena teve aperto nas últimas 2h
 
+# Watchdog (auto-heal) — só age com Ultra Watch ATIVO. Remédio do no-record
+# silencioso (aperto 200 mas 0 evento/vídeo): pm2 restart camera. Conservador —
+# exige que press_without_video persista por vários ciclos + cooldown longo.
+AUTOHEAL_PRESS_WITHOUT_VIDEO = True
+AUTOHEAL_MIN_CONSECUTIVE = 2   # ciclos seguidos de press_without_video antes de agir (~90s @ 45s)
+AUTOHEAL_COOLDOWN = 900        # segundos entre restarts de camera (evita loop; ~70s p/ re-armar)
+
 _state = {}
 _thread = None
 _stop = threading.Event()
@@ -40,6 +48,7 @@ _lock = threading.Lock()
 _consecutive = {}   # dedupKey -> ciclos consecutivos
 _snap = {}          # mid -> {"hash": str, "identical": int}
 _cyc = 0            # contador de ciclos
+_last_autoheal = 0.0  # epoch do último pm2 restart camera do watchdog
 
 
 def _log(msg):
@@ -309,6 +318,60 @@ def check_gpio_idle_24h():
     return out
 
 
+# ---------------------------------------------------------------- watchdog
+def _restart_camera():
+    """pm2 restart camera — mesmo remédio manual do no-record silencioso.
+    Roda como root (agent), PM2_HOME=/root/.pm2 (igual ao _restart_shinobi do agent)."""
+    env = {**os.environ, "PM2_HOME": PM2_HOME, "HOME": "/root"}
+    for name in ("camera", "Shinobi", "shinobi"):
+        try:
+            r = subprocess.run(["pm2", "restart", name], capture_output=True,
+                               text=True, timeout=30, env=env)
+            if r.returncode == 0:
+                _log(f"auto-heal: pm2 restart {name} ok")
+                return True
+        except Exception as e:
+            _log(f"auto-heal: pm2 restart {name} erro: {e}")
+    _log("auto-heal: pm2 restart camera falhou (todos os nomes)")
+    return False
+
+
+def _maybe_autoheal(found, serial, secret, ops):
+    """Watchdog: se press_without_video persistir por >=AUTOHEAL_MIN_CONSECUTIVE
+    ciclos, dá pm2 restart camera (com cooldown). É o único remédio que recupera o
+    no-record silencioso (stop/start por monitor não resolve — só processo novo).
+    Cobre Pis ainda não atualizados p/ o fix de raiz (motion_lock) e bordas raras."""
+    global _last_autoheal
+    if not AUTOHEAL_PRESS_WITHOUT_VIDEO:
+        return
+    pwv = [a for a in found
+           if a.get("type") == "press_without_video"
+           and a.get("consecutiveCount", 0) >= AUTOHEAL_MIN_CONSECUTIVE]
+    if not pwv:
+        return
+    now = time.time()
+    if now - _last_autoheal < AUTOHEAL_COOLDOWN:
+        _log(f"auto-heal: press_without_video persistente mas em cooldown "
+             f"({int(AUTOHEAL_COOLDOWN - (now - _last_autoheal))}s restantes)")
+        return
+    monitors = sorted({(a.get("evidence") or {}).get("monitor") for a in pwv} - {None})
+    _log(f"auto-heal: press_without_video persistente em {monitors} -> pm2 restart camera")
+    ok = _restart_camera()
+    _last_autoheal = now
+    # zera os contadores dos monitores afetados p/ dar tempo de re-armar antes de recontar
+    for a in pwv:
+        _consecutive.pop(a.get("dedupKey"), None)
+    # reporta a ação pro OPS (visibilidade — vira anomalia resolvida/ação no painel)
+    _post("/api/observation/report", {
+        "type": "autoheal_camera_restart", "severity": "high",
+        "detail": f"auto-heal (Ultra Watch): pm2 restart camera por press_without_video em {', '.join(monitors)}",
+        "evidence": {"monitors": monitors, "restarted": ok, "reason": "press_without_video"},
+        "dedupKey": "autoheal_camera_restart",
+        "consecutiveCount": 1,
+        "firstSeenAt": datetime.now(timezone.utc).isoformat(),
+    }, serial, secret, ops)
+
+
 # ---------------------------------------------------------------- loop
 def _cycle():
     global _cyc
@@ -359,6 +422,14 @@ def _cycle():
     for dk in list(_consecutive):
         if dk not in seen:
             del _consecutive[dk]
+
+    # Watchdog: auto-cura do no-record silencioso (só com Ultra Watch ativo, que é
+    # a condição p/ estarmos neste loop). pm2 restart camera se press_without_video
+    # persistir. `found` já traz consecutiveCount setado acima.
+    try:
+        _maybe_autoheal(found, serial, secret, ops)
+    except Exception as e:
+        _log(f"auto-heal erro: {e}")
 
 
 def _loop():
