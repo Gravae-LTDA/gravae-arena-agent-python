@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.5.7"
+VERSION = "3.5.8"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -1903,6 +1903,73 @@ def ensure_shinobi_fatalretry_patched():
         _restart_shinobi()
     except Exception as e:
         print(f"[Shinobi] ensure fatalretry patch failed: {e}")
+
+
+def ensure_shinobi_motionlock_patched():
+    """Fix Shinobi's stuck `motion_lock` that silently kills recording after a mid-run
+    camera/RTSP drop.
+
+    Root cause of "arena online (Watching) but stops recording on its own -- every
+    button press returns HTTP 200 but writes 0 Event/0 MP4, and only `pm2 restart
+    camera` recovers". Proven by instrumentation on the live event pipeline: when
+    stuck, `checkMotionLock` (libs/events/utils.js) sees `activeMonitor.motion_lock`
+    truthy and does `return false`, so the event is dropped before it ever reaches the
+    recorder.
+
+    `motion_lock` is a setTimeout handle set by setMotionLock (15s). In cameraDestroy
+    (libs/monitor/utils.js) it is the ONLY timer in the teardown batch that does
+    `clearTimeout(activeMonitor.motion_lock)` WITHOUT the matching
+    `delete(activeMonitor.motion_lock)` that every sibling timer has. clearTimeout
+    cancels the timer -- so the callback that would delete the property never runs --
+    but the property keeps the dead handle (truthy) forever. During the relaunch storm
+    of a camera drop (setMotionLock every ~5s + cameraDestroy cancelling it) the lock
+    is never released, so all triggers are rejected until the process is restarted.
+
+    Regression introduced by Shinobi commit 638b0076 "Refactor Monitor Launch Sequence"
+    (adds setMotionLock); the older Dec-2025 Shinobi did not have it. Fix mirrors the
+    convention of the neighbouring timers: insert `delete(activeMonitor.motion_lock)`
+    right after the cameraDestroy `clearTimeout(activeMonitor.motion_lock)`. Deleting a
+    lock can only ever ALLOW a trigger, never block one -- safe by construction.
+    Reproduced (block RTSP mid-run -> next trigger STUCK) and fixed (next trigger records
+    on its own) with this exact change. Idempotent: no-op once the delete is in place or
+    on a Shinobi version without the buggy anchor.
+    """
+    time.sleep(30)  # settle after boot; runs just after ensure_shinobi_fatalretry_patched
+    try:
+        shinobi_dir = _find_shinobi_dir()
+        utils_path = os.path.join(shinobi_dir, 'libs', 'monitor', 'utils.js')
+        if not os.path.exists(utils_path):
+            return
+        with open(utils_path, 'r') as f:
+            src = f.read()
+        # cameraDestroy teardown: motion_lock clearTimeout immediately followed by the
+        # resetFatalErrorCountTimer clearTimeout (unique to cameraDestroy). Insert the
+        # missing delete in between. Anchor stops matching once patched -> idempotent.
+        anchor = re.compile(
+            r'(clearTimeout\(activeMonitor\.motion_lock\)\n)'
+            r'(\s*)'
+            r'(clearTimeout\(activeMonitor\.resetFatalErrorCountTimer\))'
+        )
+        if not anchor.search(src):
+            return  # already patched, or different Shinobi version -> no-op
+        patched = anchor.sub(
+            lambda m: m.group(1) + m.group(2) + 'delete(activeMonitor.motion_lock)\n' + m.group(2) + m.group(3),
+            src,
+            count=1,
+        )
+        bak = utils_path + '.bak-motionlock'
+        if not os.path.exists(bak):
+            try:
+                with open(bak, 'w') as f:
+                    f.write(src)
+            except Exception:
+                pass
+        with open(utils_path, 'w') as f:
+            f.write(patched)
+        print("[Shinobi] Patched stuck motion_lock in cameraDestroy (added delete); restarting Shinobi")
+        _restart_shinobi()
+    except Exception as e:
+        print(f"[Shinobi] ensure motionlock patch failed: {e}")
 
 
 def setup_ftp_events():
@@ -5707,6 +5774,11 @@ def main():
     # gravacao apos reboot: monitor "Watching" mas /motion/ retorna 200 sem gravar).
     # Idempotent: no-op se ja patchado ou versao nao-buggada do Shinobi.
     threading.Thread(target=ensure_shinobi_fatalretry_patched, daemon=True).start()
+
+    # Corrige o motion_lock preso do Shinobi (cameraDestroy faz clearTimeout sem delete):
+    # apos queda de camera no meio, /motion/ retorna 200 mas descarta o evento (0 gravacao)
+    # ate um pm2 restart. Insere o delete faltante. Idempotent: no-op se ja corrigido.
+    threading.Thread(target=ensure_shinobi_motionlock_patched, daemon=True).start()
 
     # Ultra Watch: retoma o modo observacao se estava ativo antes do restart.
     threading.Thread(target=observation_mode.resume_if_enabled, daemon=True).start()
