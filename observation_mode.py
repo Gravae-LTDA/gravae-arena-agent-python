@@ -24,11 +24,11 @@ from datetime import datetime, timezone
 STATE_PATH = "/etc/gravae/observation.json"
 DEVICE_PATH = "/etc/gravae/device.json"
 DEFAULT_INTERVAL = 45
-OBS_VERSION = "1.2.0"
+OBS_VERSION = "1.4.0"
 PM2_HOME = "/root/.pm2"
 
 # Fase 2 — parâmetros dos checks (conservadores p/ evitar falso-positivo).
-SNAP_EVERY = 6            # reamostra snapshot a cada N ciclos (~4.5min @ 45s)
+SNAP_EVERY = 6            # reamostra o buffer HLS a cada N ciclos (~4.5min @ 45s)
 FROZEN_SAMPLES = 3        # nº de amostras idênticas seguidas p/ "congelado" (~13min)
 GPIO_STUCK_PER_3MIN = 40  # apertos no mesmo GPIO em 3min ⇒ botão preso/bouncing
 IDLE_HOURS = 24           # botão sem aperto há mais que isto...
@@ -40,13 +40,14 @@ ACTIVE_RECENT_HOURS = 2   # ...enquanto a arena teve aperto nas últimas 2h
 AUTOHEAL_PRESS_WITHOUT_VIDEO = True
 AUTOHEAL_MIN_CONSECUTIVE = 2   # ciclos seguidos de press_without_video antes de agir (~90s @ 45s)
 AUTOHEAL_COOLDOWN = 900        # segundos entre restarts de camera (evita loop; ~70s p/ re-armar)
+AUTOHEAL_SHINOBI_PORT_DEAD = True  # tb reinicia camera se o 8080 do Shinobi estiver morto (pm2 "online" mas porta caída)
 
 _state = {}
 _thread = None
 _stop = threading.Event()
 _lock = threading.Lock()
 _consecutive = {}   # dedupKey -> ciclos consecutivos
-_snap = {}          # mid -> {"hash": str, "identical": int}
+_snap = {}          # mid -> {"sig": [seg,size], "identical": int}
 _cyc = 0            # contador de ciclos
 _last_autoheal = 0.0  # epoch do último pm2 restart camera do watchdog
 
@@ -93,13 +94,20 @@ def _post(path, obj, serial, secret, ops):
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read().decode() or "{}")
-    except urllib.error.HTTPError as e:
-        _log(f"POST {path} HTTP {e.code}")
-    except Exception as e:
-        _log(f"POST {path} erro: {e}")
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            if e.code < 500:   # 4xx não adianta retentar
+                _log(f"POST {path} HTTP {e.code}")
+                return None
+            last_err = f"HTTP {e.code}"
+        except Exception as e:
+            last_err = str(e)   # DNS/timeout transiente -> retenta
+        time.sleep(2 * (attempt + 1))
+    _log(f"POST {path} falhou apos 3 tentativas: {last_err}")
     return None
 
 
@@ -168,6 +176,26 @@ def _recent_presses(minutes=3):
 
 
 # ---------------------------------------------------------------- checks
+def check_shinobi_8080():
+    """Shinobi 8080 morto enquanto o pm2 diz 'online' (hung) — PONTO CEGO do
+    check_service_down (que le /phoenix/status, reportado pelo pm2). Bate direto no 8080."""
+    out = []
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8080/", method="GET")
+        with urllib.request.urlopen(req, timeout=6) as r:
+            if r.status == 200:
+                return out
+    except Exception:
+        pass
+    out.append({
+        "type": "shinobi_port_dead", "severity": "critical",
+        "detail": "Shinobi 8080 nao responde (processo pode estar 'online' no pm2 mas travado)",
+        "evidence": {"port": 8080},
+        "dedupKey": "shinobi_port_dead",
+    })
+    return out
+
+
 def check_service_down():
     out = []
     st = _local_get("/phoenix/status")
@@ -233,22 +261,51 @@ def check_monitor_died():
     return out
 
 
-def _snapshot(mid, api, gk):
-    url = f"http://127.0.0.1:8080/{api}/jpeg/{gk}/{mid}/s.jpg"
+# Bases onde o Shinobi escreve o buffer HLS (SIP) — RAM primeiro.
+_STREAM_BASES = ("/dev/shm/streams", "/home/Shinobi/streams")
+
+
+def _stream_dir(gk, mo):
+    """Diretório do buffer HLS do monitor. O Shinobi nomeia a pasta pelo NOME do
+    monitor (às vezes pelo mid); fica em /dev/shm/streams (RAM) ou
+    /home/Shinobi/streams. Legível sem root (dirs 755, .ts 644)."""
+    for base in _STREAM_BASES:
+        for key in (mo.get("name"), mo.get("mid")):
+            if not key:
+                continue
+            d = os.path.join(base, gk, key)
+            if os.path.isdir(d):
+                return d
+    return None
+
+
+def _buffer_head(d):
+    """Assinatura [nome, tamanho] do segmento .ts mais novo do buffer (None se vazio).
+    Enquanto o stream grava, o Shinobi rotaciona segmentos (~1-2s cada), então essa
+    assinatura muda a cada amostra; se o stream trava, o segmento mais novo para de
+    renovar (mesmo nome e tamanho). Sem decodificar frame."""
     try:
-        with urllib.request.urlopen(url, timeout=8) as r:
-            return r.read()
+        segs = [f for f in os.listdir(d) if f.endswith(".ts")]
+        if not segs:
+            return None
+        newest = max(segs, key=lambda f: os.path.getmtime(os.path.join(d, f)))
+        return [newest, os.path.getsize(os.path.join(d, newest))]
     except Exception:
         return None
 
 
 def check_camera_frozen():
-    """Stream congelado: mesmo frame por várias amostras seguidas. Reamostra o
-    snapshot a cada SNAP_EVERY ciclos; entre amostras mantém o veredito (pra
-    acumular consecutiveCount). Conservador (~13min de frame idêntico)."""
+    """Stream congelado: o buffer HLS (SIP) para de renovar.
+
+    Antes comparava o snapshot (s.jpg) — que em monitor mode:start fica ESTÁTICO
+    mesmo com a gravação viva, gerando falso-positivo (câmera ok, só o snapshot-cache
+    do Shinobi travado). Agora olha o segmento .ts mais novo do buffer em RAM: o
+    Shinobi renova esses segmentos continuamente enquanto grava, então se a assinatura
+    (nome+tamanho) do segmento mais novo não muda entre amostras, o stream de fato
+    travou. Conservador (~13min). monitor_died cobre o caso de buffer ausente."""
     out = []
-    api, gk = _shinobi_creds()
-    if not api or not gk:
+    _, gk = _shinobi_creds()
+    if not gk:
         return out
     mons = _local_get("/phoenix/monitors")
     if not mons:
@@ -259,18 +316,23 @@ def check_camera_frozen():
         mid = mo.get("mid")
         if not mid:
             continue
-        st = _snap.setdefault(mid, {"hash": None, "identical": 0})
+        st = _snap.setdefault(mid, {"sig": None, "identical": 0})
         if sample:
-            img = _snapshot(mid, api, gk)
-            if img:
-                h = hashlib.md5(img).hexdigest()
-                st["identical"] = st["identical"] + 1 if st["hash"] == h else 0
-                st["hash"] = h
+            d = _stream_dir(gk, mo)
+            head = _buffer_head(d) if d else None
+            if head is None:
+                # buffer ausente/ilegível → não afirma congelado (fail-safe, sem alerta)
+                st["identical"] = 0
+                st["sig"] = None
+                continue
+            st["identical"] = st["identical"] + 1 if st["sig"] == head else 0
+            st["sig"] = head
         if st["identical"] >= FROZEN_SAMPLES:
             out.append({
                 "type": "camera_frozen", "severity": "high",
-                "detail": f"câmera {mo.get('name')} possivelmente congelada (frame idêntico)",
-                "evidence": {"mid": mid, "monitor": mo.get("name"), "identicalSamples": st["identical"]},
+                "detail": f"câmera {mo.get('name')} possivelmente congelada (buffer HLS parou de renovar)",
+                "evidence": {"mid": mid, "monitor": mo.get("name"),
+                             "identicalSamples": st["identical"], "segment": st["sig"]},
                 "dedupKey": f"camera_frozen:{mid}",
             })
     # limpa estado de monitores que saíram do ar
@@ -342,20 +404,25 @@ def _maybe_autoheal(found, serial, secret, ops):
     no-record silencioso (stop/start por monitor não resolve — só processo novo).
     Cobre Pis ainda não atualizados p/ o fix de raiz (motion_lock) e bordas raras."""
     global _last_autoheal
-    if not AUTOHEAL_PRESS_WITHOUT_VIDEO:
-        return
-    pwv = [a for a in found
-           if a.get("type") == "press_without_video"
-           and a.get("consecutiveCount", 0) >= AUTOHEAL_MIN_CONSECUTIVE]
+    pwv = []
+    if AUTOHEAL_PRESS_WITHOUT_VIDEO:
+        pwv += [a for a in found
+                if a.get("type") == "press_without_video"
+                and a.get("consecutiveCount", 0) >= AUTOHEAL_MIN_CONSECUTIVE]
+    if AUTOHEAL_SHINOBI_PORT_DEAD:
+        pwv += [a for a in found
+                if a.get("type") == "shinobi_port_dead"
+                and a.get("consecutiveCount", 0) >= AUTOHEAL_MIN_CONSECUTIVE]
     if not pwv:
         return
     now = time.time()
     if now - _last_autoheal < AUTOHEAL_COOLDOWN:
-        _log(f"auto-heal: press_without_video persistente mas em cooldown "
+        _log(f"auto-heal: gatilho persistente mas em cooldown "
              f"({int(AUTOHEAL_COOLDOWN - (now - _last_autoheal))}s restantes)")
         return
+    reasons = ', '.join(sorted({a.get("type") for a in pwv}))
     monitors = sorted({(a.get("evidence") or {}).get("monitor") for a in pwv} - {None})
-    _log(f"auto-heal: press_without_video persistente em {monitors} -> pm2 restart camera")
+    _log(f"auto-heal: {reasons} -> pm2 restart camera (monitors={monitors})")
     ok = _restart_camera()
     _last_autoheal = now
     # zera os contadores dos monitores afetados p/ dar tempo de re-armar antes de recontar
@@ -364,8 +431,8 @@ def _maybe_autoheal(found, serial, secret, ops):
     # reporta a ação pro OPS (visibilidade — vira anomalia resolvida/ação no painel)
     _post("/api/observation/report", {
         "type": "autoheal_camera_restart", "severity": "high",
-        "detail": f"auto-heal (Ultra Watch): pm2 restart camera por press_without_video em {', '.join(monitors)}",
-        "evidence": {"monitors": monitors, "restarted": ok, "reason": "press_without_video"},
+        "detail": f"auto-heal (Ultra Watch): pm2 restart camera por {reasons}" + (f" em {', '.join(monitors)}" if monitors else ""),
+        "evidence": {"monitors": monitors, "restarted": ok, "reason": reasons},
         "dedupKey": "autoheal_camera_restart",
         "consecutiveCount": 1,
         "firstSeenAt": datetime.now(timezone.utc).isoformat(),
@@ -400,6 +467,7 @@ def _cycle():
     found = []
     for fn, args in (
         (check_service_down, ()),
+        (check_shinobi_8080, ()),
         (check_press_without_video, (presses,)),
         (check_monitor_died, ()),
         (check_camera_frozen, ()),
