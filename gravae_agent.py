@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.6.1"
+VERSION = "3.6.2"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -1973,20 +1973,16 @@ def ensure_shinobi_motionlock_patched():
 
 
 def ensure_detector_frames_disabled():
-    """Disable Shinobi detector_send_frames on monitors that use neither pixel
-    motion nor object detection. Shinobi otherwise decodes the FULL stream in
-    software to feed a detector that consumes nothing (~50% CPU per camera on a
-    Pi 4 -> superaquecimento -> travamento termico). Arenas de botao (GPIO) gravam
-    via SIP/trigger, independente desse feed. SEGURO: so mexe onde
-    detector_use_motion=0 AND detector_use_detect_object=0 (arenas com deteccao
-    de movimento/objeto ficam intactas). Idempotente; reinicia o Shinobi so quando
-    de fato alterou algo.
+    """Force Shinobi detector_send_frames='0' on ALL monitors. Shinobi otherwise
+    decodes the FULL stream in software to feed the detector (~50% CPU per camera
+    on a Pi 4 -> superaquecimento -> travamento termico). Toda a frota Gravae grava
+    por BOTAO (GPIO/SIP-trigger), nao por deteccao de pixel, entao esse feed nao
+    serve pra nada em lugar nenhum -> desligar incondicionalmente (decisao do dono).
+    Idempotente; reinicia o Shinobi so quando de fato alterou algo.
     """
     time.sleep(24)
     try:
-        cond = ("JSON_UNQUOTE(JSON_EXTRACT(details,'$.detector_send_frames')) <> '0' "
-                "AND JSON_UNQUOTE(JSON_EXTRACT(details,'$.detector_use_motion')) = '0' "
-                "AND JSON_UNQUOTE(JSON_EXTRACT(details,'$.detector_use_detect_object')) = '0'")
+        cond = "JSON_UNQUOTE(JSON_EXTRACT(details,'$.detector_send_frames')) <> '0'"
         sel = "SELECT COUNT(*) FROM Monitors WHERE " + cond
         r = subprocess.run(['mysql', '-u', 'majesticflame', 'ccio', '-N', '-e', sel],
                            capture_output=True, text=True, timeout=15)
