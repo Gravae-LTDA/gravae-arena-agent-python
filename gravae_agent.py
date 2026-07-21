@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.5.10"
+VERSION = "3.6.1"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -1970,6 +1970,36 @@ def ensure_shinobi_motionlock_patched():
         _restart_shinobi()
     except Exception as e:
         print(f"[Shinobi] ensure motionlock patch failed: {e}")
+
+
+def ensure_detector_frames_disabled():
+    """Disable Shinobi detector_send_frames on monitors that use neither pixel
+    motion nor object detection. Shinobi otherwise decodes the FULL stream in
+    software to feed a detector that consumes nothing (~50% CPU per camera on a
+    Pi 4 -> superaquecimento -> travamento termico). Arenas de botao (GPIO) gravam
+    via SIP/trigger, independente desse feed. SEGURO: so mexe onde
+    detector_use_motion=0 AND detector_use_detect_object=0 (arenas com deteccao
+    de movimento/objeto ficam intactas). Idempotente; reinicia o Shinobi so quando
+    de fato alterou algo.
+    """
+    time.sleep(24)
+    try:
+        cond = ("JSON_UNQUOTE(JSON_EXTRACT(details,'$.detector_send_frames')) <> '0' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(details,'$.detector_use_motion')) = '0' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(details,'$.detector_use_detect_object')) = '0'")
+        sel = "SELECT COUNT(*) FROM Monitors WHERE " + cond
+        r = subprocess.run(['mysql', '-u', 'majesticflame', 'ccio', '-N', '-e', sel],
+                           capture_output=True, text=True, timeout=15)
+        n = int((r.stdout or '0').strip() or '0')
+        if n <= 0:
+            return
+        upd = "UPDATE Monitors SET details=JSON_SET(details,'$.detector_send_frames','0') WHERE " + cond
+        subprocess.run(['mysql', '-u', 'majesticflame', 'ccio', '-e', upd],
+                       capture_output=True, text=True, timeout=20)
+        print("[Shinobi] Disabled wasteful detector_send_frames on %d monitor(s); restarting Shinobi" % n)
+        _restart_shinobi()
+    except Exception as e:
+        print("[Shinobi] ensure detector_send_frames failed: %s" % e)
 
 
 def setup_ftp_events():
@@ -5848,6 +5878,11 @@ def main():
     # toa e estoura a CPU durante os jogos. Forca '0' nos monitores existentes.
     # Idempotent: no-op se ja desligado; nao afeta a gravacao por botao.
     threading.Thread(target=ensure_shinobi_detector_use_motion_off, daemon=True).start()
+
+    # Desliga detector_send_frames onde NAO ha deteccao de movimento/objeto: o Shinobi
+    # decode 1080p em software (CPU/calor) sem afetar gravacao por botao. Condicional
+    # e idempotente (so mexe onde motion/object=0; restart so quando altera algo).
+    threading.Thread(target=ensure_detector_frames_disabled, daemon=True).start()
 
     # Ultra Watch: retoma o modo observacao se estava ativo antes do restart.
     threading.Thread(target=observation_mode.resume_if_enabled, daemon=True).start()
