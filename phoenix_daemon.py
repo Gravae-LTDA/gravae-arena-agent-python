@@ -722,9 +722,21 @@ class ServiceGuardian:
 
             # Check based on service type
             if config.get("pm2"):
-                # PM2 service (like Shinobi)
-                is_running = self.check_port(config.get("port", 8080))
-                if not is_running:
+                # PM2 service (like Shinobi): the PORT is authoritative. A pm2
+                # process that shows "online" but whose port is dead (EADDRINUSE /
+                # crashed HTTP listener) is the recurring Shinobi "zombie" — the
+                # web server on 8080 is gone even though camera.js is still up.
+                # The old code fell back to check_pm2_process when the port was
+                # down, which reported the zombie as "running" and BLOCKED the
+                # auto-restart (restart_pm2_process was never called). Trust the
+                # port: if it's down, restart. Only use the process check when the
+                # service has no port to probe. restart_pm2_process already handles
+                # zombie (restart), missing process (re-register) and Bug6
+                # (duplicate PM2 daemons), so this alone closes the loop.
+                port = config.get("port")
+                if port:
+                    is_running = self.check_port(port)
+                else:
                     is_running = self.check_pm2_process(service_name)
             elif service_name == "gravae-buttons":
                 # Button service - check both possible systemd names, then legacy botao.py
