@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.6.0"
+VERSION = "3.6.1"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -5625,6 +5625,69 @@ def _fix_shinobi_monitors_stimeout():
         print(f"[Shinobi] timeout fix error: {e}")
 
 
+def ensure_shinobi_detector_use_motion_off():
+    """Force detector_use_motion='0' on this arena's Shinobi monitors.
+
+    detector_use_motion=1 makes Shinobi run its pixel-based motion detector, which
+    decodes the stream and spikes CPU whenever there is movement in frame (players on
+    court). These arenas record on a physical BUTTON trigger (HTTP /motion/ from the
+    button daemon), NOT on pixel motion, so use_motion must stay off -- with it on it
+    is pure wasted CPU (reported as "CPU muito alta durante os jogos"). The
+    _MONITOR_FIELDS lock only coerces use_motion=0 on writes that go THROUGH the agent;
+    monitors created/edited out-of-band keep '1' forever. This self-heal enforces the
+    invariant on the existing rows at startup, mirroring _fix_shinobi_monitors_stimeout.
+
+    Idempotent: no-op once every monitor is already off. Restarts Shinobi only when it
+    actually changed a row. Disabling motion detection can only reduce CPU and never
+    affects the button-triggered recording -- safe by construction.
+    """
+    import time
+    time.sleep(34)  # settle after boot; runs after the other Shinobi self-heals
+
+    group_key = CONFIG.get('shinobiGroupKey')
+    if not group_key:
+        return
+
+    try:
+        db_config = get_shinobi_db_config()
+        if not db_config:
+            print("[Shinobi] Cannot read DB config for detector_use_motion fix")
+            return
+
+        db_name = db_config.get('database', 'ccio')
+        env = os.environ.copy()
+        if db_config.get('password'):
+            env['MYSQL_PWD'] = db_config['password']
+
+        # Count monitors with motion detection still enabled (stored as string or int)
+        check = subprocess.run(
+            ['sudo', 'mysql', '-N', db_name, '-e',
+             f"SELECT COUNT(*) FROM Monitors WHERE ke='{group_key}' "
+             f"AND JSON_UNQUOTE(JSON_EXTRACT(details, '$.detector_use_motion')) = '1';"],
+            capture_output=True, text=True, env=env, timeout=10
+        )
+
+        count = int(check.stdout.strip()) if check.returncode == 0 and check.stdout.strip() else 0
+        if count == 0:
+            return  # already off everywhere
+
+        result = subprocess.run(
+            ['sudo', 'mysql', db_name, '-e',
+             f"UPDATE Monitors SET details = JSON_SET(details, '$.detector_use_motion', '0') "
+             f"WHERE ke='{group_key}' "
+             f"AND JSON_UNQUOTE(JSON_EXTRACT(details, '$.detector_use_motion')) = '1';"],
+            capture_output=True, text=True, env=env, timeout=10
+        )
+
+        if result.returncode == 0:
+            _restart_shinobi()
+            print(f"[Shinobi] Disabled detector_use_motion on {count} monitor(s) (wasteful CPU), restarted Shinobi")
+        else:
+            print(f"[Shinobi] Failed to disable detector_use_motion: {result.stderr}")
+    except Exception as e:
+        print(f"[Shinobi] detector_use_motion fix error: {e}")
+
+
 def get_phoenix_monitors():
     """Get Shinobi monitors with events for anomaly detection (GET handler)."""
     api_key = CONFIG.get('shinobiApiKey')
@@ -5809,6 +5872,12 @@ def main():
     # apos queda de camera no meio, /motion/ retorna 200 mas descarta o evento (0 gravacao)
     # ate um pm2 restart. Insere o delete faltante. Idempotent: no-op se ja corrigido.
     threading.Thread(target=ensure_shinobi_motionlock_patched, daemon=True).start()
+
+    # Desliga detector_use_motion (deteccao de movimento por pixel): estas arenas
+    # gravam por BOTAO, nao por movimento, entao use_motion=1 so decodifica frame a
+    # toa e estoura a CPU durante os jogos. Forca '0' nos monitores existentes.
+    # Idempotent: no-op se ja desligado; nao afeta a gravacao por botao.
+    threading.Thread(target=ensure_shinobi_detector_use_motion_off, daemon=True).start()
 
     # Desliga detector_send_frames onde NAO ha deteccao de movimento/objeto: o Shinobi
     # decode 1080p em software (CPU/calor) sem afetar gravacao por botao. Condicional
