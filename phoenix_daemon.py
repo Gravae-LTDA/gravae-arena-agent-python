@@ -24,6 +24,7 @@ import sys
 import json
 import time
 import uuid
+import re
 import socket
 import sqlite3
 import subprocess
@@ -35,7 +36,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.4"
+VERSION = "1.15.5"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -525,6 +526,52 @@ class ServiceGuardian:
                 {"killed": killed}
             )
 
+    def _free_port(self, port):
+        """Kill whatever process is currently listening on the given TCP port.
+
+        Used to clear an EADDRINUSE condition before a pm2 restart: when an
+        orphaned/old listener still holds the port, the freshly-restarted process
+        (e.g. camera.js on 8080) cannot bind and its web server stays dead while
+        the process still looks 'online' to pm2 — the zombie-8080 trap that makes
+        button presses hit a dead 8080 and never record.
+
+        Only ever called after a normal restart already ran AND check_port() still
+        failed, i.e. the service is genuinely down — so killing the holder is safe.
+        Targets only the socket LISTENING on `port` (parsed from `ss -ltnp`); never
+        a broad pkill. Fail-safe: any error (incl. `ss` missing) returns [] and the
+        caller falls back to the pre-existing behaviour. Returns pids killed."""
+        def _listener_pids():
+            pids = set()
+            try:
+                out = subprocess.run(
+                    ["ss", "-ltnp"], capture_output=True, text=True, timeout=10
+                ).stdout
+                for line in out.splitlines():
+                    cols = line.split()
+                    # local address is the 4th column on listening lines: e.g. *:8080
+                    if len(cols) >= 4 and cols[3].endswith(f":{port}"):
+                        pids.update(re.findall(r"pid=(\d+)", line))
+            except Exception as e:
+                log.error(f"_free_port({port}) ss error: {e}")
+            return pids
+
+        killed = []
+        for pid in _listener_pids():
+            try:
+                subprocess.run(["kill", "-TERM", pid], capture_output=True, timeout=5)
+                killed.append(pid)
+            except Exception:
+                pass
+        if killed:
+            time.sleep(2)
+            # SIGKILL any survivor still holding the port
+            for pid in _listener_pids():
+                try:
+                    subprocess.run(["kill", "-9", pid], capture_output=True, timeout=5)
+                except Exception:
+                    pass
+        return killed
+
     def restart_pm2_process(self, service_name):
         """Restart PM2 processes for a service, with fallback to re-register if PM2 list is empty.
         Uses cooldown and max attempts like restart_service()."""
@@ -620,6 +667,30 @@ class ServiceGuardian:
         # Wait and verify
         time.sleep(5)
         port = SERVICES.get(service_name, {}).get("port")
+
+        # EADDRINUSE guard: if this service exposes a port and that port is STILL
+        # dead after a normal pm2 restart, an old/orphan listener is very likely
+        # still holding it (camera.js zombie-8080). A plain `pm2 restart` cannot
+        # recover from that — the new process fails to bind. Free the port (kill
+        # the stuck listener) and restart once more. Reached only for port-based
+        # pm2 services that stayed down, so killing the holder is safe.
+        if port and not self.check_port(port):
+            freed = self._free_port(port)
+            if freed:
+                log.warning(
+                    f"PM2 service {service_name}: port {port} still down after restart "
+                    f"(EADDRINUSE) — killed listener(s) {freed}, restarting"
+                )
+                for pm2_name in pm2_names:
+                    try:
+                        subprocess.run(
+                            ["pm2", "restart", pm2_name],
+                            capture_output=True, timeout=30, env=_pm2_env()
+                        )
+                    except Exception as e:
+                        log.error(f"Error re-running pm2 restart {pm2_name}: {e}")
+                time.sleep(5)
+
         if port and self.check_port(port):
             log.info(f"PM2 service {service_name} recovered successfully")
             alerts.add(
