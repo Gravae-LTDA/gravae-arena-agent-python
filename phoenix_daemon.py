@@ -36,7 +36,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.5"
+VERSION = "1.15.6"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -363,6 +363,7 @@ class ServiceGuardian:
     def __init__(self):
         self.restart_attempts = {}  # service -> (count, last_attempt)
         self.service_status = {}
+        self._http_fail_count = {}  # service -> consecutive HTTP-health failures (TCP up, HTTP hung)
 
     def check_service_systemd(self, service_name):
         try:
@@ -387,6 +388,25 @@ class ServiceGuardian:
     def check_shinobi(self):
         # Shinobi runs via pm2, check port 8080
         return self.check_port(8080)
+
+    def _http_health(self, port, timeout=8):
+        """Return True if an HTTP GET to localhost:port returns an HTTP status line
+        within `timeout`. Distinguishes a healthy web server (responds) from a
+        'zombie' where the TCP listener still accepts connections but the HTTP
+        handler is hung — e.g. Shinobi's knex/DB pool exhausted: button presses
+        hit a dead 8080 and nothing records, yet check_port() (a bare TCP connect)
+        succeeds because the socket is accepted. Any HTTP response (even 3xx/4xx)
+        means the handler is alive; only a full hang (timeout) counts as unhealthy.
+        Fail-closed on errors is fine here: callers require 2 consecutive failures
+        before acting, so a transient blip never triggers a restart."""
+        try:
+            with socket.create_connection(("localhost", port), timeout=timeout) as s:
+                s.settimeout(timeout)
+                s.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                data = s.recv(64)
+                return data.startswith(b"HTTP/")
+        except Exception:
+            return False
 
     def _get_arena_user(self):
         """Detect the arena user (gravae or replayme) from device config or home dirs."""
@@ -807,6 +827,26 @@ class ServiceGuardian:
                 port = config.get("port")
                 if port:
                     is_running = self.check_port(port)
+                    # Zombie-web guard (complements the EADDRINUSE case above): the
+                    # TCP port can be up while the HTTP handler is hung (Shinobi
+                    # knex/DB pool exhausted). check_port() can't tell these apart.
+                    # If TCP is up but HTTP stays unresponsive for 2 CONSECUTIVE
+                    # checks, treat the service as down so it gets restarted.
+                    # Requiring two cycles (not one) avoids restarting a healthy
+                    # Shinobi that is merely busy for a single check — a false
+                    # restart mid-game is worse than the rare zombie.
+                    if is_running:
+                        if self._http_health(port):
+                            self._http_fail_count[service_name] = 0
+                        else:
+                            n = self._http_fail_count.get(service_name, 0) + 1
+                            self._http_fail_count[service_name] = n
+                            if n >= 2:
+                                log.warning(
+                                    f"{service_name}: port {port} accepts TCP but HTTP "
+                                    f"unresponsive x{n} — treating as down (hung-web zombie)"
+                                )
+                                is_running = False
                 else:
                     is_running = self.check_pm2_process(service_name)
             elif service_name == "gravae-buttons":
