@@ -8,6 +8,7 @@ e roda checks locais baratos (Pi 3B friendly); cada anomalia vira um POST /repor
 
 Fase 1: heartbeat + service_down + press_without_video.
 Fase 2: monitor_died + camera_frozen + gpio_idle_24h + gpio_stuck.
+Fase 4: high_memory + ffmpeg_memory_leak (antecipa o OOM que trava a Pi).
 """
 import os
 import re
@@ -24,7 +25,7 @@ from datetime import datetime, timezone
 STATE_PATH = "/etc/gravae/observation.json"
 DEVICE_PATH = "/etc/gravae/device.json"
 DEFAULT_INTERVAL = 45
-OBS_VERSION = "1.4.0"
+OBS_VERSION = "1.5.0"
 PM2_HOME = "/root/.pm2"
 
 # Fase 2 — parâmetros dos checks (conservadores p/ evitar falso-positivo).
@@ -33,6 +34,16 @@ FROZEN_SAMPLES = 3        # nº de amostras idênticas seguidas p/ "congelado" (
 GPIO_STUCK_PER_3MIN = 40  # apertos no mesmo GPIO em 3min ⇒ botão preso/bouncing
 IDLE_HOURS = 24           # botão sem aperto há mais que isto...
 ACTIVE_RECENT_HOURS = 2   # ...enquanto a arena teve aperto nas últimas 2h
+
+# Fase 4 — pressão de memória. Motivador: Calçadão Pinheiros (2026-07) travava a
+# Pi inteira a cada poucos dias. O OOM killer matava ffmpeg inflados (1-2 GB, o
+# normal é ~50 MB) e ~20min depois o kernel travava — só voltava com power-cycle
+# físico. Nenhum check existente pegava isso: o Ultra Watch só notava DEPOIS,
+# como device_offline. Aqui alertamos ANTES do OOM, com folga pra agir.
+MEM_AVAIL_WARN_MB = 700    # RAM disponível abaixo disto ⇒ medium
+MEM_AVAIL_CRIT_MB = 350    # ...abaixo disto ⇒ high (OOM iminente)
+FFMPEG_RSS_WARN_MB = 600   # um ffmpeg sozinho acima disto já é anômalo
+FFMPEG_RSS_CRIT_MB = 900   # nesta faixa o OOM costuma disparar em minutos
 
 # Watchdog (auto-heal) — só age com Ultra Watch ATIVO. Remédio do no-record
 # silencioso (aperto 200 mas 0 evento/vídeo): pm2 restart camera. Conservador —
@@ -440,6 +451,96 @@ def _maybe_autoheal(found, serial, secret, ops):
 
 
 # ---------------------------------------------------------------- loop
+def _meminfo_mb():
+    """(disponivel_mb, total_mb) do /proc/meminfo. MemAvailable é o número certo
+    (conta cache reclaimável), não MemFree."""
+    vals = {}
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].rstrip(":") in ("MemAvailable", "MemTotal"):
+                    vals[parts[0].rstrip(":")] = int(parts[1]) // 1024
+    except Exception:
+        return (None, None)
+    return (vals.get("MemAvailable"), vals.get("MemTotal"))
+
+
+def _ffmpeg_rss_mb():
+    """RSS de cada ffmpeg, em MB, com o monitor a que pertence (quando dá pra
+    inferir pela cmdline). Lê /proc direto — sem ps/awk, barato no Pi 3B."""
+    out = []
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open("/proc/%s/comm" % pid) as fh:
+                    if fh.read().strip() != "ffmpeg":
+                        continue
+                rss = None
+                with open("/proc/%s/status" % pid) as fh:
+                    for line in fh:
+                        if line.startswith("VmRSS:"):
+                            rss = int(line.split()[1]) // 1024
+                            break
+                if rss is None:
+                    continue
+                mon = None
+                with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                    cmd = fh.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+                m = re.search(r"[A-Za-z0-9]+_camera[0-9]+", cmd)
+                if m:
+                    mon = m.group(0)
+                out.append({"pid": int(pid), "rssMb": rss, "monitor": mon})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def check_memory_pressure():
+    """RAM apertando ou ffmpeg inflando — antecede o OOM que trava a Pi.
+
+    Dois gatilhos independentes:
+      - RAM disponível baixa (o sistema todo está no limite);
+      - um ffmpeg individual gigante (o vazamento, antes de derrubar o resto).
+    O segundo é o mais útil: aponta a câmera culpada enquanto ainda há folga.
+    """
+    out = []
+    avail, total = _meminfo_mb()
+    procs = _ffmpeg_rss_mb()
+    worst = max(procs, key=lambda x: x["rssMb"]) if procs else None
+
+    if avail is not None and avail < MEM_AVAIL_WARN_MB:
+        sev = "high" if avail < MEM_AVAIL_CRIT_MB else "medium"
+        out.append({
+            "type": "high_memory", "severity": sev,
+            "detail": "RAM disponivel em %d MB de %s — risco de OOM travar a Pi" % (avail, total),
+            "evidence": {
+                "availMb": avail, "totalMb": total,
+                "ffmpeg": sorted(procs, key=lambda x: -x["rssMb"])[:6],
+            },
+            "dedupKey": "high_memory:device",
+        })
+
+    if worst and worst["rssMb"] >= FFMPEG_RSS_WARN_MB:
+        sev = "high" if worst["rssMb"] >= FFMPEG_RSS_CRIT_MB else "medium"
+        alvo = worst["monitor"] or ("pid %d" % worst["pid"])
+        out.append({
+            "type": "ffmpeg_memory_leak", "severity": sev,
+            "detail": "ffmpeg de %s com %d MB (normal ~50 MB) — inflando ate o OOM" % (alvo, worst["rssMb"]),
+            "evidence": {
+                "monitor": worst["monitor"], "pid": worst["pid"], "rssMb": worst["rssMb"],
+                "availMb": avail, "ffmpegCount": len(procs),
+            },
+            "dedupKey": "ffmpeg_memory_leak:%s" % (worst["monitor"] or "device"),
+        })
+
+    return out
+
+
 def _cycle():
     global _cyc
     _cyc += 1
@@ -473,6 +574,7 @@ def _cycle():
         (check_camera_frozen, ()),
         (check_gpio_stuck, (presses,)),
         (check_gpio_idle_24h, ()),
+        (check_memory_pressure, ()),
     ):
         try:
             found.extend(fn(*args))
