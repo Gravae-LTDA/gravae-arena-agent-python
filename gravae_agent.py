@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.6.5"
+VERSION = "3.6.6"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -1820,6 +1820,90 @@ def ensure_journald_persistent():
         print("[journald] Set Storage=persistent and restarted systemd-journald")
     except Exception as e:
         print(f"[journald] ensure persistent failed: {e}")
+
+
+def ensure_pm2_cgroup_isolated():
+    """Stop a gravae-agent/gravae-phoenix restart from killing Shinobi with it.
+
+    Root cause seen across the fleet (2026-07-30: 285 of 350 Pis affected): the PM2
+    God daemon is spawned as a child of whichever process calls `pm2` first after
+    boot. When that caller is gravae-agent or gravae-phoenix, God -- and the
+    camera.js it supervises -- land inside that unit's cgroup. Every time systemd
+    restarts the unit it tears down the whole cgroup, so Shinobi dies as collateral.
+    Port 8080 disappears, the button daemon gets `[Errno 111] Connection refused`,
+    and presses are lost silently: no alarm fires because the agent itself is up.
+    RRBT Beach Tennis lost 71 presses over 3 days this way.
+
+    Two layers, both idempotent and neither restarts anything that is serving:
+
+    1) KillMode=process drop-ins on gravae-agent and gravae-phoenix. systemd then
+       kills only the unit's main process on restart, never inherited children.
+       This neutralises the damage even while God sits in the wrong cgroup, which
+       is what makes the fix safe to roll out without touching a running Shinobi.
+
+    2) pm2-root.service enabled. On the next boot systemd starts it before the
+       agent, so God is born in /system.slice/pm2-root.service and the cgroup is
+       correct from then on.
+
+    Deliberately does NOT re-parent PM2 now: that means stopping phoenix+agent,
+    killing God and restarting camera.js -- seconds of downtime per Pi, pointless
+    to repeat on every agent start. Layer 1 already removes the risk; layer 2
+    settles it on the next reboot.
+    """
+    time.sleep(40)  # let the startup burst finish first
+    try:
+        changed = []
+        for unit in ("gravae-agent", "gravae-phoenix"):
+            d = f"/etc/systemd/system/{unit}.service.d"
+            conf = f"{d}/10-killmode.conf"
+            try:
+                with open(conf, "r") as f:
+                    if "KillMode=process" in f.read():
+                        continue
+            except Exception:
+                pass
+            subprocess.run(["sudo", "mkdir", "-p", d], check=False, timeout=10)
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix="_killmode.conf") as tf:
+                tf.write("# Gravae: nao derrubar PM2/Shinobi herdados quando esta unit reinicia.\n"
+                         "# Ver ensure_pm2_cgroup_isolated() em gravae_agent.py\n"
+                         "[Service]\nKillMode=process\n")
+                tmp = tf.name
+            subprocess.run(["sudo", "cp", tmp, conf], check=False, timeout=10)
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            changed.append(unit)
+        if changed:
+            subprocess.run(["sudo", "systemctl", "daemon-reload"], check=False, timeout=20)
+            print(f"[pm2-cgroup] KillMode=process aplicado em: {', '.join(changed)}")
+
+        # 2) pm2-root.service habilitado para o proximo boot
+        st = subprocess.run(["sudo", "systemctl", "is-enabled", "pm2-root.service"],
+                            capture_output=True, text=True, timeout=10)
+        if "enabled" not in (st.stdout or ""):
+            subprocess.run(["sudo", "env", f"PATH={os.environ.get('PATH','')}",
+                            "pm2", "startup", "systemd", "-u", "root", "--hp", "/root"],
+                           check=False, timeout=45)
+            subprocess.run(["sudo", "systemctl", "enable", "pm2-root.service"],
+                           check=False, timeout=20)
+            print("[pm2-cgroup] pm2-root.service criado e habilitado")
+
+        # 3) so reporta o estado atual -- diagnostico, sem acao disruptiva
+        pid = subprocess.run(["sudo", "pgrep", "-f", "node.*Shinobi/camera.js"],
+                             capture_output=True, text=True, timeout=10).stdout.split("\n")[0].strip()
+        if pid:
+            cg = subprocess.run(["sudo", "cat", f"/proc/{pid}/cgroup"],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+            cg = cg.replace("0::", "")
+            if cg and "pm2-root.service" not in cg:
+                print(f"[pm2-cgroup] camera.js ainda em {cg} -- "
+                      "protegido por KillMode; corrige sozinho no proximo boot")
+            else:
+                print(f"[pm2-cgroup] camera.js isolado corretamente ({cg})")
+    except Exception as e:
+        print(f"[pm2-cgroup] ensure failed: {e}")
 
 
 def ensure_shinobi_probe_disabled():
@@ -5853,6 +5937,9 @@ def main():
     # Keep journald logs across reboots so button/agent history survives a
     # power-cycle and freezes can be diagnosed (press-vs-event). Idempotent.
     threading.Thread(target=ensure_journald_persistent, daemon=True).start()
+
+    # impede que um restart do agent/phoenix derrube o Shinobi junto
+    threading.Thread(target=ensure_pm2_cgroup_isolated, daemon=True).start()
 
     # Ensure Shinobi probeMonitorOnStart=false so a failed 2s ffprobe on a monitor
     # (re)start can no longer unregister it from activeMonitors (aperto 200 sem
