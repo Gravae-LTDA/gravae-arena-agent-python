@@ -36,7 +36,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.6"
+VERSION = "1.15.7"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -77,6 +77,55 @@ PM2_HOME = "/root/.pm2"
 def _pm2_env():
     """Environment for every pm2 subprocess call: pin root's canonical PM2_HOME."""
     return {**os.environ, "PM2_HOME": PM2_HOME, "HOME": "/root"}
+
+# PM2 boot unit repair (see ServiceGuardian._repair_pm2_boot_unit).
+PM2_ROOT_UNIT = Path("/etc/systemd/system/pm2-root.service")
+PM2_BOOT_HELPER = Path("/opt/gravae/pm2-resurrect-boot.sh")
+
+PM2_BOOT_HELPER_BODY = f"""#!/bin/bash
+# Managed by Phoenix. Brings PM2 (Shinobi camera+cron) up at boot without hanging
+# systemd: `pm2 resurrect` launches the processes but the CLI never returns on
+# pm2 6.x, so it goes to the background under a timeout and we only wait for :8080.
+export PM2_HOME={PM2_HOME}
+
+PM2=""
+for c in /usr/local/bin/pm2 /usr/bin/pm2 /usr/local/lib/node_modules/pm2/bin/pm2; do
+  [ -x "$c" ] && PM2="$c" && break
+done
+[ -z "$PM2" ] && PM2=$(command -v pm2)
+[ -z "$PM2" ] && exit 0
+
+( timeout 45 "$PM2" resurrect >/dev/null 2>&1 ) &
+
+for i in $(seq 1 30); do
+  curl -sf -o /dev/null --max-time 2 http://127.0.0.1:8080/ && exit 0
+  sleep 1
+done
+exit 0
+"""
+
+# NOTE: ExecStart is interpolated from PM2_BOOT_HELPER on purpose — _repair_pm2_boot_unit
+# detects "already repaired" by looking for that same path inside the installed unit, so a
+# hardcoded copy here would silently break idempotency and rewrite the unit on every boot.
+PM2_ROOT_UNIT_BODY = f"""[Unit]
+Description=PM2 process manager
+Documentation=https://pm2.keymetrics.io/
+After=network.target mariadb.service mysql.service
+Wants=mariadb.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Environment=PM2_HOME={PM2_HOME}
+Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+ExecStart={PM2_BOOT_HELPER}
+ExecStop=/bin/bash -c "/usr/bin/timeout 30 pm2 kill; true"
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
+"""
 
 # Connectivity check targets
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
@@ -546,6 +595,25 @@ class ServiceGuardian:
                 {"killed": killed}
             )
 
+    def _port_listener_pids(self, port):
+        """PIDs of the processes LISTENING on a TCP port (parsed from `ss -ltnp`).
+
+        Fail-safe: any error (incl. `ss` missing) returns an empty set, so every
+        caller degrades to 'unknown owner' instead of acting on bad data."""
+        pids = set()
+        try:
+            out = subprocess.run(
+                ["ss", "-ltnp"], capture_output=True, text=True, timeout=10
+            ).stdout
+            for line in out.splitlines():
+                cols = line.split()
+                # local address is the 4th column on listening lines: e.g. *:8080
+                if len(cols) >= 4 and cols[3].endswith(f":{port}"):
+                    pids.update(int(p) for p in re.findall(r"pid=(\d+)", line))
+        except Exception as e:
+            log.error(f"_port_listener_pids({port}) ss error: {e}")
+        return pids
+
     def _free_port(self, port):
         """Kill whatever process is currently listening on the given TCP port.
 
@@ -560,37 +628,264 @@ class ServiceGuardian:
         Targets only the socket LISTENING on `port` (parsed from `ss -ltnp`); never
         a broad pkill. Fail-safe: any error (incl. `ss` missing) returns [] and the
         caller falls back to the pre-existing behaviour. Returns pids killed."""
-        def _listener_pids():
-            pids = set()
-            try:
-                out = subprocess.run(
-                    ["ss", "-ltnp"], capture_output=True, text=True, timeout=10
-                ).stdout
-                for line in out.splitlines():
-                    cols = line.split()
-                    # local address is the 4th column on listening lines: e.g. *:8080
-                    if len(cols) >= 4 and cols[3].endswith(f":{port}"):
-                        pids.update(re.findall(r"pid=(\d+)", line))
-            except Exception as e:
-                log.error(f"_free_port({port}) ss error: {e}")
-            return pids
-
         killed = []
-        for pid in _listener_pids():
+        for pid in self._port_listener_pids(port):
             try:
-                subprocess.run(["kill", "-TERM", pid], capture_output=True, timeout=5)
+                subprocess.run(["kill", "-TERM", str(pid)], capture_output=True, timeout=5)
                 killed.append(pid)
             except Exception:
                 pass
         if killed:
             time.sleep(2)
             # SIGKILL any survivor still holding the port
-            for pid in _listener_pids():
+            for pid in self._port_listener_pids(port):
                 try:
-                    subprocess.run(["kill", "-9", pid], capture_output=True, timeout=5)
+                    subprocess.run(["kill", "-9", str(pid)], capture_output=True, timeout=5)
                 except Exception:
                     pass
         return killed
+
+    def _repair_pm2_boot_unit(self):
+        """Replace the broken `Type=forking` + `pm2 resurrect` pm2-root.service.
+
+        On pm2 6.x `pm2 resurrect` DOES launch camera+cron (:8080 comes up in 3-30s)
+        but the CLI process never returns. With Type=forking + PIDFile systemd never
+        finds the PIDFile and marks the unit `failed (protocol)`; with Type=oneshot it
+        is `failed (timeout)`. Either way systemd crash-loops the unit (restart counter
+        in the hundreds) and Shinobi only comes up when an attempt happens to stick —
+        which can take HOURS. CBT Tenis Rasp 2: reboot 17/06 16:05 -> Shinobi back
+        18/06 03:59, ~12h with every button press lost. Confirmed on several Pis
+        (CTF Marcelinho 319 restarts, Bs Futevolei 137, D7, Barra Beach).
+
+        Fix: a helper that backgrounds the resurrect under a timeout and returns as
+        soon as :8080 answers, behind Type=oneshot + RemainAfterExit=yes.
+
+        Non-disruptive by construction: it only writes files and reloads systemd. It
+        never restarts the unit (ExecStop runs `pm2 kill`, which WOULD drop Shinobi) —
+        a unit that is already active keeps running and simply picks up the new
+        definition at the next boot. Idempotent: a no-op once the helper is in place."""
+        try:
+            if not PM2_ROOT_UNIT.exists():
+                return  # PM2 isn't started by systemd here — nothing to repair
+            current = PM2_ROOT_UNIT.read_text(errors="ignore")
+
+            if str(PM2_BOOT_HELPER) in current:
+                # Already repaired; just make sure the helper itself survived.
+                if not PM2_BOOT_HELPER.exists():
+                    PM2_BOOT_HELPER.parent.mkdir(parents=True, exist_ok=True)
+                    PM2_BOOT_HELPER.write_text(PM2_BOOT_HELPER_BODY)
+                    PM2_BOOT_HELPER.chmod(0o755)
+                    log.warning("[pm2-boot] restored missing helper script")
+                return
+
+            # Only touch the known-broken shape: resurrect straight from ExecStart.
+            if "resurrect" not in current:
+                log.debug("[pm2-boot] custom pm2-root.service (no resurrect) — leaving alone")
+                return
+
+            dump = Path(PM2_HOME) / "dump.pm2"
+            if not dump.exists():
+                log.warning("[pm2-boot] %s missing — resurrect will restore nothing at boot; "
+                            "installing helper anyway (no worse than the current unit)", dump)
+
+            backup = PM2_ROOT_UNIT.with_suffix(f".service.bak-{int(time.time())}")
+            backup.write_text(current)
+
+            PM2_BOOT_HELPER.parent.mkdir(parents=True, exist_ok=True)
+            PM2_BOOT_HELPER.write_text(PM2_BOOT_HELPER_BODY)
+            PM2_BOOT_HELPER.chmod(0o755)
+            PM2_ROOT_UNIT.write_text(PM2_ROOT_UNIT_BODY)
+
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=60)
+            subprocess.run(["systemctl", "reset-failed", "pm2-root.service"],
+                           capture_output=True, timeout=30)
+            subprocess.run(["systemctl", "enable", "pm2-root.service"],
+                           capture_output=True, timeout=30)
+
+            # Start ONLY if it isn't up: `start` on an active unit is a no-op, and a
+            # `restart` would run ExecStop (pm2 kill) and take Shinobi down with it.
+            active = subprocess.run(["systemctl", "is-active", "pm2-root.service"],
+                                    capture_output=True, text=True, timeout=15).stdout.strip()
+            if active != "active":
+                subprocess.run(["systemctl", "start", "pm2-root.service"],
+                               capture_output=True, timeout=90)
+
+            log.warning(f"[pm2-boot] replaced broken pm2-root.service (backup: {backup.name})")
+            alerts.add(
+                "pm2_boot_unit_repaired",
+                "info",
+                "Replaced hanging pm2-root.service (Type=forking + pm2 resurrect) "
+                "with the timeout-guarded boot helper",
+                {"backup": backup.name, "was_active": active}
+            )
+        except Exception as e:
+            log.error(f"[pm2-boot] repair failed: {e}")
+
+    def _pm2_shinobi_pids(self):
+        """PIDs that the canonical PM2 God daemon reports for camera/cron."""
+        pids = set()
+        try:
+            for proc in (self._run_pm2_jlist() or []):
+                if (proc.get("name") or "").lower() not in ("camera", "cron"):
+                    continue
+                pid = proc.get("pid")
+                if isinstance(pid, int) and pid > 0:
+                    pids.add(pid)
+        except Exception as e:
+            log.debug(f"[shinobi-dedup] pm2 jlist failed: {e}")
+        return pids
+
+    def _running_camera_js(self):
+        """[(pid, ppid, args)] for every *main* Shinobi camera.js process.
+
+        Excludes libs/cameraThread/singleCamera.js — that is one worker per monitor,
+        legitimately spawned by camera.js, and its args also contain 'camera.js'."""
+        found = []
+        try:
+            res = subprocess.run(
+                ["ps", "-eo", "pid,ppid,args"], capture_output=True, text=True, timeout=10
+            )
+        except Exception as e:
+            log.debug(f"[shinobi-dedup] ps failed: {e}")
+            return found
+        for line in res.stdout.splitlines():
+            if "camera.js" not in line or "singleCamera" in line:
+                continue
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid, ppid = int(parts[0]), int(parts[1])
+            except Exception:
+                continue
+            if pid == os.getpid():
+                continue
+            found.append((pid, ppid, parts[2]))
+        return found
+
+    def _systemd_units_starting_camera_js(self):
+        """Unit files whose ExecStart launches Shinobi's camera.js directly.
+
+        These are the competing supervisor: PM2 is the one Phoenix knows how to
+        restart/re-register, so a unit that starts camera.js behind PM2's back is
+        always the intruder. pm2-*.service never matches (its ExecStart is
+        `pm2 resurrect`, not camera.js) and is explicitly skipped anyway."""
+        units = []
+        try:
+            for path in Path("/etc/systemd/system").glob("*.service"):
+                if path.name.startswith("pm2"):
+                    continue
+                try:
+                    text = path.read_text(errors="ignore")
+                except Exception:
+                    continue
+                if "camera.js" in text and "singleCamera" not in text:
+                    units.append(path.name)
+        except Exception as e:
+            log.debug(f"[shinobi-dedup] unit scan failed: {e}")
+        return units
+
+    def _cleanup_rogue_shinobi_instances(self):
+        """Ensure exactly ONE Shinobi camera.js runs. Fixes the *other* duplication vector.
+
+        Bug6 (_cleanup_duplicate_pm2_daemons) only ever inspects lines containing
+        'PM2 ... God Daemon', so it is structurally blind to a second camera.js
+        started outside PM2 — a systemd unit, a cron entry, a manual `node camera.js`.
+
+        Why it matters: both instances open the same RTSP and write the SAME
+        /dev/shm/streams/<gk>/<mid>/ with +delete_segments while sharing a single
+        s.m3u8. Each deletes the other's segments and overwrites the playlist, so
+        the HLS buffer the recorder reads has holes and every exported clip freezes
+        for seconds at a time. Villa Beach (2026-08-01): a 36s clip was 62.8% frozen,
+        11.4 fps effective, with one 4s segment lost every 6s. The loser also never
+        binds :8080 (EADDRINUSE, 60x in camera-error.log) so it is pure damage —
+        it serves nothing and corrupts the stream of the one that does.
+
+        Acts ONLY when 2+ are running: a single instance is left alone no matter
+        which supervisor owns it, so this can never take Shinobi down."""
+        procs = self._running_camera_js()
+        if len(procs) <= 1:
+            return
+
+        now = time.time()
+        if now - getattr(self, "_last_shinobi_dedup", 0) < 600:
+            return  # never loop on this; one corrective pass per 10 min is plenty
+
+        pm2_pids = self._pm2_shinobi_pids()
+        keep = next((pid for pid, _, _ in procs if pid in pm2_pids), None)
+        disable_units = True
+        if keep is None:
+            # PM2 owns none of them. Keep whoever actually serves :8080 and only drop
+            # the extras — do NOT disable units here: with no PM2 instance to fall
+            # back on, that unit is the only thing keeping Shinobi alive.
+            disable_units = False
+            listeners = self._port_listener_pids(8080)
+            keep = next((pid for pid, _, _ in procs if pid in listeners), None)
+            if keep is None:
+                log.warning("[shinobi-dedup] %d camera.js running but no canonical owner "
+                            "(PM2 knows none, none holds :8080) — not touching anything",
+                            len(procs))
+                return
+
+        self._last_shinobi_dedup = now
+        log.warning(f"[shinobi-dedup] {len(procs)} camera.js running (expected 1) — keeping pid={keep}")
+
+        disabled = []
+        if disable_units:
+            # Disable the unit BEFORE killing: Restart=always would resurrect the
+            # rogue immediately and we would just flap against it forever.
+            for unit in self._systemd_units_starting_camera_js():
+                try:
+                    subprocess.run(["systemctl", "disable", "--now", unit],
+                                   capture_output=True, timeout=60)
+                    disabled.append(unit)
+                    log.warning(f"[shinobi-dedup] disabled {unit} — it competes with PM2 for Shinobi")
+                except Exception as e:
+                    log.error(f"[shinobi-dedup] failed to disable {unit}: {e}")
+
+        held_8080 = self._port_listener_pids(8080)
+        rogue_owned_8080 = False
+        killed = []
+        for pid, _ppid, _args in procs:
+            if pid == keep:
+                continue
+            if pid in held_8080:
+                rogue_owned_8080 = True
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed.append(pid)
+            except ProcessLookupError:
+                pass  # `systemctl disable --now` already reaped it
+            except Exception as e:
+                log.error(f"[shinobi-dedup] failed to stop rogue pid={pid}: {e}")
+        if killed:
+            time.sleep(3)
+            for pid in killed:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        if not killed and not disabled:
+            return
+
+        # If the rogue was the one holding :8080, the survivor had lost the bind at
+        # startup and never retries — it must be restarted or Shinobi stays headless.
+        if rogue_owned_8080 or not self.check_port(8080):
+            log.warning("[shinobi-dedup] survivor does not own :8080 — restarting PM2 camera")
+            try:
+                subprocess.run(["pm2", "restart", "camera"], capture_output=True,
+                               timeout=60, env=_pm2_env())
+            except Exception as e:
+                log.error(f"[shinobi-dedup] pm2 restart camera failed: {e}")
+
+        alerts.add(
+            "shinobi_duplicate_cleaned",
+            "warning",
+            f"Removed {len(killed)} rogue Shinobi instance(s), kept pid={keep}"
+            + (f"; disabled {', '.join(disabled)}" if disabled else ""),
+            {"killed": killed, "kept": keep, "disabled_units": disabled,
+             "rogue_owned_8080": rogue_owned_8080}
+        )
 
     def restart_pm2_process(self, service_name):
         """Restart PM2 processes for a service, with fallback to re-register if PM2 list is empty.
@@ -2350,6 +2645,19 @@ class PhoenixDaemon:
         except Exception:
             pass
 
+        # Same-shape self-heal for a camera.js started outside PM2 (systemd/cron/manual):
+        # two writers on one /dev/shm HLS dir = every exported clip comes out frozen.
+        try:
+            self.service_guardian._cleanup_rogue_shinobi_instances()
+        except Exception:
+            pass
+
+        # One-shot repair of the pm2-root.service that hangs at boot (12h outages).
+        try:
+            self.service_guardian._repair_pm2_boot_unit()
+        except Exception:
+            pass
+
         # sd_notify kept for backwards compatibility (no-op if service is Type=simple)
         def sd_notify(msg):
             try:
@@ -2389,6 +2697,7 @@ class PhoenixDaemon:
                 # Service check (every 2 minutes)
                 if now - last_service_check >= CHECK_INTERVAL:
                     self.service_guardian._cleanup_duplicate_pm2_daemons()
+                    self.service_guardian._cleanup_rogue_shinobi_instances()
                     self.service_guardian.check_all_services_v2()
                     last_service_check = now
 
