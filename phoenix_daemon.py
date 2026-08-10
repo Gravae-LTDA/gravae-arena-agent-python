@@ -36,7 +36,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.6"
+VERSION = "1.15.8"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -79,8 +79,10 @@ def _pm2_env():
     return {**os.environ, "PM2_HOME": PM2_HOME, "HOME": "/root"}
 
 # Connectivity check targets
+# Só IP literal, nunca hostname: nome dual-stack resolve por IPv6 e esconde a
+# perda de rota IPv4 -- que é o que de fato derruba tunel, pitunnel e cameras.
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
-HTTP_TARGETS = ["https://cloudflare.com", "https://google.com"]
+TCP4_TARGETS = [("1.1.1.1", 443), ("8.8.8.8", 53), ("208.67.222.222", 443)]
 
 # Services to monitor
 SERVICES = {
@@ -1155,24 +1157,74 @@ class ConnectivitySentinel:
         except:
             return False
 
-    def http_check(self, url):
+    def tcp4_check(self, host, port):
+        """Conexao TCP forcando IPv4 (AF_INET).
+
+        Fallback pro ping: alguns provedores bloqueiam ICMP. Usa IP literal e
+        AF_INET de proposito -- ver check_connectivity() pro porque.
+        """
+        sock = None
         try:
-            import urllib.request
-            req = urllib.request.Request(url, method="HEAD")
-            urllib.request.urlopen(req, timeout=10)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((host, port))
             return True
-        except:
+        except Exception:
             return False
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def has_ipv4_default_route(self):
+        """True se existe rota default IPv4. Na duvida, True (nao acusar sem prova)."""
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "route", "show", "default"],
+                capture_output=True, text=True, timeout=5
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return True
 
     def check_connectivity(self):
-        # Try ping first
+        """Conectividade UTIL para a arena -- ou seja, IPv4.
+
+        ATENCAO: so testar IPv4 aqui e proposital, nao descuido.
+
+        O tunel cloudflared, o pitunnel e as cameras (LAN 192.168.x) dependem
+        todos de IPv4. Uma Pi que perdeu o IPv4 e manteve o IPv6 esta morta para
+        a operacao, mesmo "navegando" normalmente.
+
+        O bug que isso corrige: o fallback antigo era HTTP por NOME
+        (cloudflare.com / google.com). Esses nomes sao dual-stack, entao o
+        urllib conectava por IPv6 e devolvia True -- o sentinela se achava
+        online, offline_since ficava None e NENHUM degrau de escalonamento
+        rodava (nem o dhcp_fallback de 2h, que era exatamente o conserto).
+        Caso real: Quadro Padel Garden, 04/08/2026 -- outro aparelho tomou o IP
+        da Pi por DAD, o dhcpcd removeu a rota default IPv4 e a arena ficou
+        5 DIAS fora sem o Phoenix reagir uma unica vez.
+        """
+        # Sinal mais direto do modo de falha: sem rota default IPv4 nao ha o que
+        # testar -- nada que a arena precisa vai funcionar.
+        if not self.has_ipv4_default_route():
+            log.warning(
+                "Sem rota default IPv4 (possivel conflito de IP/lease perdido) - "
+                "tratando como OFFLINE mesmo que o IPv6 esteja funcionando"
+            )
+            return False
+
+        # ICMP primeiro (barato)
         for target in PING_TARGETS:
             if self.ping(target):
                 return True
 
-        # Try HTTP as fallback
-        for target in HTTP_TARGETS:
-            if self.http_check(target):
+        # Fallback TCP, IPv4 forcado. NUNCA usar hostname aqui: dual-stack
+        # mascara a perda de IPv4 e foi exatamente o que causou o incidente.
+        for host, port in TCP4_TARGETS:
+            if self.tcp4_check(host, port):
                 return True
 
         return False
@@ -2057,6 +2109,7 @@ class WebhookSender:
 
     def __init__(self):
         self.webhook_url = None
+        self.ops_webhook_url = None
         self.platform = None
         self.device_serial = None
         self.device_name = None
@@ -2081,6 +2134,16 @@ class WebhookSender:
 
                 self.webhook_url = config.get("webhookUrl") or WEBHOOK_URLS.get(self.platform)
 
+                # ⚠️ O instalador grava a URL do OPS como **platformWebhookUrl**,
+                # mas por anos so se leu `webhookUrl` acima — chave que NAO existe
+                # no device.json. Resultado: o destino do OPS era descartado em
+                # silencio e a tabela `phoenix_alerts` ficou vazia na frota
+                # inteira. Lido separado (e nao como fallback) pra continuar
+                # mandando pro webhook do produto tambem.
+                self.ops_webhook_url = config.get("platformWebhookUrl")
+                if self.ops_webhook_url == self.webhook_url:
+                    self.ops_webhook_url = None
+
             # Read device serial
             try:
                 with open("/proc/cpuinfo") as f:
@@ -2091,7 +2154,7 @@ class WebhookSender:
             except Exception:
                 pass
 
-            log.info(f"Webhook configured: platform={self.platform}, url={self.webhook_url}, serial={self.device_serial}")
+            log.info(f"Webhook configured: platform={self.platform}, url={self.webhook_url}, ops_url={self.ops_webhook_url}, serial={self.device_serial}")
         except Exception as e:
             log.warning(f"Webhook config load failed: {e}")
 
@@ -2183,34 +2246,56 @@ class WebhookSender:
             "Content-Type": "application/json",
         }
 
-        # Send with retry
+        # Manda pra TODOS os destinos configurados. Antes so ia pro webhook do
+        # produto; o do OPS (`platformWebhookUrl` do device.json) era lido com a
+        # chave errada em _load_config e ficava sempre None, entao NENHUM alerta
+        # da frota chegou no OPS — `phoenix_alerts` estava zerada.
+        targets = [u for u in (self.webhook_url, self.ops_webhook_url) if u]
+        if not targets:
+            return False
+
+        delivered = False
+        for url in targets:
+            if self._post_events(url, payload, headers, len(events)):
+                delivered = True
+
+        # Basta um destino aceitar pra nao reenviar eternamente.
+        if delivered:
+            alert_queue.mark_synced(alert_ids)
+        return delivered
+
+    def _post_events(self, url, payload, headers, event_count):
+        """POST com retry num destino. True se o destino aceitou."""
         for attempt in range(WEBHOOK_MAX_RETRIES):
             try:
                 import urllib.request
                 req = urllib.request.Request(
-                    self.webhook_url,
+                    url,
                     data=json.dumps(payload).encode("utf-8"),
                     headers=headers,
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT) as resp:
                     status = resp.status
-                    if status in (200, 202):
-                        alert_queue.mark_synced(alert_ids)
-                        log.info(f"Webhook sent: {len(events)} event(s), status={status}")
+                    # Qualquer 2xx conta. Antes so 200/202 eram aceitos e o
+                    # endpoint do produto responde **204**: a fila nunca era
+                    # marcada como enviada e os mesmos alertas voltavam pra
+                    # sempre (7.387 reenvios observados numa unica Pi).
+                    if 200 <= status < 300:
+                        log.info(f"Webhook sent: {event_count} event(s), status={status}, url={url}")
                         return True
                     elif status == 429:
                         wait = 2 ** attempt
-                        log.warning(f"Webhook rate limited, retrying in {wait}s")
+                        log.warning(f"Webhook rate limited em {url}, retentando em {wait}s")
                         time.sleep(wait)
                     else:
-                        log.warning(f"Webhook returned {status}")
+                        log.warning(f"Webhook returned {status} em {url}")
                         return False
             except Exception as e:
                 if attempt < WEBHOOK_MAX_RETRIES - 1:
                     time.sleep(2 ** attempt)
                 else:
-                    log.warning(f"Webhook send failed after {WEBHOOK_MAX_RETRIES} attempts: {e}")
+                    log.warning(f"Webhook send failed after {WEBHOOK_MAX_RETRIES} attempts em {url}: {e}")
         return False
 
 # Boot report removed in v1.9.0 - Phoenix no longer reboots the system.
