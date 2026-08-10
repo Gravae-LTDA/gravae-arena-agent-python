@@ -36,7 +36,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.6"
+VERSION = "1.15.7"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -79,8 +79,10 @@ def _pm2_env():
     return {**os.environ, "PM2_HOME": PM2_HOME, "HOME": "/root"}
 
 # Connectivity check targets
+# Só IP literal, nunca hostname: nome dual-stack resolve por IPv6 e esconde a
+# perda de rota IPv4 -- que é o que de fato derruba tunel, pitunnel e cameras.
 PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
-HTTP_TARGETS = ["https://cloudflare.com", "https://google.com"]
+TCP4_TARGETS = [("1.1.1.1", 443), ("8.8.8.8", 53), ("208.67.222.222", 443)]
 
 # Services to monitor
 SERVICES = {
@@ -1155,24 +1157,74 @@ class ConnectivitySentinel:
         except:
             return False
 
-    def http_check(self, url):
+    def tcp4_check(self, host, port):
+        """Conexao TCP forcando IPv4 (AF_INET).
+
+        Fallback pro ping: alguns provedores bloqueiam ICMP. Usa IP literal e
+        AF_INET de proposito -- ver check_connectivity() pro porque.
+        """
+        sock = None
         try:
-            import urllib.request
-            req = urllib.request.Request(url, method="HEAD")
-            urllib.request.urlopen(req, timeout=10)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((host, port))
             return True
-        except:
+        except Exception:
             return False
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def has_ipv4_default_route(self):
+        """True se existe rota default IPv4. Na duvida, True (nao acusar sem prova)."""
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "route", "show", "default"],
+                capture_output=True, text=True, timeout=5
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return True
 
     def check_connectivity(self):
-        # Try ping first
+        """Conectividade UTIL para a arena -- ou seja, IPv4.
+
+        ATENCAO: so testar IPv4 aqui e proposital, nao descuido.
+
+        O tunel cloudflared, o pitunnel e as cameras (LAN 192.168.x) dependem
+        todos de IPv4. Uma Pi que perdeu o IPv4 e manteve o IPv6 esta morta para
+        a operacao, mesmo "navegando" normalmente.
+
+        O bug que isso corrige: o fallback antigo era HTTP por NOME
+        (cloudflare.com / google.com). Esses nomes sao dual-stack, entao o
+        urllib conectava por IPv6 e devolvia True -- o sentinela se achava
+        online, offline_since ficava None e NENHUM degrau de escalonamento
+        rodava (nem o dhcp_fallback de 2h, que era exatamente o conserto).
+        Caso real: Quadro Padel Garden, 04/08/2026 -- outro aparelho tomou o IP
+        da Pi por DAD, o dhcpcd removeu a rota default IPv4 e a arena ficou
+        5 DIAS fora sem o Phoenix reagir uma unica vez.
+        """
+        # Sinal mais direto do modo de falha: sem rota default IPv4 nao ha o que
+        # testar -- nada que a arena precisa vai funcionar.
+        if not self.has_ipv4_default_route():
+            log.warning(
+                "Sem rota default IPv4 (possivel conflito de IP/lease perdido) - "
+                "tratando como OFFLINE mesmo que o IPv6 esteja funcionando"
+            )
+            return False
+
+        # ICMP primeiro (barato)
         for target in PING_TARGETS:
             if self.ping(target):
                 return True
 
-        # Try HTTP as fallback
-        for target in HTTP_TARGETS:
-            if self.http_check(target):
+        # Fallback TCP, IPv4 forcado. NUNCA usar hostname aqui: dual-stack
+        # mascara a perda de IPv4 e foi exatamente o que causou o incidente.
+        for host, port in TCP4_TARGETS:
+            if self.tcp4_check(host, port):
                 return True
 
         return False
