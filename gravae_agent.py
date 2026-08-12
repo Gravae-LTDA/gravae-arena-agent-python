@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.6.7"
+VERSION = "3.6.8"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -247,6 +247,52 @@ def get_uptime():
     except Exception as e:
         return {"error": str(e)}
 
+def get_button_presses(limit=60):
+    """Últimos apertos de botão, lidos do journal do gravae-buttons.
+
+    Serve pra tela de mapeamento do OPS mostrar os apertos ao vivo — o operador
+    aperta a botoeira na quadra e vê qual GPIO respondeu, que é o jeito prático
+    de descobrir o mapa certo antes de gravar.
+
+    Lê do journalctl (e não do arquivo de contagem) porque as DUAS gerações de
+    button-daemon.py imprimem `[PRESS]`, com formatos de linha diferentes:
+      antigo: [PRESS] GPIO13 -> quadra01_camera01 (Quadra 1) HTTP 200
+      novo:   [PRESS] 2026-08-07 18:16:18 - GPIO6 - quadra01_camera01 [1 monitors]
+    Por isso o parse extrai só GPIO e monitor, tolerando o resto.
+    """
+    import re as _re
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 60
+
+    try:
+        out = subprocess.run(
+            ['journalctl', '-u', 'gravae-buttons', '-n', str(limit * 4),
+             '--no-pager', '-o', 'short-iso'],
+            capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception as e:
+        return {"presses": [], "error": str(e)}
+
+    presses = []
+    for line in out.splitlines():
+        if '[PRESS]' not in line:
+            continue
+        gpio = _re.search(r'GPIO\s*(\d+)', line)
+        # monitor = primeiro token com "_camera" (vale nos dois formatos)
+        monitor = _re.search(r'([A-Za-z0-9_]*_camera\d+)', line)
+        ts = _re.match(r'(\S+)', line)
+        presses.append({
+            "at": ts.group(1) if ts else None,
+            "gpio": int(gpio.group(1)) if gpio else None,
+            "monitor": monitor.group(1) if monitor else None,
+            "raw": line.strip()[-160:],
+        })
+
+    return {"presses": presses[-limit:], "count": len(presses)}
+
+
 def get_button_daemon_status():
     try:
         result = subprocess.run(['systemctl', 'is-active', 'gravae-buttons'], capture_output=True, text=True)
@@ -268,9 +314,10 @@ def get_button_mapping():
         if not match:
             return None
         triggers_block = match.group(1)
-        # Parse each GPIO entry: gpio_num: [('url', 'label'), ...]
         mapping = []
-        # Find all gpio entries
+
+        # --- Formato ATUAL (gerado pelo OPS): gpio: [('url', 'monitor'), ...] ---
+        # A lista permite mais de um monitor por GPIO.
         gpio_pattern = re.findall(r'(\d+)\s*:\s*\[(.*?)\]', triggers_block, re.DOTALL)
         for gpio_str, urls_block in gpio_pattern:
             gpio = int(gpio_str)
@@ -284,6 +331,31 @@ def get_button_mapping():
                 "label": label,
                 "monitors": monitors,
             })
+
+        # --- Formato LEGADO: gpio: ("monitor_id", "Rótulo") ---
+        # Instalações antigas guardam a tupla direta, sem lista e sem URL (a URL
+        # é montada em runtime por trigger_url()). O regex de lista acima não
+        # casa com isso e o mapa voltava VAZIO — a tela do OPS mostrava
+        # "daemon rodando / 0 GPIOs", sem explicar nada.
+        if not mapping:
+            legacy = re.findall(
+                r'(\d+)\s*:\s*\(\s*[\'"]([^\'"]+)[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]\s*\)',
+                triggers_block,
+            )
+            for gpio_str, monitor_id, label in legacy:
+                mapping.append({
+                    "gpio": int(gpio_str),
+                    "label": label or monitor_id,
+                    "monitors": [monitor_id],
+                })
+
+        # Bloco existe mas nada foi extraído = formato desconhecido, NÃO "sem
+        # botões". Devolver None deixa o OPS dizer "não consegui parsear" em vez
+        # de afirmar que a arena tem zero GPIO configurado.
+        if not mapping and triggers_block.strip():
+            log.warning("BTN_TRIGGERS encontrado mas nenhum GPIO reconhecido (formato novo?)")
+            return None
+
         return mapping
     except Exception as e:
         log.error(f"Failed to parse button mapping: {e}")
@@ -5270,6 +5342,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/hardware/info': lambda: {"model": get_device_model(), "serial": get_device_serial(), "os": get_os_info(), "gpio": get_gpio_info()},
             '/gpio/info': get_gpio_info,
             '/buttons/status': get_button_daemon_status,
+            '/buttons/presses': lambda: get_button_presses(query.get('limit', ['60'])[0]),
             '/buttons/mapping': lambda: {"mapping": get_button_mapping(), "running": get_button_daemon_status().get("running", False)},
             '/buttons/legacy': find_legacy_botao,
             '/update/backup-status': lambda: {
