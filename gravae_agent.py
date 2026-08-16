@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.6.8"
+VERSION = "3.6.9"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -5493,8 +5493,8 @@ def _fix_shinobi_pm2_cwd():
 
 def _get_ffmpeg_timeout_flag():
     """Detect the correct RTSP timeout flag for the installed FFmpeg version.
-    - FFmpeg < 7: -stimeout (microseconds)
-    - FFmpeg >= 7: -timeout (microseconds), -stimeout was removed
+    - FFmpeg < 5: -stimeout (microseconds)
+    - FFmpeg >= 5: -timeout (microseconds), -stimeout foi REMOVIDO no 5.0
     Retries up to 3 times to handle slow boot.
     """
     import re
@@ -5508,7 +5508,11 @@ def _get_ffmpeg_timeout_flag():
             match = re.search(r'version\s+(\d+)\.', first_line)
             if match:
                 major = int(match.group(1))
-                flag = '-timeout' if major >= 7 else '-stimeout'
+                # -stimeout morreu no ffmpeg 5.0 (virou -timeout), NAO no 7.0.
+                # Com limiar 7 as Pis em Bookworm (ffmpeg 5.1) recebiam
+                # '-stimeout' e o ffmpeg nem subia ("Unrecognized option"),
+                # derrubando todas as cameras da arena pra Died.
+                flag = '-timeout' if major >= 5 else '-stimeout'
                 print(f"[Shinobi] FFmpeg {major}.x detected, using {flag}")
                 return flag
             else:
@@ -5719,7 +5723,7 @@ def _fix_mariadb_user_hosts():
 def _fix_shinobi_monitors_stimeout():
     """Add RTSP timeout to all Shinobi monitors to prevent FFmpeg from hanging
     indefinitely when RTSP connections drop. Detects FFmpeg version to use the
-    correct flag (-stimeout for FFmpeg <7, -timeout for FFmpeg >=7).
+    correct flag (-stimeout for FFmpeg <5, -timeout for FFmpeg >=5).
     Uses MySQL JSON_SET to update only the cust_input field.
     Runs in a background thread on startup with a delay to let Shinobi start."""
     import time
