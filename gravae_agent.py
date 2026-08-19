@@ -27,7 +27,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.6.8"
+VERSION = "3.6.9"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -682,12 +682,12 @@ def configure_network_static(interface, ip, prefix, gateway, dns=None):
                     new_lines.append(line)
 
             # Add new static config
-            new_lines.append(f'\\ninterface {interface}\\n')
-            new_lines.append(f'static ip_address={ip}/{prefix}\\n')
-            new_lines.append(f'static routers={gateway}\\n')
+            new_lines.append(f'\ninterface {interface}\n')
+            new_lines.append(f'static ip_address={ip}/{prefix}\n')
+            new_lines.append(f'static routers={gateway}\n')
             if dns:
                 dns_str = ' '.join(dns) if isinstance(dns, list) else dns
-                new_lines.append(f'static domain_name_servers={dns_str}\\n')
+                new_lines.append(f'static domain_name_servers={dns_str}\n')
 
             # Write config
             with open('/tmp/dhcpcd.conf.new', 'w') as f:
@@ -811,9 +811,9 @@ def add_network_alias(interface, ip, prefix, label=None):
             config_path = '/etc/dhcpcd.conf'
             try:
                 with open(config_path, 'a') as f:
-                    f.write(f'\\n# IP alias for {label}\\n')
-                    f.write(f'interface {interface}\\n')
-                    f.write(f'static ip_address={ip}/{prefix}\\n')
+                    f.write(f'\n# IP alias for {label}\n')
+                    f.write(f'interface {interface}\n')
+                    f.write(f'static ip_address={ip}/{prefix}\n')
                 persistent_note = "Alias added to dhcpcd.conf for persistence"
             except:
                 persistent_note = "Note: Could not make alias persistent in dhcpcd.conf"
@@ -3744,7 +3744,7 @@ def ensure_log_dir():
 def append_line(filepath, line):
     ensure_log_dir()
     with open(filepath, 'a') as f:
-        f.write(line + '\\n')
+        f.write(line + '\n')
 
 def now_str():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -4256,7 +4256,7 @@ def phoenix_disable():
     try:
         os.makedirs("/etc/gravae", exist_ok=True)
         with open("/etc/gravae/no_reboot", "w") as f:
-            f.write(f"Phoenix disabled via agent at {datetime.now().isoformat()}\\n")
+            f.write(f"Phoenix disabled via agent at {datetime.now().isoformat()}\n")
         result["killSwitch"] = True
     except Exception as e:
         result["errors"].append(f"Failed to create kill switch: {e}")
