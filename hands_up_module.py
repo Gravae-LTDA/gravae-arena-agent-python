@@ -117,10 +117,22 @@ def aplica(config):
     #
     # Vao primeiro: se o resto da aplicacao falhar no meio, pelo menos o
     # destino ficou certo.
+    #
+    # SO QUANDO MUDA. O OPS manda estes dois em TODA aplicacao (ele e o dono
+    # dos valores), e reiniciar a cada clique derrubava o detector no meio da
+    # sequencia: o proximo switch chegava com o servico ainda subindo e
+    # falhava. Medido na CTF Marcelinho - "geral" passava e as tres quadras
+    # em seguida falhavam.
+    _, atual = _http("/api/config")
+    atual = atual if isinstance(atual, dict) else {}
+    mudou_endereco = False
     for chave in ("nuvem", "webhook"):
-        if config.get(chave) is not None:
-            ok, _ = _http("/api/config", {chave: config[chave]})
-            passos.append({chave: config[chave], "ok": ok})
+        novo_valor = config.get(chave)
+        if novo_valor is None or novo_valor == atual.get(chave):
+            continue
+        ok, _ = _http("/api/config", {chave: novo_valor})
+        passos.append({chave: novo_valor, "ok": ok})
+        mudou_endereco = mudou_endereco or ok
 
     if "ativo" in config:
         ok, r = _http("/api/config", {"ativo": bool(config["ativo"])})
@@ -141,9 +153,17 @@ def aplica(config):
     # `nuvem` e `webhook` sao lidos no BOOT do detector (viram `H.cfg`), nao a
     # cada quadro: gravar no arquivo nao basta, tem que reiniciar. Os switches
     # de quadra/camera, esses sim, valem na hora.
-    if any(k in config and config[k] is not None for k in ("nuvem", "webhook")):
+    if mudou_endereco:
         rc, _ = _systemd("restart", SERVICO)
         passos.append({"restart": SERVICO, "ok": rc == 0})
+        # O detector leva alguns segundos pra voltar a atender. Sem esperar, o
+        # `status()` logo abaixo relataria "nao responde" numa Pi que esta
+        # perfeitamente bem - e o painel pintaria erro por pressa nossa.
+        for _ in range(20):
+            time.sleep(1)
+            ok, _ = _http("/api/config", timeout=2)
+            if ok:
+                break
 
     return {"ok": all(p["ok"] for p in passos), "passos": passos, "estado": status()}
 
