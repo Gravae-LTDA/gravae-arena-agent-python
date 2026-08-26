@@ -213,13 +213,22 @@ def _instala_bloqueante(ops_evento_url="", nuvem_url="", diretorio=DIR_PADRAO):
         subprocess.run(["git", "-C", diretorio, "pull", "--ff-only"],
                        capture_output=True, text=True, timeout=300)
 
-    cmd = ["./instalar.sh"]
+    # `bash instalar.sh`, nao `./instalar.sh`: o bit de execucao nao sobrevive
+    # a todo clone/pull (depende de core.fileMode e do umask de quem clonou), e
+    # a primeira reinstalacao real morreu com PermissionError justamente nisso.
+    # Chamar pelo interpretador nao depende de permissao de execucao.
+    cmd = ["bash", "instalar.sh"]
     if nuvem_url:
         cmd += ["--nuvem", nuvem_url]
     else:
         cmd += ["--local"]
     if ops_evento_url:
         cmd += ["--webhook", ops_evento_url]
+
+    try:
+        os.chmod(os.path.join(diretorio, "rasp", "instalar.sh"), 0o755)
+    except Exception:
+        pass
 
     p = subprocess.run(cmd, cwd=os.path.join(diretorio, "rasp"),
                        capture_output=True, text=True, timeout=900)
