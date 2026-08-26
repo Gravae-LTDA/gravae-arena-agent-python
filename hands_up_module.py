@@ -19,6 +19,8 @@ O QUE ELE NAO FAZ
 import json
 import os
 import subprocess
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -80,6 +82,7 @@ def status():
         "instalado": instalado(),
         "servico": ativo or "desconhecido",
         "respondendo": ok,
+        "instalacao": instalacao_status(),
     }
     if ok:
         fora["config"] = dados
@@ -123,7 +126,54 @@ def aplica(config):
     return {"ok": all(p["ok"] for p in passos), "passos": passos, "estado": status()}
 
 
+#: Estado da instalacao em curso. Existe porque a instalacao NAO cabe numa
+#: resposta HTTP: o `cloudflared` da arena corta a requisicao em ~100 s e o
+#: clone + venv leva minutos - a primeira tentativa em producao voltou 502 com
+#: o processo ainda rodando do outro lado. Agora quem chama recebe "comecou" na
+#: hora e acompanha por `/hands-up/status`.
+_instalacao = {"estado": "ocioso", "desde": None, "etapa": None,
+               "ok": None, "erro": None, "saida": None}
+_lock_instalacao = threading.Lock()
+
+
+def instalacao_status():
+    return dict(_instalacao)
+
+
 def instala(ops_evento_url="", nuvem_url="", diretorio=DIR_PADRAO):
+    """Dispara a instalacao em segundo plano e devolve na hora.
+
+    Uma instalacao por vez: duas em paralelo brigariam pelo mesmo diretorio.
+    """
+    with _lock_instalacao:
+        if _instalacao["estado"] == "rodando":
+            return {"ok": False, "ja_rodando": True, "instalacao": instalacao_status()}
+        _instalacao.update({"estado": "rodando", "desde": time.time(),
+                            "etapa": "clone", "ok": None, "erro": None,
+                            "saida": None})
+
+    threading.Thread(
+        target=_instala_agora,
+        args=(ops_evento_url, nuvem_url, diretorio),
+        daemon=True,
+    ).start()
+    return {"ok": True, "iniciado": True, "instalacao": instalacao_status()}
+
+
+def _instala_agora(ops_evento_url, nuvem_url, diretorio):
+    try:
+        r = _instala_bloqueante(ops_evento_url, nuvem_url, diretorio)
+    except Exception as e:
+        r = {"ok": False, "etapa": "excecao", "erro": f"{type(e).__name__}: {e}"}
+    with _lock_instalacao:
+        _instalacao.update({
+            "estado": "concluido" if r.get("ok") else "falhou",
+            "etapa": r.get("etapa"), "ok": bool(r.get("ok")),
+            "erro": r.get("erro"), "saida": (r.get("saida") or "")[-800:],
+        })
+
+
+def _instala_bloqueante(ops_evento_url="", nuvem_url="", diretorio=DIR_PADRAO):
     """Clona (ou atualiza) o detector e sobe o servico.
 
     Idempotente: rodar de novo numa Pi que ja tem so atualiza o codigo. O
