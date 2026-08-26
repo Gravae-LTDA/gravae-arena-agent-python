@@ -107,6 +107,21 @@ def aplica(config):
         return {"ok": False, "erro": "config invalida"}
 
     passos = []
+
+    # Endereco do worker de inferencia e do webhook do gesto vem do OPS, nao
+    # do arquivo local. Sem isto, uma Pi instalada apontando pra um endpoint
+    # antigo ficava presa nele: `main()` do detector da PRECEDENCIA a config
+    # sobre a linha de comando, entao reinstalar nao corrigia. Foi o que
+    # aconteceu na primeira arena real - detector rodando, apontando pro worker
+    # errado e com webhook vazio, ou seja, detectando pra ninguem.
+    #
+    # Vao primeiro: se o resto da aplicacao falhar no meio, pelo menos o
+    # destino ficou certo.
+    for chave in ("nuvem", "webhook"):
+        if config.get(chave) is not None:
+            ok, _ = _http("/api/config", {chave: config[chave]})
+            passos.append({chave: config[chave], "ok": ok})
+
     if "ativo" in config:
         ok, r = _http("/api/config", {"ativo": bool(config["ativo"])})
         passos.append({"ativo": config["ativo"], "ok": ok})
@@ -122,6 +137,13 @@ def aplica(config):
     for camera, valor in (config.get("cameras") or {}).items():
         ok, _ = _http("/api/config", {"camera": camera, "valor": bool(valor)})
         passos.append({"camera": camera, "valor": bool(valor), "ok": ok})
+
+    # `nuvem` e `webhook` sao lidos no BOOT do detector (viram `H.cfg`), nao a
+    # cada quadro: gravar no arquivo nao basta, tem que reiniciar. Os switches
+    # de quadra/camera, esses sim, valem na hora.
+    if any(k in config and config[k] is not None for k in ("nuvem", "webhook")):
+        rc, _ = _systemd("restart", SERVICO)
+        passos.append({"restart": SERVICO, "ok": rc == 0})
 
     return {"ok": all(p["ok"] for p in passos), "passos": passos, "estado": status()}
 
