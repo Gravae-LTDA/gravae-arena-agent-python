@@ -23,11 +23,16 @@ import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import observation_mode  # Ultra Watch (modo observação)
+try:
+    import hands_up_module
+except Exception as _e:  # modulo ausente numa atualizacao parcial
+    hands_up_module = None
+    _HANDS_UP_ERRO = f"{type(_e).__name__}: {_e}"
 from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.6.9"
+VERSION = "3.7.0"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -1200,6 +1205,10 @@ def _perform_update_direct():
         files_to_update = [
             ("gravae_agent.py", f"{GITHUB_RAW_URL}/gravae_agent.py"),
             ("phoenix_daemon.py", f"{GITHUB_RAW_URL}/phoenix_daemon.py"),
+            # Ponte do detector de bracos levantados. Precisa estar aqui: sem
+            # isto, uma Pi que caia no fallback (git pull falho) fica com o
+            # agente novo e o modulo velho/ausente.
+            ("hands_up_module.py", f"{GITHUB_RAW_URL}/hands_up_module.py"),
         ]
 
         update_status = {"status": "downloading", "progress": 20, "message": "Baixando do GitHub...", "error": None}
@@ -4838,6 +4847,29 @@ class AgentHandler(BaseHTTPRequestHandler):
         if not path.startswith('/terminal/'):
             log.info(f"POST {path}", extra={"content_length": length})
 
+        # ── Detector de bracos levantados (No-hands) ──────────────────
+        # O detector escuta em localhost:8090, porta que NAO tem rota no
+        # tunel. O agente e a ponte: e por aqui que o OPS liga, desliga e
+        # instala o modo na Pi, como tudo mais que mexe na Raspberry.
+        if path.startswith('/hands-up/'):
+            if hands_up_module is None:
+                self._send_json({"ok": False, "indisponivel": True,
+                                 "erro": "hands_up_module ausente nesta Pi",
+                                 "detalhe": _HANDS_UP_ERRO}, 503)
+                return
+            if path == '/hands-up/apply':
+                self._send_json(hands_up_module.aplica(data.get('config') or data))
+                return
+            if path == '/hands-up/install':
+                self._send_json(hands_up_module.instala(
+                    ops_evento_url=data.get('webhook', ''),
+                    nuvem_url=data.get('nuvem', ''),
+                ))
+                return
+            if path == '/hands-up/stop':
+                self._send_json(hands_up_module.para())
+                return
+
         if path == '/observation/enable':
             secret = data.get('secret')
             ops = data.get('opsUrl')
@@ -5235,6 +5267,14 @@ class AgentHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+
+        if path == '/hands-up/status':
+            if hands_up_module is None:
+                self._send_json({"instalado": False, "indisponivel": True,
+                                 "erro": "hands_up_module ausente nesta Pi"}, 503)
+                return
+            self._send_json(hands_up_module.status())
+            return
 
         if path == '/terminal/output':
             session_id = query.get('sessionId', [None])[0]

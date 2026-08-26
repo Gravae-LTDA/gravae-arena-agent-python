@@ -40,6 +40,7 @@ echo "Device Serial: $DEVICE_SERIAL"
 echo "Installing agent files..."
 cp gravae_agent.py $INSTALL_DIR/
 cp phoenix_daemon.py $INSTALL_DIR/
+cp hands_up_module.py $INSTALL_DIR/
 chmod +x $INSTALL_DIR/gravae_agent.py
 chmod +x $INSTALL_DIR/phoenix_daemon.py
 
