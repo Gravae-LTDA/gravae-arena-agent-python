@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.7.4"
+VERSION = "3.7.5"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -1862,43 +1862,78 @@ def ensure_journald_persistent():
     when they're needed to diagnose a freeze that the customer 'fixed' by
     power-cycling -- making the press-vs-event cross-check impossible after the
     fact. Persistent storage keeps that history so a recurrence can be proven
-    instead of guessed. Idempotent: only acts when not already persistent.
+    instead of guessed.
+
+    Writing Storage=persistent into /etc/systemd/journald.conf is NOT enough:
+    Raspberry Pi OS ships /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf
+    with Storage=volatile, and drop-ins take precedence over the main config
+    file. The override has to be a drop-in under /etc with a higher number.
+    Seen on Calcadao BH rasp2 (27/08/2026): journald.conf said persistent,
+    /var/log/journal existed and was empty, and the journal still lived in /run --
+    so the crash that cost 169 lost button presses left no evidence behind.
+
+    Idempotent, and checks the OUTCOME (journal files actually on disk) rather
+    than the presence of a config line, which is what made the previous version
+    return early while storage stayed volatile.
     """
     time.sleep(25)  # let the system settle before restarting journald
     try:
-        conf = "/etc/systemd/journald.conf"
         try:
-            with open(conf, "r") as f:
-                cur = f.read()
+            with open("/etc/machine-id", "r") as f:
+                machine_id = f.read().strip()
         except Exception:
-            cur = ""
-        already = any(l.strip() == "Storage=persistent" for l in cur.splitlines())
-        if already and os.path.isdir("/var/log/journal"):
-            return
-        subprocess.run(["sudo", "mkdir", "-p", "/var/log/journal"], check=False, timeout=10)
-        lines = cur.splitlines()
-        replaced = False
-        for i, l in enumerate(lines):
-            if l.lstrip("#").strip().startswith("Storage="):
-                lines[i] = "Storage=persistent"
-                replaced = True
-                break
-        if not replaced:
-            lines.append("Storage=persistent")
-        new_conf = "\n".join(lines) + "\n"
+            machine_id = ""
+        journal_dir = os.path.join("/var/log/journal", machine_id) if machine_id else "/var/log/journal"
+
+        # Already effective? Only true when journald really writes to disk.
+        try:
+            if machine_id and any(n.endswith(".journal") for n in os.listdir(journal_dir)):
+                return
+        except Exception:
+            pass
+
+        dropin_dir = "/etc/systemd/journald.conf.d"
+        dropin = os.path.join(dropin_dir, "99-gravae-persistent.conf")
+        # Size caps are not optional: without them the journal grows on the SD card.
+        content = (
+            "[Journal]\n"
+            "Storage=persistent\n"
+            "SystemMaxUse=200M\n"
+            "SystemMaxFileSize=20M\n"
+            "MaxRetentionSec=30day\n"
+        )
+
         import tempfile
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix="_journald.conf") as tf:
-            tf.write(new_conf)
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix="_journald_dropin.conf") as tf:
+            tf.write(content)
             tmp = tf.name
-        subprocess.run(["sudo", "cp", tmp, conf], check=False, timeout=10)
+        subprocess.run(["sudo", "mkdir", "-p", dropin_dir], check=False, timeout=10)
+        subprocess.run(["sudo", "cp", tmp, dropin], check=False, timeout=10)
+        subprocess.run(["sudo", "chmod", "644", dropin], check=False, timeout=10)
         try:
             os.unlink(tmp)
         except Exception:
             pass
+
+        if machine_id:
+            subprocess.run(["sudo", "mkdir", "-p", journal_dir], check=False, timeout=10)
+            subprocess.run(["sudo", "chown", "root:systemd-journal", journal_dir], check=False, timeout=10)
+            subprocess.run(["sudo", "chmod", "2755", journal_dir], check=False, timeout=10)
         subprocess.run(["sudo", "systemd-tmpfiles", "--create", "--prefix", "/var/log/journal"],
                        check=False, timeout=15)
         subprocess.run(["sudo", "systemctl", "restart", "systemd-journald"], check=False, timeout=20)
-        print("[journald] Set Storage=persistent and restarted systemd-journald")
+        time.sleep(3)
+        subprocess.run(["sudo", "journalctl", "--flush"], check=False, timeout=20)
+
+        landed = False
+        try:
+            landed = any(n.endswith(".journal") for n in os.listdir(journal_dir))
+        except Exception:
+            pass
+        if landed:
+            print(f"[journald] Persistent storage active at {journal_dir} (drop-in {dropin})")
+        else:
+            print(f"[journald] Drop-in written but journal still not on disk at {journal_dir}")
     except Exception as e:
         print(f"[journald] ensure persistent failed: {e}")
 
