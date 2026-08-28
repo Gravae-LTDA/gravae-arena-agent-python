@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.7.5"
+VERSION = "3.7.6"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -5566,25 +5566,58 @@ def _fix_shinobi_pm2_cwd():
         print(f"[Startup] Failed to check/fix Shinobi PM2 cwd: {e}")
 
 
+def _get_shinobi_ffmpeg_binary():
+    """Return the ffmpeg binary Shinobi actually runs.
+
+    Shinobi's conf.json may point ffmpegDir at a bundled static build (some
+    arenas ship a 4.2.1 static binary on a Debian 12 host, where the system
+    ffmpeg is 5.1). Reading the version from /usr/bin/ffmpeg would then pick
+    the wrong RTSP timeout flag and kill every monitor on the device.
+    """
+    try:
+        with open('/home/Shinobi/conf.json', 'r') as fh:
+            conf = json.load(fh)
+        ffmpeg_dir = (conf.get('ffmpegDir') or '').strip()
+        if ffmpeg_dir:
+            candidate = ffmpeg_dir
+            if os.path.isdir(candidate):
+                candidate = os.path.join(candidate, 'ffmpeg')
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+            print(f"[Shinobi] conf.json ffmpegDir={ffmpeg_dir} not usable, falling back to /usr/bin/ffmpeg")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[Shinobi] Could not read Shinobi conf.json: {e}")
+    return '/usr/bin/ffmpeg'
+
+
 def _get_ffmpeg_timeout_flag():
-    """Detect the correct RTSP timeout flag for the installed FFmpeg version.
-    - FFmpeg < 7: -stimeout (microseconds)
-    - FFmpeg >= 7: -timeout (microseconds), -stimeout was removed
+    """Detect the correct RTSP timeout flag for the FFmpeg Shinobi runs.
+    - FFmpeg < 5: -stimeout (microseconds)
+    - FFmpeg >= 5: -timeout (microseconds), -stimeout was removed in 5.0
+
+    Using the wrong one is fatal, in both directions: -stimeout on >= 5 gives
+    "Unrecognized option 'stimeout'", and -timeout on 4.x makes the RTSP demuxer
+    listen instead of connect ("Unable to open RTSP for listening"). Either way
+    ffmpeg never starts and the monitors go to Died.
+
     Retries up to 3 times to handle slow boot.
     """
     import re
+    binary = _get_shinobi_ffmpeg_binary()
     for attempt in range(3):
         try:
             result = subprocess.run(
-                ['/usr/bin/ffmpeg', '-version'],
+                [binary, '-version'],
                 capture_output=True, text=True, timeout=10
             )
             first_line = result.stdout.split('\n')[0] if result.stdout else ''
             match = re.search(r'version\s+(\d+)\.', first_line)
             if match:
                 major = int(match.group(1))
-                flag = '-timeout' if major >= 7 else '-stimeout'
-                print(f"[Shinobi] FFmpeg {major}.x detected, using {flag}")
+                flag = '-timeout' if major >= 5 else '-stimeout'
+                print(f"[Shinobi] FFmpeg {major}.x detected at {binary}, using {flag}")
                 return flag
             else:
                 print(f"[Shinobi] Could not parse ffmpeg version: {first_line[:80]}")
@@ -5593,7 +5626,7 @@ def _get_ffmpeg_timeout_flag():
         if attempt < 2:
             import time
             time.sleep(5)
-    # Default to -stimeout (safe for Bullseye which is 90% of devices)
+    # Default to -stimeout (safe for Bullseye which is ~70% of devices)
     print("[Shinobi] ffmpeg version detection failed, defaulting to -stimeout")
     return '-stimeout'
 
