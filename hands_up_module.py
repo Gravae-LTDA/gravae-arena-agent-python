@@ -102,9 +102,25 @@ def aplica(config):
     Manda um POST por chave porque e essa a API do detector; sao poucas e
     locais (localhost), entao o custo e irrelevante perto de inventar um
     endpoint novo la e ter que versionar os dois juntos.
+
+    SE O DETECTOR NAO ESTIVER INSTALADO, INSTALA AQUI.
+        O detector nao vai junto com o agente de proposito: sao 893 Pis, e a
+        esmagadora maioria nunca vai ligar o modo. Instalar em todas seria
+        gastar apt, disco e banda do parque inteiro para servir algumas
+        arenas. Entao a instalacao acontece na primeira vez que a arena LIGA
+        o hands-up — que e o unico momento em que ela e necessaria.
+
+        Antes disso o comportamento era mudo: sem detector, o POST no
+        localhost falhava, o OPS registrava "a Pi recebeu mas nao aplicou" e o
+        painel ficava mostrando a chave ligada com nada instalado do outro
+        lado. Foi a Arena da Vila em 29/08/2026 — `instalado: false`,
+        `lastPollAt` nulo e zero eventos, com o medidor contando gasto.
     """
     if not isinstance(config, dict):
         return {"ok": False, "erro": "config invalida"}
+
+    if not instalado():
+        return _instala_e_aplica_depois(config)
 
     passos = []
 
@@ -168,6 +184,46 @@ def aplica(config):
     return {"ok": all(p["ok"] for p in passos), "passos": passos, "estado": status()}
 
 
+#: A config que o OPS mandou enquanto o detector ainda estava sendo instalado.
+#: Sem isto, o operador ligaria o modo, a Pi instalaria o detector e ele
+#: subiria DESLIGADO — o clique se perderia e alguem teria que clicar de novo
+#: sem saber por que. Guardar e reaplicar no fim da instalacao fecha o ciclo
+#: sozinho.
+_config_pendente = None
+
+
+def _instala_e_aplica_depois(config):
+    """Comeca a instalacao e guarda a config para aplicar quando ela terminar.
+
+    Devolve NA HORA. A instalacao leva de ~10 s (modo nuvem, o normal) a
+    alguns minutos quando falta `python3-opencv` e o apt precisa entrar — e o
+    `cloudflared` da arena corta a requisicao em ~100 s. Segurar aqui daria
+    502 no painel com o processo ainda rodando do outro lado.
+
+    `ok: True` de proposito: nada falhou. O OPS trata `ok: False` como erro e
+    pintaria de vermelho uma Pi que esta fazendo exatamente o que foi mandada
+    fazer. Quem acompanha o resto e `/hands-up/status`.
+    """
+    global _config_pendente
+    _config_pendente = dict(config)
+
+    # Os enderecos vem do OPS junto com os switches. Passa-los para o
+    # instalador faz o detector ja nascer apontando para o worker e para o
+    # webhook certos — senao ele sobe apontando para lugar nenhum e so
+    # acertaria no restart do primeiro `aplica`.
+    r = instala(
+        ops_evento_url=config.get("webhook", "") or "",
+        nuvem_url=config.get("nuvem", "") or "",
+    )
+    return {
+        "ok": True,
+        "instalando": True,
+        "ja_rodando": bool(r.get("ja_rodando")),
+        "mensagem": "detector nao estava instalado; instalando agora e aplicando ao terminar",
+        "estado": status(),
+    }
+
+
 #: Estado da instalacao em curso. Existe porque a instalacao NAO cabe numa
 #: resposta HTTP: o `cloudflared` da arena corta a requisicao em ~100 s e o
 #: clone + venv leva minutos - a primeira tentativa em producao voltou 502 com
@@ -203,6 +259,7 @@ def instala(ops_evento_url="", nuvem_url="", diretorio=DIR_PADRAO):
 
 
 def _instala_agora(ops_evento_url, nuvem_url, diretorio):
+    global _config_pendente
     try:
         r = _instala_bloqueante(ops_evento_url, nuvem_url, diretorio)
     except Exception as e:
@@ -213,6 +270,21 @@ def _instala_agora(ops_evento_url, nuvem_url, diretorio):
             "etapa": r.get("etapa"), "ok": bool(r.get("ok")),
             "erro": r.get("erro"), "saida": (r.get("saida") or "")[-800:],
         })
+
+    # A instalacao deixa tudo desligado (e tem que deixar: uma atualizacao de
+    # parque nao pode comecar a consumir sozinha). Se ela comecou porque
+    # alguem LIGOU o modo, aplicar a escolha agora e o que fecha o ciclo — sem
+    # isto o operador clicaria, esperaria, e o modo continuaria desligado.
+    pendente, _config_pendente = _config_pendente, None
+    # `instalado()` no guarda tambem evita recursao: sem ele, uma instalacao
+    # que reporta sucesso mas nao registra o servico faria `aplica` cair de
+    # novo no ramo de instalar, e o par instala->aplica giraria sozinho.
+    if r.get("ok") and pendente and instalado():
+        try:
+            print("[HandsUp] instalado; aplicando a config que ficou pendente")
+            aplica(pendente)
+        except Exception as e:
+            print(f"[HandsUp] falha ao aplicar config pendente: {type(e).__name__}: {e}")
 
 
 def _instala_bloqueante(ops_evento_url="", nuvem_url="", diretorio=DIR_PADRAO):
