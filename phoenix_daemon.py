@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -1162,7 +1162,16 @@ class PressToVideoAuditor:
     STATUS_TTL = 6 * 3600      # janela que o status cobre, p/ o OPS saber a validade
 
     def __init__(self):
+        # Na primeira execucao (sem estado persistido) NAO auditamos o passado:
+        # a janela de 6 h ressuscitaria perdas ja' resolvidas e alertaria sobre
+        # incidente antigo. Mesmo cuidado do ShinobiCrashLoopDetector, que na
+        # primeira rodada pula o backlog do log. Daqui pra frente, so' o que
+        # acontecer com o watcher no ar.
         self.last_ts = self._load_state()
+        if self.last_ts is None:
+            self.last_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._save_state(self.last_ts)
+            log.info(f"[press-audit] primeira execucao, auditando a partir de {self.last_ts}")
 
     # ---------- estado ----------
     def _load_state(self):
