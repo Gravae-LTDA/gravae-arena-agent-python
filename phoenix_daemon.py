@@ -20,7 +20,9 @@ SAFETY GUARDS:
 """
 
 import os
+import re
 import sys
+import glob
 import json
 import time
 import uuid
@@ -36,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.15.8"
+VERSION = "1.16.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -1131,6 +1133,241 @@ class ShinobiCrashLoopDetector:
         except Exception as e:
             log.debug(f"[shinobi-epipe] check error: {e}")
         return False
+
+# === Press-to-Video Auditor ===
+class PressToVideoAuditor:
+    """Audita se todo aperto de botao virou evento no Shinobi (e portanto clipe).
+
+    Existe porque essa falha e' INVISIVEL por todos os outros caminhos: a rota
+    `/motion` do Shinobi responde `Trigger Successful` SEM esperar o
+    `triggerEvent()`, entao o button-daemon recebe 200 mesmo quando o evento e'
+    descartado depois — por filtro com `halt`, por excecao engolida no async, ou
+    por `activeMonitors` incompleto. Monitor segue em *Watching*, servico verde,
+    zero erro em log, e a arena passa dias sem gerar video.
+
+    Compara duas fontes independentes:
+      - apertos: `button_presses_details.txt` do button-daemon (uma linha por aperto)
+      - eventos: tabela `Events` do MariaDB do Shinobi
+
+    Desconta o lockout: o Shinobi arma um `motion_lock` de 15 s por monitor a cada
+    trigger e descarta em silencio o que cair dentro dele. Aperto nessa janela NAO
+    e' falha — e' dedup esperado.
+    """
+
+    STATE_FILE = LOG_DIR / "press_audit.state"
+    SETTLE_SECONDS = 90        # so' audita aperto com tempo de virar evento
+    MATCH_TOLERANCE = 3        # casamento aperto <-> evento, em segundos
+    LOCK_WINDOW = 15           # motion_lock do Shinobi (libs/monitor/utils.js)
+    MIN_SAMPLE = 5             # nao alarma com amostra pequena
+    FAIL_RATIO = 0.30          # alarma acima de 30% de perda
+    ALERT_COOLDOWN = 30 * 60
+
+    def __init__(self):
+        self.last_alert = 0
+        self.last_ts = self._load_state()
+
+    # ---------- estado ----------
+    def _load_state(self):
+        try:
+            if self.STATE_FILE.exists():
+                return self.STATE_FILE.read_text().strip() or None
+        except Exception:
+            pass
+        return None
+
+    def _save_state(self, ts_str):
+        try:
+            self.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.STATE_FILE.write_text(ts_str)
+        except Exception as e:
+            log.debug(f"[press-audit] falha ao persistir estado: {e}")
+
+    # ---------- fontes ----------
+    def _press_log(self):
+        for p in glob.glob("/home/*/Documents/*/logs/button_presses_details.txt"):
+            return Path(p)
+        return None
+
+    def _gpio_to_mid(self):
+        """Mapa 'rotulo da quadra' -> mid, lido do BTN_TRIGGERS do button-daemon."""
+        mapping = {}
+        for p in glob.glob("/home/*/Documents/*/button-daemon.py"):
+            try:
+                txt = Path(p).read_text(errors="replace")
+            except Exception:
+                continue
+            # ('http://.../motion/<ke>/<mid>?...', 'Quadra 1'),
+            for mid, label in re.findall(
+                r"/motion/[^/]+/([a-zA-Z0-9_]+)\?[^']*',\s*'([^']+)'", txt
+            ):
+                mapping[label] = mid
+            break
+        return mapping
+
+    def _recent_presses(self, since):
+        """[(datetime, label)] do log do daemon, a partir de `since`."""
+        path = self._press_log()
+        if not path or not path.exists():
+            return []
+        out = []
+        try:
+            # o arquivo e' pequeno (uma linha por aperto); le o final e filtra
+            with open(path, "rb") as f:
+                try:
+                    f.seek(max(0, path.stat().st_size - 256 * 1024))
+                except Exception:
+                    pass
+                chunk = f.read().decode("utf-8", errors="replace")
+            for line in chunk.splitlines():
+                m = re.match(
+                    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+-\s+(?:GPIO\d+\s+-\s+)?(.+?)\s*$",
+                    line.strip(),
+                )
+                if not m:
+                    continue
+                try:
+                    ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if ts >= since:
+                    out.append((ts, m.group(2).strip()))
+        except Exception as e:
+            log.debug(f"[press-audit] erro lendo log de apertos: {e}")
+        return sorted(out)
+
+    def _events_since(self, since):
+        """{mid: [datetime, ...]} da tabela Events do Shinobi."""
+        db = {}
+        for path in ("/home/Shinobi/conf.json", "/opt/shinobi/conf.json"):
+            try:
+                if os.path.exists(path):
+                    db = json.loads(Path(path).read_text()).get("db", {}) or {}
+                    break
+            except Exception:
+                pass
+        if not db:
+            return None
+        sql = (
+            "SELECT mid, DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') FROM Events "
+            f"WHERE time >= '{since.strftime('%Y-%m-%d %H:%M:%S')}';"
+        )
+        try:
+            r = subprocess.run(
+                ["mysql", "-N", "-B",
+                 "-u", db.get("user", "majesticflame"),
+                 f"-p{db.get('password', '')}",
+                 "-h", db.get("host", "localhost"),
+                 db.get("database", "ccio"), "-e", sql],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode != 0:
+                log.debug(f"[press-audit] mysql rc={r.returncode}: {r.stderr.strip()[:120]}")
+                return None
+        except Exception as e:
+            log.debug(f"[press-audit] mysql erro: {e}")
+            return None
+        out = {}
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            try:
+                out.setdefault(parts[0], []).append(
+                    datetime.strptime(parts[1], "%Y-%m-%d %H:%M:%S")
+                )
+            except ValueError:
+                continue
+        for v in out.values():
+            v.sort()
+        return out
+
+    # ---------- auditoria ----------
+    def check(self):
+        now = datetime.now()
+        janela_inicio = now - timedelta(hours=6)
+        # nao reavalia o que ja' foi auditado
+        if self.last_ts:
+            try:
+                janela_inicio = max(
+                    janela_inicio, datetime.strptime(self.last_ts, "%Y-%m-%d %H:%M:%S")
+                )
+            except ValueError:
+                pass
+        limite = now - timedelta(seconds=self.SETTLE_SECONDS)
+
+        presses = [(t, l) for t, l in self._recent_presses(janela_inicio) if t <= limite]
+        if not presses:
+            return False
+
+        label2mid = self._gpio_to_mid()
+        eventos = self._events_since(janela_inicio - timedelta(seconds=self.LOCK_WINDOW))
+        if eventos is None:
+            log.debug("[press-audit] sem acesso ao banco do Shinobi; pulando")
+            return False
+
+        auditados = 0
+        perdidos = []
+        for ts, label in presses:
+            mid = label2mid.get(label)
+            if not mid:
+                continue  # rotulo desconhecido: nao da' para auditar
+            ev = eventos.get(mid, [])
+            casou = any(abs((ts - e).total_seconds()) <= self.MATCH_TOLERANCE for e in ev)
+            if casou:
+                auditados += 1
+                continue
+            # lockout: houve evento aceito nos 15 s anteriores neste mesmo monitor?
+            anteriores = [e for e in ev if 0 < (ts - e).total_seconds() <= self.LOCK_WINDOW]
+            if anteriores:
+                continue  # dedup esperado, nao conta como aperto nem como perda
+            auditados += 1
+            perdidos.append((ts, label, mid))
+
+        self.last_ts = presses[-1][0].strftime("%Y-%m-%d %H:%M:%S")
+        self._save_state(self.last_ts)
+
+        if auditados < self.MIN_SAMPLE or not perdidos:
+            if perdidos:
+                log.info(
+                    f"[press-audit] {len(perdidos)}/{auditados} apertos sem evento "
+                    "(amostra pequena, sem alerta)"
+                )
+            return False
+
+        ratio = len(perdidos) / auditados
+        if ratio < self.FAIL_RATIO:
+            log.info(f"[press-audit] {len(perdidos)}/{auditados} sem evento ({ratio:.0%}) — abaixo do limiar")
+            return False
+
+        agora = time.time()
+        if agora - self.last_alert < self.ALERT_COOLDOWN:
+            log.warning(f"[press-audit] {len(perdidos)}/{auditados} sem evento, mas dentro do cooldown")
+            return False
+        self.last_alert = agora
+
+        exemplos = [f"{t:%H:%M:%S} {lbl}" for t, lbl, _ in perdidos[:5]]
+        por_quadra = {}
+        for _, lbl, _ in perdidos:
+            por_quadra[lbl] = por_quadra.get(lbl, 0) + 1
+        log.error(
+            f"[press-audit] APERTO SEM VIDEO: {len(perdidos)} de {auditados} "
+            f"({ratio:.0%}) — {por_quadra}"
+        )
+        alerts.add(
+            "press_without_video",
+            "critical",
+            f"{len(perdidos)} de {auditados} apertos não geraram vídeo ({ratio:.0%}) — "
+            "o Shinobi respondeu sucesso mas o evento não nasceu",
+            {
+                "perdidos": len(perdidos),
+                "auditados": auditados,
+                "ratio": round(ratio, 2),
+                "por_quadra": por_quadra,
+                "exemplos": exemplos,
+                "lock_window_s": self.LOCK_WINDOW,
+            },
+        )
+        return True
 
 # === Connectivity Sentinel ===
 class ConnectivitySentinel:
@@ -2337,6 +2574,7 @@ class PhoenixDaemon:
         self.watchdog = HardwareWatchdog()
         self.shinobi_watcher = None  # Lazy loaded to save memory
         self.shinobi_epipe_detector = ShinobiCrashLoopDetector(self.service_guardian)
+        self.press_auditor = PressToVideoAuditor()
 
         # Setup signal handlers
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -2458,6 +2696,7 @@ class PhoenixDaemon:
         last_resource_check = 0
         last_monitor_check = 0
         last_shinobi_epipe_check = 0
+        last_press_audit = 0
         last_webhook_send = 0
         last_alert_cleanup = 0
         last_gc = 0
@@ -2465,6 +2704,7 @@ class PhoenixDaemon:
         last_speed_test = 0
         SPEED_TEST_INTERVAL = 4 * 60 * 60  # 4 hours
         SHINOBI_EPIPE_CHECK_INTERVAL = 120  # 2 minutes
+        PRESS_AUDIT_INTERVAL = 300  # 5 minutes
 
         while self.running:
             now = time.time()
@@ -2509,6 +2749,17 @@ class PhoenixDaemon:
                     except Exception as e:
                         log.debug(f"Shinobi EPIPE check error: {e}")
                     last_shinobi_epipe_check = now
+
+                # Auditoria aperto -> video (a cada 5 minutos)
+                # Pega a falha que nenhum outro check enxerga: o Shinobi responde
+                # "Trigger Successful" sem esperar o triggerEvent, entao aperto
+                # engolido nao aparece como erro em lugar nenhum.
+                if now - last_press_audit >= PRESS_AUDIT_INTERVAL:
+                    try:
+                        self.press_auditor.check()
+                    except Exception as e:
+                        log.debug(f"Press audit error: {e}")
+                    last_press_audit = now
 
                 # Resource check (every 5 minutes)
                 if now - last_resource_check >= 300:
