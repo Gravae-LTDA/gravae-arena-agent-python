@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.7.6"
+VERSION = "3.7.7"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -4263,6 +4263,16 @@ def get_phoenix_status():
                         })
     except Exception as e:
         print(f"Failed to get monitors: {e}")
+
+    # Auditoria aperto -> video (PressToVideoAuditor do Phoenix). O OPS le' isso
+    # para virar a anomaly `press_without_video`. Ausente = nao auditado ainda.
+    try:
+        _pa = "/var/log/gravae/press_audit.json"
+        if os.path.exists(_pa):
+            with open(_pa) as f:
+                status["pressAudit"] = json.load(f)
+    except Exception as e:
+        print(f"Failed to read press audit status: {e}")
 
     if os.path.exists(PHOENIX_LOG_PATH):
         try:
