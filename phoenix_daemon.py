@@ -1186,8 +1186,13 @@ class PressToVideoAuditor:
             return Path(p)
         return None
 
-    def _gpio_to_mid(self):
-        """Mapa 'rotulo da quadra' -> mid, lido do BTN_TRIGGERS do button-daemon."""
+    def _label_to_mids(self):
+        """Mapa 'rotulo do botao' -> LISTA de mids, lido do BTN_TRIGGERS.
+
+        Um GPIO pode disparar mais de um monitor (quadra com duas cameras, como
+        na Inspire CT). Nesse caso o aperto so' esta' ok se TODOS os monitores
+        registrarem evento — se um falhar e o outro nao, e' perda.
+        """
         mapping = {}
         for p in glob.glob("/home/*/Documents/*/button-daemon.py"):
             try:
@@ -1198,7 +1203,9 @@ class PressToVideoAuditor:
             for mid, label in re.findall(
                 r"/motion/[^/]+/([a-zA-Z0-9_]+)\?[^']*',\s*'([^']+)'", txt
             ):
-                mapping[label] = mid
+                alvos = mapping.setdefault(label, [])
+                if mid not in alvos:
+                    alvos.append(mid)
             break
         return mapping
 
@@ -1297,7 +1304,7 @@ class PressToVideoAuditor:
         if not presses:
             return False
 
-        label2mid = self._gpio_to_mid()
+        label2mids = self._label_to_mids()
         eventos = self._events_since(janela_inicio - timedelta(seconds=self.LOCK_WINDOW))
         if eventos is None:
             log.debug("[press-audit] sem acesso ao banco do Shinobi; pulando")
@@ -1306,20 +1313,24 @@ class PressToVideoAuditor:
         auditados = 0
         perdidos = []
         for ts, label in presses:
-            mid = label2mid.get(label)
-            if not mid:
+            mids = label2mids.get(label) or []
+            if not mids:
                 continue  # rotulo desconhecido: nao da' para auditar
-            ev = eventos.get(mid, [])
-            casou = any(abs((ts - e).total_seconds()) <= self.MATCH_TOLERANCE for e in ev)
-            if casou:
-                auditados += 1
-                continue
-            # lockout: houve evento aceito nos 15 s anteriores neste mesmo monitor?
-            anteriores = [e for e in ev if 0 < (ts - e).total_seconds() <= self.LOCK_WINDOW]
-            if anteriores:
-                continue  # dedup esperado, nao conta como aperto nem como perda
+            faltando, travados = [], 0
+            for mid in mids:
+                ev = eventos.get(mid, [])
+                if any(abs((ts - e).total_seconds()) <= self.MATCH_TOLERANCE for e in ev):
+                    continue
+                # lockout: houve evento aceito nos 15 s anteriores NESTE monitor?
+                if any(0 < (ts - e).total_seconds() <= self.LOCK_WINDOW for e in ev):
+                    travados += 1
+                    continue
+                faltando.append(mid)
+            if travados == len(mids):
+                continue  # tudo dedup esperado: nao conta como aperto nem como perda
             auditados += 1
-            perdidos.append((ts, label, mid))
+            if faltando:
+                perdidos.append((ts, label, faltando))
 
         self.last_ts = presses[-1][0].strftime("%Y-%m-%d %H:%M:%S")
         self._save_state(self.last_ts)
@@ -1327,7 +1338,10 @@ class PressToVideoAuditor:
         por_quadra = {}
         for _, lbl, _ in perdidos:
             por_quadra[lbl] = por_quadra.get(lbl, 0) + 1
-        exemplos = [f"{t:%Y-%m-%d %H:%M:%S} {lbl}" for t, lbl, _ in perdidos[:10]]
+        exemplos = [
+            f"{t:%Y-%m-%d %H:%M:%S} {lbl} (sem evento em: {', '.join(fs)})"
+            for t, lbl, fs in perdidos[:10]
+        ]
 
         # Status sempre publicado (inclusive limpo), para o OPS distinguir
         # "auditado e sem perda" de "sem dado nenhum".
