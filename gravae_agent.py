@@ -4264,6 +4264,16 @@ def get_phoenix_status():
     except Exception as e:
         print(f"Failed to get monitors: {e}")
 
+    # Auditoria aperto -> video (PressToVideoAuditor do Phoenix). O OPS le' isso
+    # para virar a anomaly `press_without_video`. Ausente = nao auditado ainda.
+    try:
+        _pa = "/var/log/gravae/press_audit.json"
+        if os.path.exists(_pa):
+            with open(_pa) as f:
+                status["pressAudit"] = json.load(f)
+    except Exception as e:
+        print(f"Failed to read press audit status: {e}")
+
     if os.path.exists(PHOENIX_LOG_PATH):
         try:
             with open(PHOENIX_LOG_PATH, "r") as f:

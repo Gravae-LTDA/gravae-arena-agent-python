@@ -1155,15 +1155,13 @@ class PressToVideoAuditor:
     """
 
     STATE_FILE = LOG_DIR / "press_audit.state"
+    STATUS_FILE = LOG_DIR / "press_audit.json"   # lido pelo agent -> /phoenix/status
     SETTLE_SECONDS = 90        # so' audita aperto com tempo de virar evento
     MATCH_TOLERANCE = 3        # casamento aperto <-> evento, em segundos
     LOCK_WINDOW = 15           # motion_lock do Shinobi (libs/monitor/utils.js)
-    MIN_SAMPLE = 5             # nao alarma com amostra pequena
-    FAIL_RATIO = 0.30          # alarma acima de 30% de perda
-    ALERT_COOLDOWN = 30 * 60
+    STATUS_TTL = 6 * 3600      # janela que o status cobre, p/ o OPS saber a validade
 
     def __init__(self):
-        self.last_alert = 0
         self.last_ts = self._load_state()
 
     # ---------- estado ----------
@@ -1326,29 +1324,21 @@ class PressToVideoAuditor:
         self.last_ts = presses[-1][0].strftime("%Y-%m-%d %H:%M:%S")
         self._save_state(self.last_ts)
 
-        if auditados < self.MIN_SAMPLE or not perdidos:
-            if perdidos:
-                log.info(
-                    f"[press-audit] {len(perdidos)}/{auditados} apertos sem evento "
-                    "(amostra pequena, sem alerta)"
-                )
-            return False
-
-        ratio = len(perdidos) / auditados
-        if ratio < self.FAIL_RATIO:
-            log.info(f"[press-audit] {len(perdidos)}/{auditados} sem evento ({ratio:.0%}) — abaixo do limiar")
-            return False
-
-        agora = time.time()
-        if agora - self.last_alert < self.ALERT_COOLDOWN:
-            log.warning(f"[press-audit] {len(perdidos)}/{auditados} sem evento, mas dentro do cooldown")
-            return False
-        self.last_alert = agora
-
-        exemplos = [f"{t:%H:%M:%S} {lbl}" for t, lbl, _ in perdidos[:5]]
         por_quadra = {}
         for _, lbl, _ in perdidos:
             por_quadra[lbl] = por_quadra.get(lbl, 0) + 1
+        exemplos = [f"{t:%Y-%m-%d %H:%M:%S} {lbl}" for t, lbl, _ in perdidos[:10]]
+
+        # Status sempre publicado (inclusive limpo), para o OPS distinguir
+        # "auditado e sem perda" de "sem dado nenhum".
+        self._write_status(auditados, len(perdidos), por_quadra, exemplos)
+
+        if not perdidos:
+            return False
+
+        # Sem limiar: UMA perda ja' e' falha. O lockout ja' foi descontado acima,
+        # entao o que sobra aqui e' aperto que o cliente deu e nao virou video.
+        ratio = len(perdidos) / auditados if auditados else 1.0
         log.error(
             f"[press-audit] APERTO SEM VIDEO: {len(perdidos)} de {auditados} "
             f"({ratio:.0%}) — {por_quadra}"
@@ -1356,7 +1346,7 @@ class PressToVideoAuditor:
         alerts.add(
             "press_without_video",
             "critical",
-            f"{len(perdidos)} de {auditados} apertos não geraram vídeo ({ratio:.0%}) — "
+            f"{len(perdidos)} de {auditados} apertos não geraram vídeo — "
             "o Shinobi respondeu sucesso mas o evento não nasceu",
             {
                 "perdidos": len(perdidos),
@@ -1368,6 +1358,22 @@ class PressToVideoAuditor:
             },
         )
         return True
+
+    def _write_status(self, auditados, perdidos, por_quadra, exemplos):
+        """Publica o resultado para o agent expor em /phoenix/status."""
+        try:
+            self.STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.STATUS_FILE.write_text(json.dumps({
+                "checkedAt": datetime.now().isoformat(),
+                "windowSeconds": self.STATUS_TTL,
+                "audited": auditados,
+                "lost": perdidos,
+                "byCourt": por_quadra,
+                "examples": exemplos,
+                "lockWindowSeconds": self.LOCK_WINDOW,
+            }))
+        except Exception as e:
+            log.debug(f"[press-audit] falha ao publicar status: {e}")
 
 # === Connectivity Sentinel ===
 class ConnectivitySentinel:
