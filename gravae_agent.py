@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "3.7.7"
+VERSION = "3.7.8"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -2018,8 +2018,79 @@ def ensure_pm2_cgroup_isolated():
                       "protegido por KillMode; corrige sozinho no proximo boot")
             else:
                 print(f"[pm2-cgroup] camera.js isolado corretamente ({cg})")
+
+        # 4) aposentar o pm2-<usuario>.service (ver retire_user_pm2_units)
+        retire_user_pm2_units()
     except Exception as e:
         print(f"[pm2-cgroup] ensure failed: {e}")
+
+
+def _root_pm2_has_shinobi_online():
+    """True se o PM2 canonico (/root/.pm2) esta com camera/Shinobi online."""
+    try:
+        r = subprocess.run(["pm2", "jlist"], capture_output=True, text=True,
+                           timeout=30, env=_pm2_env())
+        if r.returncode != 0 or not r.stdout.strip():
+            return False
+        start = r.stdout.find("[")
+        procs = json.loads(r.stdout[start:]) if start >= 0 else []
+        return any(p.get("name") in ("camera", "Shinobi", "shinobi")
+                   and (p.get("pm2_env") or {}).get("status") == "online"
+                   for p in procs)
+    except Exception as e:
+        print(f"[pm2-user] nao consegui ler o pm2 do root: {e}")
+        return False
+
+
+def retire_user_pm2_units():
+    """Desliga o pm2-<usuario>.service que briga com o PM2 canonico do root.
+
+    Visto na frota em 02/09/2026: 389 Pis, 14.493 alertas em 7 dias do tipo
+    "Removed 1 stray PM2 daemon". Mecanismo: um `pm2 startup` feito como
+    replayme/gravae deixou uma unit pm2-<usuario>.service com Restart=on-failure
+    e `pm2 resurrect`, e o dump.pm2 desse home tem `camera`. A cada boot (e a cada
+    vez que o phoenix mata o daemon extra) o systemd religa a unit, que sobe um
+    SEGUNDO camera.js -- dois ffmpeg por monitor por alguns segundos -- ate o
+    phoenix matar de novo. Loop de 2 a 6 minutos, para sempre.
+
+    Idempotente e conservador: so age se o PM2 do root esta com camera online
+    (senao o PM2 do usuario pode ser o unico que esta gravando e fica como esta).
+    Nunca toca no root. Nao reinicia nada que esteja servindo.
+    """
+    if not _root_pm2_has_shinobi_online():
+        print("[pm2-user] PM2 do root sem camera online; nao mexo nas units de usuario")
+        return
+    users = []
+    for u in (CONFIG.get('arenaUser') or 'gravae', 'gravae', 'replayme'):
+        if u and u != 'root' and u not in users:
+            users.append(u)
+    for user in users:
+        unit = f"pm2-{user}.service"
+        st = subprocess.run(["sudo", "systemctl", "is-enabled", unit],
+                            capture_output=True, text=True, timeout=10)
+        state = (st.stdout or st.stderr or "").strip()
+        active = subprocess.run(["sudo", "systemctl", "is-active", unit],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+        unit_exists = state and "not-found" not in state and "No such file" not in state
+        if unit_exists and (state in ("enabled", "enabled-runtime", "static") or active == "active"):
+            subprocess.run(["sudo", "systemctl", "disable", "--now", unit],
+                           check=False, capture_output=True, timeout=30)
+            print(f"[pm2-user] {unit} desabilitado e parado (estava {state}/{active})")
+        # daemon e camera.js sobressalentes desse usuario (o phoenix tambem mata, mas
+        # aqui evitamos a janela de ffmpeg duplicado ate ele passar)
+        pids = subprocess.run(["sudo", "pgrep", "-u", user, "-f",
+                               "PM2 v|/home/Shinobi/camera.js|/home/Shinobi/cron.js"],
+                              capture_output=True, text=True, timeout=10).stdout.split()
+        for pid in pids:
+            subprocess.run(["sudo", "kill", pid], check=False, timeout=10)
+        if pids:
+            print(f"[pm2-user] matei {len(pids)} processo(s) PM2/Shinobi do usuario {user}: {' '.join(pids)}")
+        dump = f"/home/{user}/.pm2/dump.pm2"
+        if os.path.exists(dump):
+            stamp = datetime.now().strftime("%Y%m%d")
+            subprocess.run(["sudo", "mv", dump, f"{dump}.desativado-{stamp}"],
+                           check=False, timeout=10)
+            print(f"[pm2-user] {dump} renomeado; `pm2 resurrect` como {user} nao sobe mais nada")
 
 
 def ensure_shinobi_probe_disabled():
