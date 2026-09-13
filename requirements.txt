@@ -11,3 +11,5 @@
 # - sqlite3
 # - logging
 # - urllib.request
+
+# Optional DIRECT runtime dependencies: see requirements-direct.txt and DIRECT.md.

@@ -1,0 +1,19 @@
+[Unit]
+Description=Gravae staging durable direct-upload queue
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/gravae-direct-queue/direct_upload_queue.py --config /etc/gravae/direct-upload.json serve
+Restart=on-failure
+RestartSec=10
+Nice=10
+CPUQuota=25%
+MemoryMax=192M
+IOWeight=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+[Unit]
+Description=Gravae staging device gateway client
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+ConditionPathExists=/etc/gravae/device-client.json
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+WorkingDirectory=/opt/gravae-device-client
+ExecStart=/opt/gravae-device-client/venv/bin/python /opt/gravae-device-client/device_gateway_client.py --config /etc/gravae/device-client.json serve
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/gravae-device-client /run
+StateDirectory=gravae-device-client
+Nice=5
+CPUQuota=100%
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
