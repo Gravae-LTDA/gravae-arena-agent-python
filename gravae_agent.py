@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v4.0.0
+Gravae Arena Agent v4.0.1
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "4.0.0"
+VERSION = "4.0.1"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -6171,8 +6171,17 @@ def _fix_button_daemon_polling():
         print(f"[Startup] Button daemon polling fix error: {e}")
 
 
-def main():
-    log.info(f"Gravae Agent v{VERSION} starting", extra={"port": PORT})
+def run_startup_repairs():
+    """Explicit opt-out for an API-only update of an already running arena.
+
+    Legacy boot behavior remains the default. Controlled updates install a
+    systemd drop-in with GRAVAE_STARTUP_REPAIRS=disabled before restarting only
+    this service. Repairs must be scheduled separately by OPS.
+    """
+    policy = os.environ.get('GRAVAE_STARTUP_REPAIRS', 'enabled')
+    if policy != 'enabled':
+        log.warning("Startup repairs skipped", extra={"policy": policy})
+        return
 
     # Fix git safe.directory for updates (git 2.35.2+ blocks cross-user repos)
     subprocess.run(['git', 'config', '--global', '--add', 'safe.directory', AGENT_PATH], capture_output=True, timeout=5)
@@ -6236,6 +6245,13 @@ def main():
     if _coaching_module and _coaching_module.is_configured():
         _coaching_module.start()
         log.info("Coaching module started")
+
+
+
+def main():
+    log.info(f"Gravae Agent v{VERSION} starting", extra={"port": PORT})
+
+    run_startup_repairs()
 
     server = HTTPServer(('0.0.0.0', PORT), AgentHandler)
     log.info(f"HTTP server listening on 0.0.0.0:{PORT}")

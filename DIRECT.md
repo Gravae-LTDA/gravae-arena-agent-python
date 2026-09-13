@@ -31,3 +31,36 @@ O instalador OPS copia estes módulos para `/opt/gravae-device-client` e `/opt/g
 Executar `python3 -m unittest discover -s tests -p 'test_*.py'` e `node tests/shinobi_upload_hook.test.cjs`.
 
 O núcleo anterior à regra de modo foi testado na Raspberry piloto: lives RTSP simultâneas, upload por evento e menor uso periódico de CPU. A nova sincronização de modo e o instalador completo do OPS ainda exigem homologação LEGACY/DIRECT antes do rollout de frota. ACK com eventId e HLS de todas as câmeras são requisitos de aceite, não são afrouxados por esta versão.
+
+## Controlled API update (4.0.1)
+
+`GRAVAE_STARTUP_REPAIRS=disabled` starts only the HTTP API. It skips startup
+repairs, post-update checks and automatic observation/coaching resumption.
+This is an explicit maintenance setting for an already running pilot; it does
+not replace device readiness or the gateway/uploader services. Missing setting
+keeps the existing startup behavior; unknown values skip repairs rather than
+accidentally restarting cameras.
+
+`ops/upgrade-pilot-api.py ARCHIVE SHA256` is restricted to physical serial
+`10000000a8917a01`. The archive contains exactly `gravae_agent.py`,
+`observation_mode.py`, `hands_up_module.py`, and `VERSION`. It checks Python
+syntax before replacing files, saves a protected backup, installs a systemd
+drop-in, and restarts only `gravae-agent.service`. Failed `/update/version` validation
+restores the files and drop-in. It never runs `install.sh`, touches DIRECT queue
+files or replaces the gateway/uploader. It rejects media processes sharing the
+agent's cgroup, since restarting that unit could otherwise terminate media.
+
+Keep this drop-in for controlled API restarts. Re-enabling startup repairs is
+an explicit maintenance task, since existing repair routines can modify Shinobi
+and restart media. Do not apply this pilot installer to other arenas.
+
+Pilot validation, 2026-09-13:
+- API upgraded from 3.0.0 to 4.0.1; backup `/var/backups/gravae-api/1789327719`.
+- Gateway PID 1672816 and uploader PID 1667310 unchanged.
+- Six tracked node/FFmpeg PIDs unchanged during the successful upgrade.
+- Authenticated OPS proxy: `status.read` returned online / 4.0.1;
+  `buttons.read` returned HTTP 200. The pilot daemon is stopped and its existing
+  GPIO 26 mapping refers to `quadra01_camera01`; this mapping was not changed
+  or activated by the upgrade. Reading a mapping does not validate a physical press.
+- An initial health check used the wrong route and triggered rollback. The
+  corrected installer validates the actual `/update/version` endpoint.
