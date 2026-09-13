@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v4.0.0
+Gravae Arena Agent v4.0.1
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "4.0.0"
+VERSION = "4.0.1"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -2647,52 +2647,56 @@ def shinobi_monitor_update(mid, fields, who=None, group_key=None):
     }
 
 
-def shinobi_monitor_restart(mid, group_key=None):
-    """Force Shinobi to re-read the monitor's details from DB.
+_monitor_control_lock = threading.Lock()
 
-    Strategy:
-      1. Try the per-monitor REST stop+start (uses agent's shinobiApiKey).
-         This is granular — only the targeted monitor briefly drops.
-      2. Fall back to `pm2 restart camera` if the API key lacks the
-         control_monitors permission (returns "Not Authorized").
+
+def shinobi_monitor_control(mid, action, group_key=None):
+    """Control only one monitor. Never fall back to a process-wide restart.
+
+    A REST acknowledgement is acceptance, not proof of working camera media.
+    Timeout is uncertain and must be reconciled from status before retrying.
     """
     gk = group_key or CONFIG.get('shinobiGroupKey')
     api_key = CONFIG.get('shinobiApiKey')
-
-    # ── Path 1: granular REST stop+start ─────────────────────────────
-    if gk and api_key:
-        base_url = f"http://127.0.0.1:8080/{api_key}/monitor/{gk}/{mid}"
-        try:
-            with urllib.request.urlopen(f"{base_url}/stop", timeout=10) as r:
-                stop_body = r.read().decode()[:400]
-            granular_ok = '"ok":true' in stop_body.replace(' ', '') or '"ok": true' in stop_body
-            if granular_ok:
-                time.sleep(2)
-                with urllib.request.urlopen(f"{base_url}/start", timeout=15) as r:
-                    start_body = r.read().decode()[:400]
-                return {"success": True, "method": "granular", "stop": stop_body, "start": start_body}
-        except Exception as e:
-            print(f"[monitor-restart] granular failed: {e} — falling back to pm2")
-
-    # ── Path 2: pm2 restart camera (full Shinobi reload, ~3-5s) ──────
+    if (not isinstance(mid, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', mid)
+            or not isinstance(gk, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', gk)
+            or action not in ('start', 'stop', 'record', 'restart')):
+        return {"success": False, "errorCode": "INVALID_MONITOR_CONTROL"}
+    if not api_key:
+        return {"success": False, "errorCode": "SHINOBI_AUTH_REQUIRED"}
+    if not _monitor_control_lock.acquire(blocking=False):
+        return {"success": False, "errorCode": "MONITOR_CONTROL_BUSY"}
+    sent = False
     try:
-        result = subprocess.run(
-            ['pm2', 'restart', 'camera'],
-            capture_output=True, text=True, timeout=30, env=_pm2_env(),
-        )
-        if result.returncode != 0:
-            return {"success": False, "method": "pm2", "error": result.stderr.strip()[:400]}
-        # Wait for Shinobi to come back up
-        for _ in range(20):
-            time.sleep(2)
-            try:
-                with urllib.request.urlopen("http://127.0.0.1:8080/", timeout=3) as _:
-                    return {"success": True, "method": "pm2", "note": "full Shinobi restart (granular auth not available)"}
-            except Exception:
-                continue
-        return {"success": False, "method": "pm2", "error": "Shinobi did not come back within 40s"}
-    except Exception as e:
-        return {"success": False, "method": "pm2", "error": str(e)}
+        current = shinobi_monitor_get(mid, group_key=gk)
+        if not current.get('success') or current.get('monitor', {}).get('mid') != mid:
+            return {"success": False, "errorCode": "MONITOR_NOT_FOUND"}
+        mode = current['monitor'].get('mode')
+        if action == 'restart' and mode not in ('start', 'record', 'stop'):
+            return {"success": False, "errorCode": "MONITOR_MODE_UNKNOWN"}
+        if action == 'restart' and mode == 'stop':
+            return {"success": True, "method": "granular", "accepted": False, "state": "stopped"}
+        actions = ['stop', mode] if action == 'restart' else [action]
+        from urllib.parse import quote
+        base_url = "http://127.0.0.1:8080/{}/monitor/{}/{}".format(quote(api_key, safe=''), gk, mid)
+        for step in actions:
+            sent = True
+            with urllib.request.urlopen(base_url + '/' + step, timeout=15) as response:
+                result = json.loads(response.read(65536))
+            if not isinstance(result, dict) or result.get('ok') is not True:
+                return {"success": False, "method": "granular", "errorCode": "MONITOR_CONTROL_REJECTED", "failedStep": step, "reconcileRequired": True}
+            if action == 'restart' and step == 'stop':
+                time.sleep(2)
+        return {"success": True, "method": "granular", "accepted": True, "requestedMode": actions[-1], "mediaVerified": False}
+    except Exception:
+        # Do not log URLs: local Shinobi credentials are part of the URL.
+        return {"success": False, "method": "granular", "errorCode": "MONITOR_CONTROL_UNCERTAIN" if sent else "MONITOR_READ_FAILED", "reconcileRequired": sent}
+    finally:
+        _monitor_control_lock.release()
+
+
+def shinobi_monitor_restart(mid, group_key=None):
+    return shinobi_monitor_control(mid, 'restart', group_key=group_key)
 
 
 def ensure_super_admin_token():
@@ -5117,6 +5121,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"success": False, "error": str(e)}, 500)
 
+        elif path == '/shinobi/monitor/control':
+            result = shinobi_monitor_control(data.get('mid'), data.get('action'), group_key=data.get('groupKey'))
+            self._send_json(result, 200 if result.get('success') else 409)
+
         elif path == '/shinobi/monitor/restart':
             mid = data.get('mid')
             gk = data.get('groupKey')
@@ -6171,8 +6179,17 @@ def _fix_button_daemon_polling():
         print(f"[Startup] Button daemon polling fix error: {e}")
 
 
-def main():
-    log.info(f"Gravae Agent v{VERSION} starting", extra={"port": PORT})
+def run_startup_repairs():
+    """Explicit opt-out for an API-only update of an already running arena.
+
+    Legacy boot behavior remains the default. Controlled updates install a
+    systemd drop-in with GRAVAE_STARTUP_REPAIRS=disabled before restarting only
+    this service. Repairs must be scheduled separately by OPS.
+    """
+    policy = os.environ.get('GRAVAE_STARTUP_REPAIRS', 'enabled')
+    if policy != 'enabled':
+        log.warning("Startup repairs skipped", extra={"policy": policy})
+        return
 
     # Fix git safe.directory for updates (git 2.35.2+ blocks cross-user repos)
     subprocess.run(['git', 'config', '--global', '--add', 'safe.directory', AGENT_PATH], capture_output=True, timeout=5)
@@ -6236,6 +6253,13 @@ def main():
     if _coaching_module and _coaching_module.is_configured():
         _coaching_module.start()
         log.info("Coaching module started")
+
+
+
+def main():
+    log.info(f"Gravae Agent v{VERSION} starting", extra={"port": PORT})
+
+    run_startup_repairs()
 
     server = HTTPServer(('0.0.0.0', PORT), AgentHandler)
     log.info(f"HTTP server listening on 0.0.0.0:{PORT}")
