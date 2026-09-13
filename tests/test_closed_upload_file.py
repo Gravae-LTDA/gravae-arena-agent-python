@@ -22,7 +22,10 @@ class ClosedFileTests(unittest.TestCase):
 
     @unittest.skipUnless(Path('/proc/self/fd').exists(), 'Linux procfs required')
     def test_real_open_writer_then_closed_file(self):
-        with tempfile.NamedTemporaryFile() as source:
-            st = os.fstat(source.fileno())
-            self.assertIn((st.st_dev, st.st_ino), open_writer_inodes())
-        self.assertNotIn((st.st_dev, st.st_ino), open_writer_inodes())
+        # Exercise real Linux descriptors without requiring visibility into other users.
+        with tempfile.TemporaryDirectory() as proc:
+            (Path(proc)/str(os.getpid())).symlink_to(Path('/proc')/str(os.getpid()))
+            with tempfile.NamedTemporaryFile() as source:
+                st = os.fstat(source.fileno())
+                self.assertIn((st.st_dev, st.st_ino), open_writer_inodes(proc))
+            self.assertNotIn((st.st_dev, st.st_ino), open_writer_inodes(proc))
