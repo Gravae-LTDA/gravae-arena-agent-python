@@ -71,7 +71,7 @@ def main():
                 if not member.isfile():
                     raise RuntimeError('Only regular files are permitted')
                 (stage / member.name).write_bytes(archive.extractfile(member).read())
-        if (stage / 'VERSION').read_text().strip() != '4.0.1':
+        if (stage / 'VERSION').read_text().strip() != '4.0.2':
             raise RuntimeError('Unexpected version')
         for file in stage.glob('*.py'):
             py_compile.compile(str(file), doraise=True)
@@ -101,12 +101,12 @@ def main():
                 try:
                     with urllib.request.urlopen('http://127.0.0.1:8888/update/version', timeout=2) as response:
                         version = json.load(response).get('version')
-                    if version == '4.0.1':
+                    if version == '4.0.2':
                         break
                 except Exception:
                     pass
                 time.sleep(1)
-            if version != '4.0.1':
+            if version != '4.0.2':
                 raise RuntimeError('New API did not become healthy')
         except Exception:
             for item in manifest:
