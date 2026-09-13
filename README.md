@@ -2,6 +2,12 @@
 
 Agent de monitoramento e controle para Raspberry Pi nas arenas Gravae/Replayme.
 
+### Correções 4.0.3
+
+- Observação aceita `autoheal: false`, persistido e preservado na retomada, para diagnosticar sem reiniciar o processo de câmeras.
+- `/observation/status` informa `supportsAutohealPolicy` e `autohealEnabled`; o OPS verifica a capacidade antes de ativar o piloto.
+- Chamadas legadas sem esse campo preservam a política anterior. A atualização controlada continua restrita à Raspberry piloto.
+
 ### Correções 4.0.2
 
 - Diagnóstico NetworkManager consulta o método IPv4 do perfil ativo por UUID, sem criar ou alterar conexões. Interfaces sem perfil confirmado retornam DHCP desconhecido.
