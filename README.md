@@ -2,6 +2,12 @@
 
 Agent de monitoramento e controle para Raspberry Pi nas arenas Gravae/Replayme.
 
+### Correções 4.0.2
+
+- Diagnóstico NetworkManager consulta o método IPv4 do perfil ativo por UUID, sem criar ou alterar conexões. Interfaces sem perfil confirmado retornam DHCP desconhecido.
+- Consulta `GET /observation/status` retorna estado aplicado e execução da observação sem segredo HMAC.
+- Atualizador controlado do piloto aceita 4.0.2 e preserva processos de gateway, upload e mídia. Atualização da frota continua sendo uma operação explícita pelo OPS.
+
 ## Funcionalidades
 
 ### gravae_agent.py

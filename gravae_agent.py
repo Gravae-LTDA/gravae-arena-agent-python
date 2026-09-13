@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v4.0.1
+Gravae Arena Agent v4.0.2
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "4.0.1"
+VERSION = "4.0.2"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -417,6 +417,21 @@ def get_network_manager_type():
         return {'type': 'networkmanager', 'codename': codename, 'service': 'NetworkManager'}
     return {'type': 'dhcpcd', 'codename': codename, 'service': 'dhcpcd'}
 
+def networkmanager_ipv4_method(interface):
+    """Read the active profile without creating or changing a connection."""
+    try:
+        result = subprocess.run(['nmcli', '-g', 'GENERAL.CON-UUID', 'device', 'show', interface],
+                                capture_output=True, text=True, timeout=5)
+        uuid = result.stdout.strip()
+        if result.returncode or not re.fullmatch(r'[0-9a-fA-F-]{36}', uuid):
+            return None
+        result = subprocess.run(['nmcli', '-g', 'ipv4.method', 'connection', 'show', 'uuid', uuid],
+                                capture_output=True, text=True, timeout=5)
+        method = result.stdout.strip()
+        return method if result.returncode == 0 and method in ('auto', 'manual', 'disabled', 'link-local', 'shared') else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
 def get_network_interfaces():
     """Get all network interfaces with their configuration."""
     interfaces = []
@@ -475,15 +490,11 @@ def get_network_interfaces():
         net_manager = get_network_manager_type()
 
         if net_manager['type'] == 'networkmanager':
-            # Use nmcli to check DHCP status
+            # IP4.METHOD is not a device field; read the active profile instead.
             for iface in interfaces:
-                try:
-                    result = subprocess.run(['nmcli', '-t', '-f', 'IP4.METHOD', 'device', 'show', iface['name']],
-                                           capture_output=True, text=True, timeout=5)
-                    if 'auto' in result.stdout.lower():
-                        iface['is_dhcp'] = True
-                except:
-                    pass
+                method = networkmanager_ipv4_method(iface['name'])
+                iface['ipv4_method'] = method
+                iface['is_dhcp'] = method == 'auto' if method is not None else None
         else:
             # Check dhcpcd.conf for static config
             try:
@@ -5503,6 +5514,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             '/system/network': lambda: {"localIp": get_local_ip(), "gateway": get_gateway(), "hostname": get_hostname()},
             '/system/uptime': get_uptime,
             '/network/info': get_network_interfaces,
+            '/observation/status': observation_mode.status,
             '/hardware/info': lambda: {"model": get_device_model(), "serial": get_device_serial(), "os": get_os_info(), "gpio": get_gpio_info()},
             '/gpio/info': get_gpio_info,
             '/buttons/status': get_button_daemon_status,
