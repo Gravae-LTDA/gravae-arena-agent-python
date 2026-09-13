@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 STATE_PATH = "/etc/gravae/observation.json"
 DEVICE_PATH = "/etc/gravae/device.json"
 DEFAULT_INTERVAL = 45
-OBS_VERSION = "1.5.0"
+OBS_VERSION = "1.6.0"
 PM2_HOME = "/root/.pm2"
 
 # Fase 2 — parâmetros dos checks (conservadores p/ evitar falso-positivo).
@@ -597,7 +597,8 @@ def _cycle():
     # a condição p/ estarmos neste loop). pm2 restart camera se press_without_video
     # persistir. `found` já traz consecutiveCount setado acima.
     try:
-        _maybe_autoheal(found, serial, secret, ops)
+        if _state.get("autoheal", True):
+            _maybe_autoheal(found, serial, secret, ops)
     except Exception as e:
         _log(f"auto-heal erro: {e}")
 
@@ -621,13 +622,15 @@ def _loop():
         _stop.wait(interval)
 
 
-def enable(secret, ops_url, interval=DEFAULT_INTERVAL, until=None):
+def enable(secret, ops_url, interval=DEFAULT_INTERVAL, until=None, autoheal=True):
     global _thread, _state
+    if type(autoheal) is not bool:
+        raise ValueError("autoheal must be boolean")
     with _lock:
         prev_lp = _state.get("lastPress", {}) if _state.get("enabled") else {}
         _state = {"enabled": True, "secret": secret, "opsUrl": ops_url,
                   "interval": int(interval or DEFAULT_INTERVAL), "until": until,
-                  "lastPress": prev_lp}
+                  "lastPress": prev_lp, "autoheal": autoheal}
         save_state()
         _stop.clear()
         if _thread is None or not _thread.is_alive():
@@ -650,7 +653,7 @@ def disable():
 def resume_if_enabled():
     load_state()
     if _state.get("enabled") and _state.get("secret") and _state.get("opsUrl"):
-        enable(_state["secret"], _state["opsUrl"], int(_state.get("interval") or DEFAULT_INTERVAL), _state.get("until"))
+        enable(_state["secret"], _state["opsUrl"], int(_state.get("interval") or DEFAULT_INTERVAL), _state.get("until"), _state.get("autoheal", True))
         return True
     return False
 
@@ -662,4 +665,6 @@ def status():
         "until": _state.get("until"),
         "running": _thread is not None and _thread.is_alive(),
         "obsVersion": OBS_VERSION,
+        "supportsAutohealPolicy": True,
+        "autohealEnabled": bool(_state.get("enabled")) and _state.get("autoheal", True),
     }

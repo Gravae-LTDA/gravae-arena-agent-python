@@ -26,7 +26,7 @@ class PilotApiUpgrade(unittest.TestCase):
         output = io.BytesIO()
         with tarfile.open(fileobj=output, mode='w:gz') as archive:
             for name in upgrade.FILES:
-                data = b'4.0.2\n' if name == 'VERSION' else b'# new module\n'
+                data = b'4.0.3\n' if name == 'VERSION' else b'# new module\n'
                 item = tarfile.TarInfo(name); item.size = len(data); archive.addfile(item, io.BytesIO(data))
         self.archive = root / 'payload.tar.gz'; self.archive.write_bytes(output.getvalue())
         args = ['upgrade', str(self.archive), hashlib.sha256(output.getvalue()).hexdigest()]
@@ -49,7 +49,7 @@ class PilotApiUpgrade(unittest.TestCase):
 
     def test_success_only_restarts_agent_and_preserves_baseline(self):
         baseline = {'services': {'gateway': '123'}, 'media': [{'pid': 456, 'name': 'ffmpeg'}]}
-        with patch.object(upgrade.os, 'geteuid', return_value=0), patch.object(upgrade, 'snapshot', return_value=baseline), patch.object(upgrade, 'run') as run, patch.object(upgrade.urllib.request, 'urlopen', return_value=io.BytesIO(json.dumps({'version': '4.0.2'}).encode())) as request, patch('builtins.print'):
+        with patch.object(upgrade.os, 'geteuid', return_value=0), patch.object(upgrade, 'snapshot', return_value=baseline), patch.object(upgrade, 'run') as run, patch.object(upgrade.urllib.request, 'urlopen', return_value=io.BytesIO(json.dumps({'version': '4.0.3'}).encode())) as request, patch('builtins.print'):
             upgrade.main()
         request.assert_called_once_with('http://127.0.0.1:8888/update/version', timeout=2)
         self.assertIn('GRAVAE_STARTUP_REPAIRS=disabled', self.dropin.read_text())
