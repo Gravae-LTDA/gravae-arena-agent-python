@@ -5,7 +5,7 @@ from pathlib import Path
 
 def direct_enabled(config):
     try:
-        value = json.loads(Path(config.get('mediaModeFile', '/etc/gravae/media-mode.json')).read_text())
+        value = json.loads(Path(config.get('mediaModeFile', '/var/lib/gravae-device-client/media-mode.json')).read_text())
         identity = config.get('mediaDeviceId') or config.get('shinobiId') or config.get('deviceId')
         return (value.get('mode') == 'DIRECT' and value.get('mediaDeviceId') == identity
                 and value.get('arenaId') == config.get('arenaId')

@@ -20,6 +20,8 @@ import uuid
 from device_readiness import hls_check, resource_checks, HlsReadinessCache
 from device_event_outbox import EventOutbox
 from direct_publisher import RetryingPublisher
+from media_mode import direct_enabled
+from arena_config_sync import fetch_snapshot, save_mode
 
 
 def timestamp():
@@ -86,13 +88,13 @@ class GatewayConnection:
         try:
             client.connect(self.config["gatewayUrl"], transports=["websocket"], namespaces=["/devices"],
                            auth={**identity_fields(self.config), "token": self.config["deviceToken"],
-                                 "agentVersion": "direct-pilot-3"}, wait_timeout=15)
+                                 "agentVersion": AGENT_VERSION}, wait_timeout=15)
         except Exception:
             self.close()
             raise
 
 
-AGENT_VERSION = "4.0.0"
+AGENT_VERSION = Path(__file__).with_name("VERSION").read_text().strip()
 
 
 class CommandError(Exception):
@@ -222,14 +224,20 @@ class DeviceRuntime:
                         raise ValueError("Timezone required")
                     if expires.timestamp() <= time.time():
                         raise CommandError("DEVICE_COMMAND_EXPIRED")
-                    if command.get("type") not in ("READINESS_CHECK", "STREAM_START", "STREAM_STOP"):
+                    if command.get("type") not in ("READINESS_CHECK", "STREAM_START", "STREAM_STOP", "ARENA_CONFIG_SYNC"):
                         raise CommandError("UNSUPPORTED_COMMAND")
                     db.execute("INSERT INTO commands VALUES(?,?)", (command_id, json.dumps(dict(result, event="pending"))))
                     payload = command.get("payload") or {}
                     if not isinstance(payload, dict):
                         raise CommandError("INVALID_PAYLOAD")
                     result["monitorId"] = payload.get("monitorId")
-                    if command["type"] == "STREAM_START":
+                    if command["type"] == "ARENA_CONFIG_SYNC":
+                        if not isinstance(payload.get("configPath"), str):
+                            raise CommandError("ARENA_CONFIG_SYNC_FAILED")
+                        self.sync_config(payload.get("configPath"))
+                    elif command["type"] == "READINESS_CHECK":
+                        result["readiness"] = self.readiness()
+                    elif command["type"] == "STREAM_START":
                         self.start(command["streamId"], payload, command_id=command_id)
                     elif command["type"] == "STREAM_STOP":
                         if self.streams and command.get("streamId") not in self.streams:
@@ -253,7 +261,33 @@ class DeviceRuntime:
                     raise
             return result
 
+    def sync_config(self, config_path=None):
+        try:
+            snapshot = fetch_snapshot(self.config, config_path)
+            with self.lock:
+                if snapshot['mediaMode'] == 'LEGACY':
+                    # Close the upload gate before stopping publishers. Keep files/queue.
+                    save_mode(self.config, 'LEGACY')
+                    self.stop()
+                else:
+                    active = [b['monitorId'] for b in snapshot['bindings'] if b.get('isActive') is True]
+                    if len(active) != len(set(active)) or any(mid not in self.config.get('monitors', {}) for mid in active):
+                        raise ValueError('Unknown local monitor')
+                    self.config['activeMonitorIds'] = active
+                    for stream_id, slot in list(self.streams.items()):
+                        if slot['monitorId'] not in active:
+                            self.stop(stream_id)
+                    save_mode(self.config, 'DIRECT')
+                    self.readiness()
+            return snapshot['mediaMode']
+        except Exception:
+            raise CommandError('ARENA_CONFIG_SYNC_FAILED') from None
+
     def start(self, stream_id, payload, command_id=None):
+        if not direct_enabled(self.config):
+            raise CommandError("DIRECT_MODE_REQUIRED")
+        if "activeMonitorIds" in self.config and payload.get("monitorId") not in self.config["activeMonitorIds"]:
+            raise CommandError("MONITOR_NOT_FOUND")
         if not isinstance(stream_id, str) or not stream_id:
             raise CommandError("STREAM_ID_REQUIRED")
         if stream_id in self.streams:
@@ -412,6 +446,9 @@ def serve(config):
     def health_loop():
         previous_health = 0
         while not stopping.wait(1):
+            with runtime.lock:
+                if runtime.streams and not direct_enabled(runtime.config):
+                    runtime.stop()
             runtime.reap_publishers()
             if time.monotonic() - previous_health < 15:
                 continue
@@ -438,22 +475,40 @@ def serve(config):
                 return None
             client.emit(event, envelope, namespace="/devices", callback=acknowledged)
         received.wait(8)
-        return response[0] if response else None
+        ack = response[0] if response else None
+        if not isinstance(ack, dict) or ack.get("accepted") is not True or ack.get("eventId") != envelope.get("eventId"):
+            # Never log the backend error body, command payload or credentials.
+            print(json.dumps({"event": "event.ack_pending", "eventType": event,
+                              "callbackReceived": received.is_set(),
+                              "accepted": isinstance(ack, dict) and ack.get("accepted") is True,
+                              "eventIdMatches": isinstance(ack, dict) and ack.get("eventId") == envelope.get("eventId"),
+                              "ackKeys": sorted(ack) if isinstance(ack, dict) else []}), flush=True)
+        return ack
 
     def event_loop():
         while not stopping.wait(1):
             if connection.is_connected():
                 runtime.outbox.step(send_confirmed)
 
+    def config_loop():
+        while not stopping.is_set():
+            try:
+                runtime.sync_config()
+            except CommandError:
+                operational_log("config.sync_failed", errorCode="ARENA_CONFIG_SYNC_FAILED")
+            stopping.wait(60)
+
     def heartbeat_loop():
         while not stopping.wait(15):
             try:
-                emit("device.heartbeat", {"agentVersion": "direct-pilot-3"})
+                emit("device.heartbeat", {"agentVersion": AGENT_VERSION})
             except (OSError, socketio.exceptions.SocketIOError):
                 pass
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.set())
+    config_thread = threading.Thread(target=config_loop, name="device-config", daemon=True)
+    config_thread.start()
     thread = threading.Thread(target=health_loop, name="device-health", daemon=True)
     thread.start()
     events = threading.Thread(target=event_loop, name="device-events", daemon=True)

@@ -27,6 +27,47 @@ def media_identity(config):
         raise InstallError('IDENTITY_MISMATCH')
     return ids[0] if ids else config.get('deviceId')
 
+def http_agent_version():
+    with urllib.request.urlopen('http://127.0.0.1:8888/update/version', timeout=5) as response:
+        version = json.load(response).get('version', '')
+    if not isinstance(version, str) or not re.fullmatch(r'\d+\.\d+\.\d+', version):
+        raise InstallError('AGENT_UPDATE_FAILED')
+    return version
+
+def controlled_startup():
+    dropin = Path('/etc/systemd/system/gravae-agent.service.d/90-controlled-startup.conf')
+    baseline = Path('/etc/gravae/http-startup-baseline.json')
+    if not baseline.exists():
+        atomic(baseline, json.dumps({'dropin': dropin.read_text() if dropin.exists() else None}))
+    atomic(dropin, '[Service]\nEnvironment=GRAVAE_STARTUP_REPAIRS=disabled\n')
+    run(['systemctl', 'daemon-reload'])
+
+def update_agent(data):
+    identity(data['serial'])
+    if Path('/run/gravae-live.active').exists():
+        raise InstallError('LIVE_IN_PROGRESS')
+    try:
+        version = http_agent_version()
+        if tuple(map(int, version.split('.'))) >= (4, 0, 4):
+            return {'agentVersion': version, 'updated': False}
+        controlled_startup()
+        request = urllib.request.Request('http://127.0.0.1:8888/update/perform', b'{}', {'Content-Type': 'application/json'}, method='POST')
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if json.load(response).get('success') is not True:
+                raise InstallError('AGENT_UPDATE_FAILED')
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            time.sleep(2)
+            try:
+                version = http_agent_version()
+                if tuple(map(int, version.split('.'))) >= (4, 0, 4):
+                    return {'agentVersion': version, 'updated': True}
+            except (OSError, ValueError, InstallError):
+                pass  # The HTTP service restarts during its own update.
+    except Exception:
+        raise InstallError('AGENT_UPDATE_FAILED')
+    raise InstallError('AGENT_UPDATE_FAILED')
+
 def camera_sources(data):
     # Credentials stay on the Raspberry. Read the authenticated local monitor API.
     url = 'http://127.0.0.1:8080/' + '/'.join(urllib.parse.quote(p, safe='') for p in (data['shinobiKey'], 'monitor', data['groupKey']))
@@ -60,15 +101,50 @@ def camera_sources(data):
     except Exception:
         raise InstallError('CAMERA_MAPPING_REQUIRED')
 
+def configure_http_agent(data):
+    """Install only the local Shinobi identity; never backend EXTERNAL_KEY."""
+    if not isinstance(data.get('shinobiKey'), str) or not data['shinobiKey']:
+        raise InstallError('SHINOBI_AUTH_REQUIRED')
+    path = Path('/etc/gravae/device.json')
+    config = read(path) if path.exists() else {}
+    if config.get('shinobiGroupKey') not in (None, '', data['groupKey']):
+        raise InstallError('IDENTITY_MISMATCH')
+    if config.get('shinobiGroupKey') == data['groupKey'] and config.get('shinobiApiKey') == data['shinobiKey']:
+        return False
+    config.update(shinobiGroupKey=data['groupKey'], shinobiApiKey=data['shinobiKey'])
+    atomic(path, json.dumps(config))
+    return True
+
+def reload_http_agent():
+    # Loading the new local key must not trigger the old startup media repairs.
+    if tuple(map(int, http_agent_version().split('.'))) < (4, 0, 1):
+        raise InstallError('AGENT_UPDATE_REQUIRED')
+    controlled_startup()
+    run(['systemctl', 'restart', 'gravae-agent'])
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            if tuple(map(int, http_agent_version().split('.'))) >= (4, 0, 1):
+                return
+        except (OSError, ValueError, InstallError):
+            pass
+        time.sleep(1)
+    raise InstallError('AGENT_RELOAD_FAILED')
+
 def configure_v4(data, current, cfg, source):
     sources = camera_sources(data)
+    http_config_changed = configure_http_agent(data)
+    if data.get('backendUrl'):
+        current['backendUrl'] = data['backendUrl']
+    current['groupKey'] = data['groupKey']
+    current['mediaModeFile'] = '/var/lib/gravae-device-client/media-mode.json'
     current.update(mediaDeviceId=data['deviceId'], shinobiId=data['deviceId'],
                    hlsDecodeIntervalSeconds=300, hlsDecodeRetrySeconds=60)
     for m in data['monitors']:
         monitor = m['monitorId']
         current.setdefault('monitors', {}).setdefault(monitor, {}).update(sources[monitor])
         current['monitors'][monitor]['hlsManifest'] = f'/dev/shm/streams/{data["groupKey"]}/{monitor}/s.m3u8'
-    cfg['mediaModeFile'] = '/etc/gravae/media-mode.json'
+    cfg['mediaModeFile'] = '/var/lib/gravae-device-client/media-mode.json'
     cfg.setdefault('queueIdentity', cfg['deviceId'])
     cfg.update(mediaDeviceId=data['deviceId'], shinobiId=data['deviceId'],
                adaptiveUploadEnabled=True, requireClosedFile=True, settleSeconds=3,
@@ -90,6 +166,7 @@ def configure_v4(data, current, cfg, source):
     atomic('/etc/gravae/direct-upload.json', json.dumps(cfg))
     atomic('/etc/systemd/system/gravae-confirmed-video-cleanup.service', '[Unit]\nDescription=Cleanup confirmed R2 uploads\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 /opt/gravae-direct-queue/confirmed_video_cleanup.py --config /etc/gravae/direct-upload.json\nNice=15\nUMask=0077\n')
     atomic('/etc/systemd/system/gravae-confirmed-video-cleanup.timer', '[Unit]\nDescription=Cleanup confirmed R2 uploads\n[Timer]\nOnBootSec=30\nOnUnitInactiveSec=10\n[Install]\nWantedBy=timers.target\n')
+    return http_config_changed
 
 def activate_hook():
     # Native extension hot reload preserves Shinobi recording processes.
@@ -171,7 +248,7 @@ def prepare(data):
     if existing and (existing.get('arenaId') != data['arenaId'] or existing.get('environment') != data['environment']):
         raise InstallError('IDENTITY_MISMATCH')
     if existing:
-        return {'serial': serial, 'deviceId': media_identity(existing), 'existing': True}
+        return {'serial': serial, 'deviceId': media_identity(existing), 'existing': True, 'sshHostPublicKey': Path('/etc/ssh/ssh_host_ed25519_key.pub').read_text().strip()}
     if not shutil.which('wg'):
         run(['apt-get', 'update'], timeout=300)
         run(['apt-get', 'install', '-y', 'wireguard-tools'], timeout=600)
@@ -182,7 +259,7 @@ def prepare(data):
     if not keyfile.exists():
         atomic(keyfile, run(['wg', 'genkey']) + '\n')
     public = run(['wg', 'pubkey'], input=keyfile.read_text())
-    return {'serial': serial, 'publicKey': public, 'existing': False}
+    return {'serial': serial, 'publicKey': public, 'existing': False, 'sshHostPublicKey': Path('/etc/ssh/ssh_host_ed25519_key.pub').read_text().strip()}
 
 def wg_config(enrollment, environment, private_key):
     cidr = {'staging': '10.89.0.0/16', 'prod': '10.88.0.0/16', 'replayme': '10.90.0.0/16'}[environment]
@@ -199,6 +276,31 @@ def wg_config(enrollment, environment, private_key):
         raise InstallError('VPN_CONFIG_CONFLICT')
     return f'[Interface]\nPrivateKey = {private_key.strip()}\nAddress = {ip}/32\n\n[Peer]\nPublicKey = {pubkey}\nEndpoint = {endpoint}\nAllowedIPs = {", ".join(routes)}\nPersistentKeepalive = 25\n'
 
+def install_ops_key(data):
+    """Reuse the authenticated LEGACY account; add the OPS key without replacing keys."""
+    key, user = data.get('opsPublicKey'), data.get('opsSshUser')
+    if key is None and user is None:
+        return
+    if not isinstance(user, str) or not re.fullmatch(r'[a-z_][a-z0-9_-]*', user):
+        raise InstallError('SSH_NOT_CONFIGURED')
+    if not isinstance(key, str) or not re.fullmatch(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/]+={0,3}', key):
+        raise InstallError('SSH_NOT_CONFIGURED')
+    import pwd
+    account = pwd.getpwnam(user)
+    folder = Path(account.pw_dir) / '.ssh'
+    if folder.is_symlink() or (folder / 'authorized_keys').is_symlink():
+        raise InstallError('SSH_NOT_CONFIGURED')
+    folder.mkdir(mode=0o700, exist_ok=True)
+    target = folder / 'authorized_keys'
+    previous = target.read_text() if target.exists() else ''
+    if not any(' '.join(line.split()[:2]) == key for line in previous.splitlines()):
+        atomic(target, previous.rstrip('\n') + ('\n' if previous else '') + key + '\n')
+    os.chown(folder, account.pw_uid, account.pw_gid)
+    os.chown(target, account.pw_uid, account.pw_gid)
+    folder.chmod(0o700)
+    target.chmod(0o600)
+
+
 def install(data):
     identity(data['serial'])
     monitors = bindings(data['monitors'])
@@ -212,9 +314,10 @@ def install(data):
             raise InstallError('IDENTITY_MISMATCH')
     if Path('/run/gravae-live.active').exists():
         raise InstallError('LIVE_IN_PROGRESS')
+    install_ops_key(data)
     backup = Path('/var/lib/gravae-device-client') / ('before-4.0.0-' + str(time.time_ns()))
     backup.mkdir(parents=True, mode=0o700)
-    for old in (Path('/etc/gravae/device-client.json'), Path('/etc/gravae/direct-upload.json'), Path('/etc/gravae/shinobi-upload-hook.json')):
+    for old in (Path('/etc/gravae/device.json'), Path('/etc/gravae/device-client.json'), Path('/etc/gravae/direct-upload.json'), Path('/etc/gravae/shinobi-upload-hook.json')):
         if old.exists():
             shutil.copy2(old, backup / old.name)
     for folder in ('/opt/gravae-device-client', '/opt/gravae-direct-queue'):
@@ -244,7 +347,7 @@ def install(data):
     queue = Path('/opt/gravae-direct-queue')
     client.mkdir(parents=True, exist_ok=True)
     queue.mkdir(parents=True, exist_ok=True)
-    for name in ('device_gateway_client.py', 'device_readiness.py', 'device_event_outbox.py', 'direct_publisher.py', 'VERSION', 'direct_installer.py'):
+    for name in ('device_gateway_client.py', 'device_readiness.py', 'device_event_outbox.py', 'direct_publisher.py', 'arena_config_sync.py', 'media_mode.py', 'VERSION', 'direct_installer.py'):
         atomic(client / name, (source / name).read_text())
     for name in ('direct_upload_queue.py', 'adaptive_upload.py', 'video_completion_webhook.py', 'confirmed_video_cleanup.py', 'media_mode.py'):
         atomic(queue / name, (source / name).read_text())
@@ -272,7 +375,8 @@ def install(data):
         cfg = read(upload)
         if media_identity(cfg) != data['deviceId'] or cfg.get('arenaId') != data['arenaId'] or cfg.get('backendUrl', '').rstrip('/') != data['backendUrl'].rstrip('/'):
             raise InstallError('IDENTITY_MISMATCH')
-    configure_v4(data, current, cfg, source)
+    if configure_v4(data, current, cfg, source):
+        reload_http_agent()
     for path in (current['stateDir'], str(Path(current['queueStatusFile']).parent)):
         Path(path).mkdir(parents=True, exist_ok=True)
     for service in ('gravae-device-client.service', 'gravae-direct-queue.service'):
@@ -383,7 +487,7 @@ def verify(data):
     firewall = any(subprocess.run(['systemctl', 'is-active', unit], capture_output=True, text=True).returncode == 0 for unit in ('gravae-private-services', 'gravae-direct-private'))
     if ready and services and ssh_private and firewall:
         subprocess.run(['systemctl', 'stop', 'gravae-direct-rollback.timer'], capture_output=True)
-    return {'ready': bool(ready and services and ssh_private and firewall and status.get('agentVersion') == '4.0.0'), 'agentVersion': status.get('agentVersion'), 'checks': checks, 'privateAccessReady': bool(ssh_private and firewall), 'publisherConfigured': all(m.get('rtspUrl') for m in config.get('monitors', {}).values()), 'eventsReady': status.get('eventsPending') == 0}
+    return {'ready': bool(ready and services and ssh_private and firewall and bool(re.fullmatch(r'4\.\d+\.\d+', str(status.get('agentVersion', ''))))), 'agentVersion': status.get('agentVersion'), 'checks': checks, 'privateAccessReady': bool(ssh_private and firewall), 'publisherConfigured': all(m.get('rtspUrl') for m in config.get('monitors', {}).values()), 'eventsReady': status.get('eventsPending') == 0}
 
 
 def set_mode(data):
@@ -394,8 +498,23 @@ def set_mode(data):
     if data.get('mode') not in ('DIRECT', 'LEGACY'):
         raise InstallError('MODE_NOT_CONFIRMED')
     now = time.time()
-    atomic('/etc/gravae/media-mode.json', json.dumps({'mode': data['mode'], 'mediaDeviceId': data['deviceId'], 'arenaId': data['arenaId'], 'confirmedAt': now, 'expiresAt': now + 120}))
+    atomic('/var/lib/gravae-device-client/media-mode.json', json.dumps({'mode': data['mode'], 'mediaDeviceId': data['deviceId'], 'arenaId': data['arenaId'], 'confirmedAt': now, 'expiresAt': now + 120}))
     return {'mode': data['mode']}
+
+def network(data):
+    from pilot_network import transact, public_result
+    operation = data.pop('operation', None)
+    try:
+        return public_result(transact(operation, data))
+    except ValueError as exc:
+        raise InstallError(str(exc) if re.fullmatch(r'[A-Z_]{1,80}', str(exc)) else 'INVALID_NETWORK_REQUEST')
+
+def buttons(data):
+    from pilot_buttons import execute
+    try:
+        return execute(data)
+    except ValueError as exc:
+        raise InstallError(str(exc) if re.fullmatch(r'[A-Z_]{1,80}', str(exc)) else 'INVALID_BUTTON_REQUEST')
 
 if __name__ == '__main__':
     try:
@@ -404,7 +523,7 @@ if __name__ == '__main__':
         with open('/run/gravae-direct-installer.lock', 'w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             data = json.load(sys.stdin)
-            result = {'prepare': prepare, 'install': install, 'verify': verify, 'set-mode': set_mode}[sys.argv[1]](data)
+            result = {'prepare': prepare, 'install': install, 'verify': verify, 'set-mode': set_mode, 'update-agent': update_agent, 'network': network, 'buttons': buttons}[sys.argv[1]](data)
             print(json.dumps(result))
     except Exception as exc:
         print(json.dumps({'errorCode': str(exc) if isinstance(exc, InstallError) else 'INSTALL_FAILED'}))
