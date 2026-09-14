@@ -15,6 +15,7 @@ class MonitorPublishersTests(TestCase):
             'liveActiveFile':str(root/'live'),'monitors':{m:{'hlsManifest':str(source),'rtspUrl':'rtsp://camera.local/feed'} for m in ['cam2','cam14']}})
         self.addCleanup(self.r.lock_file.close)
         self.context=ExitStack();self.addCleanup(self.context.close)
+        self.context.enter_context(patch('device_gateway_client.direct_enabled', return_value=True))
         self.context.enter_context(patch('device_gateway_client.time.sleep'))
         self.context.enter_context(patch('device_gateway_client.hls_check',return_value={'ready':True}))
         self.context.enter_context(patch('device_gateway_client.resource_checks',return_value={'shmReady':True,'shinobiDescriptorsReady':True}))

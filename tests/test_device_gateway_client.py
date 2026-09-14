@@ -15,6 +15,10 @@ class DeviceCommandTests(unittest.TestCase):
             DeviceRuntime({"EXTERNAL_KEY": "internal"})
 
     def setUp(self):
+        gate = patch("device_gateway_client.direct_enabled", return_value=True)
+        gate.start(); self.addCleanup(gate.stop)
+        health = patch.object(DeviceRuntime, "readiness", return_value={"status": "READY"})
+        health.start(); self.addCleanup(health.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
