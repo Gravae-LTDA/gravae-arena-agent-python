@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v4.0.3
+Gravae Arena Agent v4.0.4
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "4.0.3"
+VERSION = "4.0.4"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -4995,6 +4995,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json(hands_up_module.instala(
                     ops_evento_url=data.get('webhook', ''),
                     nuvem_url=data.get('nuvem', ''),
+                    revision=data.get('revision'),
                 ))
                 return
             if path == '/hands-up/stop':

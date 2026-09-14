@@ -18,6 +18,7 @@ O QUE ELE NAO FAZ
 """
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -182,29 +183,31 @@ def instalacao_status():
     return dict(_instalacao)
 
 
-def instala(ops_evento_url="", nuvem_url="", diretorio=DIR_PADRAO):
+def instala(ops_evento_url="", nuvem_url="", diretorio=DIR_PADRAO, revision=None):
     """Dispara a instalacao em segundo plano e devolve na hora.
 
     Uma instalacao por vez: duas em paralelo brigariam pelo mesmo diretorio.
     """
+    if revision is not None and (not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision)):
+        return {"ok": False, "erro": "revision deve ser um SHA completo de 40 caracteres"}
     with _lock_instalacao:
         if _instalacao["estado"] == "rodando":
             return {"ok": False, "ja_rodando": True, "instalacao": instalacao_status()}
         _instalacao.update({"estado": "rodando", "desde": time.time(),
                             "etapa": "clone", "ok": None, "erro": None,
-                            "saida": None})
+                            "saida": None, "revision": revision})
 
     threading.Thread(
         target=_instala_agora,
-        args=(ops_evento_url, nuvem_url, diretorio),
+        args=(ops_evento_url, nuvem_url, diretorio, revision),
         daemon=True,
     ).start()
     return {"ok": True, "iniciado": True, "instalacao": instalacao_status()}
 
 
-def _instala_agora(ops_evento_url, nuvem_url, diretorio):
+def _instala_agora(ops_evento_url, nuvem_url, diretorio, revision=None):
     try:
-        r = _instala_bloqueante(ops_evento_url, nuvem_url, diretorio)
+        r = _instala_bloqueante(ops_evento_url, nuvem_url, diretorio, revision)
     except Exception as e:
         r = {"ok": False, "etapa": "excecao", "erro": f"{type(e).__name__}: {e}"}
     with _lock_instalacao:
@@ -215,23 +218,39 @@ def _instala_agora(ops_evento_url, nuvem_url, diretorio):
         })
 
 
-def _instala_bloqueante(ops_evento_url="", nuvem_url="", diretorio=DIR_PADRAO):
+def _instala_bloqueante(ops_evento_url="", nuvem_url="", diretorio=DIR_PADRAO, revision=None):
     """Clona (ou atualiza) o detector e sobe o servico.
 
     Idempotente: rodar de novo numa Pi que ja tem so atualiza o codigo. O
     instalador do proprio repo NAO sobrescreve `/etc/gravae/hands-up.json`,
     entao os switches que o operador ligou sobrevivem a atualizacao.
     """
+    if revision is not None and (not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision)):
+        return {"ok": False, "etapa": "revision", "erro": "revision invalida"}
+
+    def git(*args):
+        return subprocess.run(["git", *args], capture_output=True, text=True, timeout=600)
+
     if not os.path.isdir(os.path.join(diretorio, ".git")):
-        rc = subprocess.run(
-            ["git", "clone", "--depth", "1", REPO, diretorio],
-            capture_output=True, text=True, timeout=600,
-        )
-        if rc.returncode != 0:
-            return {"ok": False, "etapa": "clone", "erro": (rc.stderr or "")[-500:]}
+        result = git("clone", "--depth", "1", REPO, diretorio)
+        if result.returncode:
+            return {"ok": False, "etapa": "clone", "erro": (result.stderr or "")[-500:]}
+    if revision:
+        # Never execute local modifications or fetch the pin from a caller-controlled origin.
+        clean = git("-C", diretorio, "status", "--porcelain", "--untracked-files=all")
+        if clean.returncode or clean.stdout.strip():
+            return {"ok": False, "etapa": "revision", "erro": "checkout possui alteracoes locais"}
+        for args in (("fetch", "--depth", "1", REPO, revision), ("checkout", "--detach", revision)):
+            result = git("-C", diretorio, *args)
+            if result.returncode:
+                return {"ok": False, "etapa": "revision", "erro": (result.stderr or "")[-500:]}
+        head = git("-C", diretorio, "rev-parse", "HEAD")
+        if head.returncode or head.stdout.strip() != revision:
+            return {"ok": False, "etapa": "revision", "erro": "revision instalada nao corresponde ao pedido"}
     else:
-        subprocess.run(["git", "-C", diretorio, "pull", "--ff-only"],
-                       capture_output=True, text=True, timeout=300)
+        result = git("-C", diretorio, "pull", "--ff-only")
+        if result.returncode:
+            return {"ok": False, "etapa": "pull", "erro": (result.stderr or "")[-500:]}
 
     # `bash instalar.sh`, nao `./instalar.sh`: o bit de execucao nao sobrevive
     # a todo clone/pull (depende de core.fileMode e do umask de quem clonou), e

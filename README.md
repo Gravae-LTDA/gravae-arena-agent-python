@@ -2,6 +2,11 @@
 
 Agent de monitoramento e controle para Raspberry Pi nas arenas Gravae/Replayme.
 
+### Correções 4.0.4
+
+- Instalação Hands-up aceita `revision` com SHA completo e verifica o checkout antes de executar o instalador. Alterações locais impedem a instalação fixada.
+- Falhas de atualização Git interrompem a instalação; chamadas legadas continuam aceitas sem revisão.
+
 ### Correções 4.0.3
 
 - Observação aceita `autoheal: false`, persistido e preservado na retomada, para diagnosticar sem reiniciar o processo de câmeras.
