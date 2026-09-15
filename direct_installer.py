@@ -48,8 +48,12 @@ def update_agent(data):
     if Path('/run/gravae-live.active').exists():
         raise InstallError('LIVE_IN_PROGRESS')
     try:
+        target = Path(__file__).with_name('VERSION').read_text().strip()
+        if not re.fullmatch(r'\d+\.\d+\.\d+', target):
+            raise InstallError('AGENT_UPDATE_FAILED')
+        required_version = tuple(map(int, target.split('.')))
         version = http_agent_version()
-        if tuple(map(int, version.split('.'))) >= (4, 0, 4):
+        if tuple(map(int, version.split('.'))) >= required_version:
             return {'agentVersion': version, 'updated': False}
         controlled_startup()
         request = urllib.request.Request('http://127.0.0.1:8888/update/perform', b'{}', {'Content-Type': 'application/json'}, method='POST')
@@ -61,7 +65,7 @@ def update_agent(data):
             time.sleep(2)
             try:
                 version = http_agent_version()
-                if tuple(map(int, version.split('.'))) >= (4, 0, 4):
+                if tuple(map(int, version.split('.'))) >= required_version:
                     return {'agentVersion': version, 'updated': True}
             except (OSError, ValueError, InstallError):
                 pass  # The HTTP service restarts during its own update.
