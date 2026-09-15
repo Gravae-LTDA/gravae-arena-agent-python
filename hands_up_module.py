@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Ponte do agente para o detector de bracos levantados (No-hands).
 
 POR QUE ISTO EXISTE
