@@ -22,7 +22,7 @@ class TokenRecovery(unittest.TestCase):
     def test_only_rejected_credentials_request_rotation(self):
         for code in (401, 403, 429, 500, 302):
             with self.subTest(code=code), patch('direct_installer.urllib.request.build_opener') as opener:
-                opener.return_value.open.side_effect = urllib.error.HTTPError('url', code, 'error', {}, None)
+                opener.return_value.open.side_effect = urllib.error.HTTPError('url', code, 'error', {}, io.BytesIO(b''))
                 if code in (401, 403):
                     self.assertFalse(gateway_token_ready(self.data, self.config))
                 else:
