@@ -17,6 +17,7 @@ import sys
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 
 class InstallError(Exception):
     pass
@@ -237,6 +238,46 @@ def check_shinobi(data):
             raise InstallError('SHINOBI_AUTH_REQUIRED')
 
 
+class NoBackendRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def gateway_token_ready(data, config):
+    token = config.get('deviceToken')
+    if not token:
+        return False
+    base = data.get('backendUrl', '').rstrip('/')
+    if urllib.parse.urlparse(base).scheme != 'https':
+        raise InstallError('IDENTITY_MISMATCH')
+    request = urllib.request.Request(
+        base + '/internal/media-devices/' + urllib.parse.quote(media_identity(config), safe='') + '/config',
+        headers={'Authorization': 'Bearer ' + token})
+    try:
+        with urllib.request.build_opener(NoBackendRedirect()).open(request, timeout=15) as response:
+            snapshot = json.load(response)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if exc.code in (401, 403):
+            return False
+        raise InstallError('BACKEND_UNAVAILABLE') from None
+    except Exception:
+        raise InstallError('BACKEND_UNAVAILABLE') from None
+    if snapshot.get('arenaId') != data['arenaId'] or snapshot.get('mediaDeviceId') != media_identity(config):
+        raise InstallError('IDENTITY_MISMATCH')
+    return True
+
+
+def install_gateway_token(config_file, current, enrollment):
+    if not enrollment:
+        return
+    token = enrollment.get('deviceGatewayToken')
+    if not isinstance(token, str) or not token:
+        raise InstallError('INSTALL_FAILED')
+    current['deviceToken'] = token
+    atomic(config_file, json.dumps(current))
+
+
 def prepare(data):
     serial = identity(data['serial'])
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', data.get('groupKey', '')):
@@ -248,7 +289,7 @@ def prepare(data):
     if existing and (existing.get('arenaId') != data['arenaId'] or existing.get('environment') != data['environment']):
         raise InstallError('IDENTITY_MISMATCH')
     if existing:
-        return {'serial': serial, 'deviceId': media_identity(existing), 'existing': True, 'sshHostPublicKey': Path('/etc/ssh/ssh_host_ed25519_key.pub').read_text().strip()}
+        return {'serial': serial, 'deviceId': media_identity(existing), 'existing': True, 'gatewayTokenReady': gateway_token_ready(data, existing), 'sshHostPublicKey': Path('/etc/ssh/ssh_host_ed25519_key.pub').read_text().strip()}
     if not shutil.which('wg'):
         run(['apt-get', 'update'], timeout=300)
         run(['apt-get', 'install', '-y', 'wireguard-tools'], timeout=600)
@@ -326,6 +367,8 @@ def install(data):
             target.mkdir(mode=0o700)
             for old in Path(folder).glob('*.py'):
                 shutil.copy2(old, target / old.name)
+    if current:
+        install_gateway_token(config_file, current, data.get('enrollment'))
     if not current:
         enrollment = data['enrollment']
         if not enrollment.get('deviceGatewayToken'):
