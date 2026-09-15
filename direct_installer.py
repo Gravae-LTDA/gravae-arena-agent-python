@@ -106,6 +106,12 @@ def camera_sources(data):
     except Exception:
         raise InstallError('CAMERA_MAPPING_REQUIRED')
 
+def monitor_inventory(data):
+    observed_sources = camera_sources(data)
+    return [{key: m[key] for key in ('monitorId', 'blockSlug', 'cameraSlug')}
+            for m in data['monitors'] if m['monitorId'] in observed_sources]
+
+
 def configure_http_agent(data):
     """Install only the local Shinobi identity; never backend EXTERNAL_KEY."""
     if not isinstance(data.get('shinobiKey'), str) or not data['shinobiKey']:
@@ -521,6 +527,7 @@ def verify(data):
     if media_identity(config) != data['deviceId'] or config.get('arenaId') != data['arenaId']:
         raise InstallError('IDENTITY_MISMATCH')
     check_shinobi(data)
+    inventory = monitor_inventory(data)
     status = read(Path(config['stateDir']) / 'status.json')
     at = datetime.datetime.fromisoformat(status['checkedAt'].replace('Z', '+00:00')).timestamp()
     ready = status.get('eventsPending') == 0 and status.get('status') == 'READY' and 0 <= time.time() - at < 45
@@ -534,7 +541,7 @@ def verify(data):
     firewall = any(subprocess.run(['systemctl', 'is-active', unit], capture_output=True, text=True).returncode == 0 for unit in ('gravae-private-services', 'gravae-direct-private'))
     if ready and services and ssh_private and firewall:
         subprocess.run(['systemctl', 'stop', 'gravae-direct-rollback.timer'], capture_output=True)
-    return {'ready': bool(ready and services and ssh_private and firewall and bool(re.fullmatch(r'4\.\d+\.\d+', str(status.get('agentVersion', ''))))), 'agentVersion': status.get('agentVersion'), 'checks': checks, 'privateAccessReady': bool(ssh_private and firewall), 'publisherConfigured': all(m.get('rtspUrl') for m in config.get('monitors', {}).values()), 'eventsReady': status.get('eventsPending') == 0}
+    return {'ready': bool(ready and services and ssh_private and firewall and bool(re.fullmatch(r'4\.\d+\.\d+', str(status.get('agentVersion', ''))))), 'monitors': inventory, 'agentVersion': status.get('agentVersion'), 'checks': checks, 'privateAccessReady': bool(ssh_private and firewall), 'publisherConfigured': all(m.get('rtspUrl') for m in config.get('monitors', {}).values()), 'eventsReady': status.get('eventsPending') == 0}
 
 
 def set_mode(data):
