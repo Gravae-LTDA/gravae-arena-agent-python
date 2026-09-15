@@ -1207,6 +1207,16 @@ def perform_update():
         except Exception as e2:
             update_status = {"status": "error", "progress": 0, "message": "Erro", "error": str(e2)}
 
+def _validate_update_content(filename, content):
+    """Validate Python without executing it; docstrings/BOM are valid headers."""
+    import ast
+    try:
+        tree = compile(content, filename, 'exec', flags=ast.PyCF_ONLY_AST)
+        if not any(isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef)) for node in tree.body):
+            raise ValueError('No Python module definitions')
+    except (SyntaxError, ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid Python content for {filename}") from exc
+
 def _perform_update_direct():
     """Download files directly from GitHub raw"""
     global update_status
@@ -1236,8 +1246,7 @@ def _perform_update_direct():
                 response = urllib.request.urlopen(req, timeout=30)
                 content = response.read()
 
-                if not content.startswith(b'#!/usr/bin/env python3') and not content.startswith(b'#'):
-                    raise Exception(f"Invalid content for {filename}")
+                _validate_update_content(filename, content)
 
                 with tempfile.NamedTemporaryFile(mode='wb', suffix=f'_{filename}', delete=False) as f:
                     temp_path = f.name
