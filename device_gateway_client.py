@@ -25,6 +25,8 @@ from direct_publisher import RetryingPublisher
 from media_mode import direct_enabled
 from arena_config_sync import fetch_snapshot, save_mode
 
+AGENT_VERSION = Path(__file__).with_name("VERSION").read_text().strip()
+
 
 def timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -48,8 +50,9 @@ def identity_fields(config):
 def operational_log(event, **fields):
     # Never log command payloads, RTMP URLs/keys, tokens or raw exception messages.
     allowed = {"commandId", "commandType", "streamId", "monitorId", "errorCode",
-               "exceptionType", "pid", "exitCode", "retrySeconds", "attempt", "stderr"}
-    print(json.dumps({"event": event, "occurredAt": timestamp(),
+               "exceptionType", "pid", "exitCode", "retrySeconds", "attempt", "stderr",
+               "signal", "causeCode", "failureStage"}
+    print(json.dumps({"event": event, "occurredAt": timestamp(), "agentVersion": AGENT_VERSION,
                       **{key: value[:400] if isinstance(value, str) else value
                          for key, value in fields.items()
                          if key in allowed and isinstance(value, (str, int, float, type(None)))}}), flush=True)
@@ -281,6 +284,8 @@ class DeviceRuntime:
                                       "RTMP_PUBLISH_FAILED": "Falha ao iniciar a publicacao RTMP/RTMPS",
                                       "ARENA_CONFIG_SYNC_FAILED": "Falha ao sincronizar a configuracao oficial",
                                   }.get(str(error), "Comando nao aceito pelo agent"))
+                    if isinstance(error, CommandError) and hasattr(error, "publisher_details"):
+                        result.update(error.publisher_details)
                 if result.get("errorCode") == "ARENA_CONFIG_SYNC_FAILED":
                     result["configSyncError"] = self.last_config_sync_error
                 result.update(eventId=str(uuid.uuid4()), occurredAt=timestamp())
@@ -385,11 +390,14 @@ class DeviceRuntime:
                 self.marker.unlink(missing_ok=True)
             raise
         time.sleep(1)
-        if process.poll() is not None or process.pid is None:
+        if process.poll() is not None or not process.child_running():
             operational_log("publisher.start_failed", streamId=stream_id, monitorId=payload.get("monitorId"),
                             exitCode=process.returncode)
+            details = dict(process.last_failure)
             self.stop(stream_id)
-            raise CommandError("RTMP_PUBLISH_FAILED")
+            error = CommandError("RTMP_PUBLISH_FAILED")
+            error.publisher_details = details
+            raise error
         operational_log("publisher.prepared", streamId=stream_id, monitorId=payload.get("monitorId"), pid=process.pid)
 
     def stop(self, stream_id=None):
@@ -421,7 +429,8 @@ class DeviceRuntime:
                 if exited and time.monotonic() < slot["deadline"] and slot["command"]:
                     failed = dict(slot["command"], event="command.failed", eventId=str(uuid.uuid4()),
                                   occurredAt=timestamp(), errorCode="RTMP_PUBLISH_FAILED", publisherStarted=False,
-                                  errorMessage="Publisher encerrou antes do prazo", exitCode=process.returncode)
+                                  agentVersion=AGENT_VERSION,
+                                  errorMessage="Publisher encerrou antes do prazo", **process.last_failure)
                     with closing(self.db()) as db:
                         db.execute("BEGIN IMMEDIATE")
                         db.execute("UPDATE commands SET result=? WHERE id=?", (json.dumps(failed), failed["commandId"]))

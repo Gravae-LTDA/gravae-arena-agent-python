@@ -3,7 +3,7 @@ import time
 import tempfile
 import unittest
 from pathlib import Path
-from direct_publisher import RetryingPublisher, safe_stderr, failure_code
+from direct_publisher import RetryingPublisher, safe_stderr, failure_code, failure_details
 
 class PublisherTests(unittest.TestCase):
     def test_redaction_and_classification(self):
@@ -49,3 +49,22 @@ print('out_time_us=1000',flush=True);time.sleep(.2)
         publisher.wait(4)
         self.assertIsNotNone(publisher.poll())
         self.assertFalse(publisher.media_started.is_set())
+
+    def test_source_auth_error_is_not_rtmp_failure(self):
+        details = failure_details('[rtsp @ x] OPTIONS 403 Forbidden; Error opening input', 8)
+        self.assertEqual(details, {'causeCode': 'MEDIA_SOURCE_ACCESS_DENIED', 'failureStage': 'SOURCE', 'exitCode': 8, 'signal': None})
+        self.assertEqual(failure_details('Connection refused', 1)['failureStage'], 'DESTINATION')
+        self.assertEqual(failure_details('', -15)['signal'], 15)
+
+    def test_supervisor_in_backoff_is_not_active_publisher(self):
+        publisher = RetryingPublisher([sys.executable, '-c', 'import sys;sys.stderr.write("Error opening input: 403 Forbidden");sys.exit(8)'], [], lambda *a, **kw: None, {}, 10, retry_interval=5)
+        try:
+            deadline = time.monotonic() + 3
+            while not publisher.last_failure and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertIsNone(publisher.poll())
+            self.assertFalse(publisher.child_running())
+            self.assertEqual(publisher.last_failure['causeCode'], 'MEDIA_SOURCE_ACCESS_DENIED')
+        finally:
+            publisher.terminate()
+            publisher.wait(3)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gravae Arena Agent v4.0.8
+Gravae Arena Agent v4.0.9
 Runs on Raspberry Pi to provide system monitoring, Shinobi setup,
 Cloudflare tunnel control, terminal access, and self-update capabilities.
 """
@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "4.0.8"
+VERSION = "4.0.9"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
