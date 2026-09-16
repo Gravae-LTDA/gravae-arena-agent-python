@@ -272,10 +272,15 @@ class BackendDelivery:
         }
 
     def post(self, path, payload, job_id):
+        # Cloudflare blocks the default Python-urllib User-Agent with error 1010, which
+        # makes the R2 upload handshake (original-videos/upload-complete/upload-fail)
+        # fail fleet-wide. A non-library User-Agent passes the bot check (same fix
+        # already applied in phoenix_daemon/gravae_agent).
         request = urllib.request.Request(self.base + path, json.dumps(payload).encode(),
                                         {"Content-Type": "application/json",
                                          "Authorization": "Bearer " + self.token(),
-                                         "Idempotency-Key": job_id}, method="POST")
+                                         "Idempotency-Key": job_id,
+                                         "User-Agent": "gravae-direct-queue"}, method="POST")
         try:
             with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as response:
                 raw = response.read(1024 * 1024)
