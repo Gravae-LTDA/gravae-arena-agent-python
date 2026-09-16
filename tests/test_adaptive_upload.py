@@ -7,6 +7,43 @@ from adaptive_upload import AdaptiveBandwidth, upload_file
 
 
 class AdaptiveBandwidthTests(unittest.TestCase):
+    def test_activity_marker_remains_until_last_transfer_finishes(self):
+        with tempfile.TemporaryDirectory() as root:
+            busy = Path(root) / "active"
+            b = self.make()
+            for _ in range(4):
+                b.begin_transfer(busy)
+            for _ in range(3):
+                b.end_transfer(busy)
+                self.assertTrue(busy.exists())
+                self.assertTrue(b.status()["transferActive"])
+            b.end_transfer(busy)
+            self.assertFalse(busy.exists())
+            self.assertFalse(b.status()["transferActive"])
+
+    def test_transfers_share_one_pacing_budget_including_live(self):
+        b = self.make()
+        clock, sent = [0.0], []
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch("adaptive_upload.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("adaptive_upload.time.sleep", side_effect=sleep):
+            for _ in range(4):
+                b.send_chunk(lambda chunk: sent.append(clock[0]), b"x" * 32768, lambda: True, 10)
+            self.assertAlmostEqual(sent[-1], 3 * 32768 / b.limit())
+            b.set_live(True)
+            for _ in range(2):
+                b.send_chunk(lambda chunk: sent.append(clock[0]), b"x" * 32768, lambda: True, 10)
+            self.assertAlmostEqual(sent[-1] - sent[-2], 32768 / b.limit())
+
+    def test_sampling_uses_aggregate_bytes_once_per_interval(self):
+        b = self.make()
+        b.sample_at, b.sample_bytes, b.total_sent = 0, 0, 4000
+        with patch("adaptive_upload.time.monotonic", return_value=4), patch.object(b, "observe") as observe:
+            for _ in range(4):
+                b.sample(lambda *_: .02, "example", 443)
+        observe.assert_called_once_with(.02, 1000)
+
     def make(self):
         return AdaptiveBandwidth({'uploadBytesPerSecond': 10 * 1024**2,
                                   'uploadInitialBytesPerSecond': 1024**2})

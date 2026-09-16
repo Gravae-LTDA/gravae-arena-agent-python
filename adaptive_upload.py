@@ -17,6 +17,12 @@ class AdaptiveBandwidth:
         self.minimum = min(self.maximum, max(16384, int(config.get("uploadMinimumBytesPerSecond", 65536))))
         self.rate = min(self.maximum, max(self.minimum, int(config.get("uploadInitialBytesPerSecond", 1024**2))))
         self.lock = threading.Lock()
+        self.pacing_lock = threading.Lock()
+        self.transfers = 0
+        self.next_send = 0
+        self.total_sent = 0
+        self.sample_at = time.monotonic()
+        self.sample_bytes = 0
         self.baseline = None
         self.latency = None
         self.observed = 0
@@ -114,11 +120,59 @@ class AdaptiveBandwidth:
                     "reason": "LINK_SEVERELY_DEGRADED" if self.paused else "REDUCED_DURING_LIVE" if self.live else self.reason}
 
     def persist(self):
-        if self.state_path:
-            temporary = self.state_path.with_suffix('.tmp')
-            temporary.write_text(json.dumps({"rate": self.rate, "savedAt": time.time()}))
-            os.chmod(temporary, 0o600)
-            temporary.replace(self.state_path)
+        with self.lock:
+            if self.state_path:
+                temporary = self.state_path.with_suffix('.tmp')
+                temporary.write_text(json.dumps({"rate": self.rate, "savedAt": time.time()}))
+                os.chmod(temporary, 0o600)
+                temporary.replace(self.state_path)
+
+    def begin_transfer(self, busy):
+        with self.lock:
+            if self.transfers == 0:
+                if busy:
+                    busy.write_text(str(os.getpid()))
+                    os.chmod(busy, 0o600)
+                self.sample_at = time.monotonic()
+                self.sample_bytes = self.total_sent
+            self.transfers += 1
+            self.active = True
+
+    def end_transfer(self, busy):
+        with self.lock:
+            self.transfers -= 1
+            self.active = self.transfers > 0
+            if not self.active and busy:
+                busy.unlink(missing_ok=True)
+
+    def sample(self, probe, host, port):
+        # Only one sample per shared interval; measure all four transfers together.
+        with self.lock:
+            now = time.monotonic()
+            if now - self.sample_at < 3:
+                return
+            throughput = (self.total_sent - self.sample_bytes) / (now - self.sample_at)
+            self.sample_at, self.sample_bytes = now, self.total_sent
+        self.observe(probe(host, port), throughput)
+
+    def send_chunk(self, send, chunk, allowed, deadline):
+        # A single pacing clock prevents four workers from each spending the full limit.
+        with self.pacing_lock:
+            while True:
+                if not allowed():
+                    raise OSError("UPLOAD_WAITING_DIRECT")
+                now = time.monotonic()
+                if now >= deadline:
+                    raise TimeoutError("UPLOAD_TIMEOUT")
+                rate = self.limit()
+                if rate > 0 and now >= self.next_send:
+                    break
+                time.sleep(0.1 if rate == 0 else max(0, min(0.1, self.next_send - now)))
+            started = time.monotonic()
+            send(chunk)
+            self.next_send = max(started + len(chunk) / rate, time.monotonic())
+            with self.lock:
+                self.total_sent += len(chunk)
 
 
 def probe_latency(host, port):
@@ -138,7 +192,6 @@ def upload_file(url, path, size, headers, bandwidth, live_active, busy_file=None
     if target.scheme != "https" or not target.hostname or target.username or target.password or target.fragment:
         raise ValueError("INVALID_HTTPS_UPLOAD_URL")
     bandwidth.set_live(live_active())
-    bandwidth.active = True
     connection = connection_factory(target.hostname, target.port or 443, timeout=10)
     done = threading.Event()
     counter = [0]
@@ -149,22 +202,17 @@ def upload_file(url, path, size, headers, bandwidth, live_active, busy_file=None
             bandwidth.set_live(live_active())
 
     def sample_network():
-        previous_time, previous_bytes = time.monotonic(), counter[0]
         while not done.wait(3):
-            latency = probe(target.hostname, target.port or 443)
-            now = time.monotonic()
-            sent = counter[0]
             if not done.is_set() and counter[0] < size:
-                bandwidth.observe(latency, (sent - previous_bytes) / max(0.001, now - previous_time))
-            previous_time, previous_bytes = now, sent
+                bandwidth.sample(probe, target.hostname, target.port or 443)
 
     watcher = threading.Thread(target=watch_live, daemon=True, name="upload-live-priority")
     sampler = threading.Thread(target=sample_network, daemon=True, name="upload-bandwidth")
     phase = "CONNECT"
+    registered = False
     try:
-        if busy:
-            busy.write_text(str(os.getpid()))
-            os.chmod(busy, 0o600)
+        bandwidth.begin_transfer(busy)
+        registered = True
         watcher.start()
         initial_latency = probe(target.hostname, target.port or 443)
         bandwidth.observe(initial_latency, 0)
@@ -183,7 +231,6 @@ def upload_file(url, path, size, headers, bandwidth, live_active, busy_file=None
             connection.putheader(name, value)
         connection.endheaders()
         sampler.start()
-        next_send = time.monotonic()
         deadline = time.monotonic() + 1800
         with open(path, "rb") as source:
             while True:
@@ -191,24 +238,8 @@ def upload_file(url, path, size, headers, bandwidth, live_active, busy_file=None
                 if not chunk:
                     break
                 bandwidth.set_live(live_active())
-                while time.monotonic() < next_send:
-                    if not allowed():
-                        raise OSError("UPLOAD_WAITING_DIRECT")
-                    time.sleep(max(0, min(0.1, next_send - time.monotonic())))
-                while bandwidth.limit() == 0:
-                    if not allowed():
-                        raise OSError("UPLOAD_WAITING_DIRECT")
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("DEGRADED_LINK_UPLOAD_TIMEOUT")
-                    time.sleep(0.1)
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("UPLOAD_TIMEOUT")
-                if not allowed():
-                    raise OSError("UPLOAD_WAITING_DIRECT")
-                connection.send(chunk)
+                bandwidth.send_chunk(connection.send, chunk, allowed, deadline)
                 counter[0] += len(chunk)
-                rate = max(bandwidth.minimum, bandwidth.limit())
-                next_send = max(next_send + len(chunk) / rate, time.monotonic())
         if counter[0] != size:
             raise ValueError("UPLOAD_SIZE_CHANGED")
         phase = "RESPONSE"
@@ -221,12 +252,11 @@ def upload_file(url, path, size, headers, bandwidth, live_active, busy_file=None
         raise
     finally:
         done.set()
-        bandwidth.active = False
         connection.close()
         if watcher.ident:
             watcher.join(timeout=1)
         if sampler.ident:
             sampler.join(timeout=3)
-        if busy:
-            busy.unlink(missing_ok=True)
+        if registered:
+            bandwidth.end_transfer(busy)
         bandwidth.persist()

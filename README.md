@@ -144,3 +144,12 @@ journalctl -u gravae-buttons -f
 ## Licença
 
 Proprietary - Gravae/Replayme
+# Fila de upload DIRECT (4.0.10)
+
+O uploader mantém no máximo quatro vídeos em processamento simultâneo por Raspberry.
+Os demais permanecem na fila SQLite e só são reservados quando uma vaga é liberada
+por conclusão ou falha. Retries respeitam o backoff e a fila sobrevive a reboot.
+O limite adaptativo de banda é compartilhado pelos quatro envios, inclusive durante
+live. No transporte curl, cada envio recebe um quarto do limite configurado e pausa
+quando uma live começa. O status expõe `maxConcurrentUploads`, `activeUploadCount`
+e `occupiedSlots` (incluindo notificações de falha em andamento).
