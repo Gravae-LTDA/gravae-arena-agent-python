@@ -27,6 +27,22 @@ def failure_code(text):
     return 'FFMPEG_PUBLISHER_FAILED'
 
 
+def failure_details(text, exit_code=None):
+    lower = text.lower()
+    source = any(fragment in lower for fragment in ('[rtsp @', 'opening input', 'input file', 'does not contain any stream'))
+    stage = 'SOURCE' if source else 'PUBLISHER'
+    code = failure_code(text)
+    if source:
+        if '403' in lower or '401' in lower or 'unauthorized' in lower:
+            code = 'MEDIA_SOURCE_ACCESS_DENIED'
+        elif code not in ('MEDIA_INPUT_INVALID', 'MEDIA_INPUT_EMPTY'):
+            code = 'MEDIA_SOURCE_UNAVAILABLE'
+    elif code.startswith('RTMP_'):
+        stage = 'DESTINATION'
+    return {'causeCode': code, 'failureStage': stage, 'exitCode': exit_code,
+            'signal': -exit_code if isinstance(exit_code, int) and exit_code < 0 else None}
+
+
 class RetryingPublisher:
     """Popen-like lifetime: remains running during retry; STOP cancels all attempts."""
     def __init__(self, argv, secrets, log, metadata, duration, retry_seconds=60, retry_interval=2,
@@ -36,6 +52,7 @@ class RetryingPublisher:
         self.factory = factory
         self.child = None
         self.returncode = None
+        self.last_failure = {}
         self.cancel = threading.Event()
         self.finished = threading.Event()
         self.media_started = threading.Event()
@@ -45,6 +62,10 @@ class RetryingPublisher:
     @property
     def pid(self):
         return self.child.pid if self.child else None
+
+    def child_running(self):
+        child = self.child
+        return child is not None and child.poll() is None and not self.finished.is_set()
 
     def poll(self):
         return self.returncode if self.finished.is_set() else None
@@ -86,8 +107,9 @@ class RetryingPublisher:
                 self.child.stdout.close()
                 self.child.stderr.close()
                 code = self.child.returncode
+                self.last_failure = failure_details(' '.join(errors), code)
                 self.log('publisher.attempt_exited', **self.metadata, attempt=attempt,
-                         exitCode=code, errorCode=failure_code(' '.join(errors)))
+                         errorCode=self.last_failure['causeCode'], **self.last_failure)
                 if self.cancel.is_set() or self.media_started.is_set():
                     self.returncode = code if code is not None else -15
                     break
@@ -103,6 +125,7 @@ class RetryingPublisher:
                              errorCode='PUBLISHER_START_RETRY_EXHAUSTED')
         except Exception as error:
             self.returncode = 1
+            self.last_failure = failure_details("", 1)
             self.log('publisher.start_failed', **self.metadata, exceptionType=type(error).__name__,
                      errorCode='PUBLISHER_EXECUTION_FAILED')
         finally:

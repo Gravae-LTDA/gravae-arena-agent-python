@@ -25,6 +25,8 @@ from direct_publisher import RetryingPublisher
 from media_mode import direct_enabled
 from arena_config_sync import fetch_snapshot, save_mode
 
+AGENT_VERSION = Path(__file__).with_name("VERSION").read_text().strip()
+
 
 def timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -48,8 +50,9 @@ def identity_fields(config):
 def operational_log(event, **fields):
     # Never log command payloads, RTMP URLs/keys, tokens or raw exception messages.
     allowed = {"commandId", "commandType", "streamId", "monitorId", "errorCode",
-               "exceptionType", "pid", "exitCode", "retrySeconds", "attempt", "stderr"}
-    print(json.dumps({"event": event, "occurredAt": timestamp(),
+               "exceptionType", "pid", "exitCode", "retrySeconds", "attempt", "stderr",
+               "signal", "causeCode", "failureStage"}
+    print(json.dumps({"event": event, "occurredAt": timestamp(), "agentVersion": AGENT_VERSION,
                       **{key: value[:400] if isinstance(value, str) else value
                          for key, value in fields.items()
                          if key in allowed and isinstance(value, (str, int, float, type(None)))}}), flush=True)
@@ -118,6 +121,7 @@ class DeviceRuntime:
         self.config_sync_ok = False
         self.last_config_sync_at = None
         self.last_config_sync_error = None
+        self.last_publisher_failure = None
         self.hls_health = HlsReadinessCache(config.get("hlsDecodeIntervalSeconds", 300),
                                             config.get("hlsDecodeRetrySeconds", 60))
         self.connected = False
@@ -137,8 +141,18 @@ class DeviceRuntime:
                                   commandId=command_id, eventId=str(uuid.uuid4()), occurredAt=timestamp())
                     db.execute("UPDATE commands SET result=? WHERE id=?",
                                (json.dumps(result), command_id))
+                self.remember_publisher_failure(result)
                 if result.get("eventId"):
                     self.outbox.put(result["event"], self.envelope(result), db)
+
+    def remember_publisher_failure(self, result):
+        if result.get('commandType') != 'STREAM_START' or result.get('event') != 'command.failed':
+            return
+        if self.last_publisher_failure and self.last_publisher_failure.get('occurredAt', '') > result.get('occurredAt', ''):
+            return
+        self.last_publisher_failure = {key: result[key] for key in (
+            'streamId', 'monitorId', 'errorCode', 'causeCode', 'failureStage',
+            'exitCode', 'signal', 'occurredAt', 'agentVersion') if key in result}
 
     def envelope(self, result):
         return dict({key: value for key, value in result.items() if key != "event"},
@@ -164,15 +178,16 @@ class DeviceRuntime:
     def readiness(self):
         with self.lock:
             slots = list(self.streams.values())
-            active_streams = [{"streamId": sid, "monitorId": slot["monitorId"]} for sid, slot in self.streams.items() if slot["process"].poll() is None]
+            active_streams = [{"streamId": sid, "monitorId": slot["monitorId"]} for sid, slot in self.streams.items() if slot["process"].child_running()]
         checks = {"agentVersion": AGENT_VERSION, "gatewayConnected": self.connected,
                   "ffmpegReady": shutil.which("ffmpeg") is not None,
                   "diskReady": shutil.disk_usage(self.root).free >= self.config.get("minFreeBytes", 2 * 1024**3),
-                  "publisherActive": any(slot["process"].poll() is None for slot in slots),
+                  "publisherActive": any(slot["process"].child_running() for slot in slots),
                   "liveInput": "SHINOBI_HLS",
-                  "activeStreamCount": sum(slot["process"].poll() is None for slot in slots),
-                  "activeMonitors": [slot["monitorId"] for slot in slots if slot["process"].poll() is None]}
+                  "activeStreamCount": sum(slot["process"].child_running() for slot in slots),
+                  "activeMonitors": [slot["monitorId"] for slot in slots if slot["process"].child_running()]}
         checks["activeStreams"] = active_streams
+        checks["lastPublisherFailure"] = self.last_publisher_failure
         checks.update(self.config_diagnostics())
         checks.update(resource_checks(self.config))
         checks["eventsPending"] = self.outbox.count()
@@ -281,9 +296,12 @@ class DeviceRuntime:
                                       "RTMP_PUBLISH_FAILED": "Falha ao iniciar a publicacao RTMP/RTMPS",
                                       "ARENA_CONFIG_SYNC_FAILED": "Falha ao sincronizar a configuracao oficial",
                                   }.get(str(error), "Comando nao aceito pelo agent"))
+                    if isinstance(error, CommandError) and hasattr(error, "publisher_details"):
+                        result.update(error.publisher_details)
                 if result.get("errorCode") == "ARENA_CONFIG_SYNC_FAILED":
                     result["configSyncError"] = self.last_config_sync_error
-                result.update(eventId=str(uuid.uuid4()), occurredAt=timestamp())
+                result.update(eventId=str(uuid.uuid4()), occurredAt=timestamp(), agentVersion=AGENT_VERSION)
+                self.remember_publisher_failure(result)
                 if result["event"] == "command.ack" and command.get("type") == "STREAM_START":
                     if result.get("streamId") in self.streams:
                         self.streams[result["streamId"]]["command"] = dict(result)
@@ -385,11 +403,14 @@ class DeviceRuntime:
                 self.marker.unlink(missing_ok=True)
             raise
         time.sleep(1)
-        if process.poll() is not None or process.pid is None:
+        if process.poll() is not None or not process.child_running():
             operational_log("publisher.start_failed", streamId=stream_id, monitorId=payload.get("monitorId"),
                             exitCode=process.returncode)
+            details = dict(process.last_failure)
             self.stop(stream_id)
-            raise CommandError("RTMP_PUBLISH_FAILED")
+            error = CommandError("RTMP_PUBLISH_FAILED")
+            error.publisher_details = details
+            raise error
         operational_log("publisher.prepared", streamId=stream_id, monitorId=payload.get("monitorId"), pid=process.pid)
 
     def stop(self, stream_id=None):
@@ -421,7 +442,9 @@ class DeviceRuntime:
                 if exited and time.monotonic() < slot["deadline"] and slot["command"]:
                     failed = dict(slot["command"], event="command.failed", eventId=str(uuid.uuid4()),
                                   occurredAt=timestamp(), errorCode="RTMP_PUBLISH_FAILED", publisherStarted=False,
-                                  errorMessage="Publisher encerrou antes do prazo", exitCode=process.returncode)
+                                  agentVersion=AGENT_VERSION,
+                                  errorMessage="Publisher encerrou antes do prazo", **process.last_failure)
+                    self.remember_publisher_failure(failed)
                     with closing(self.db()) as db:
                         db.execute("BEGIN IMMEDIATE")
                         db.execute("UPDATE commands SET result=? WHERE id=?", (json.dumps(failed), failed["commandId"]))

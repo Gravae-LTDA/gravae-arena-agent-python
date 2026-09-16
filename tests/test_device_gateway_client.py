@@ -112,6 +112,24 @@ class DeviceCommandTests(unittest.TestCase):
             self.assertTrue(result['publisherStarted'])
             self.assertEqual(result['event'], 'command.ack')
 
+    def test_backoff_after_source_failure_never_acks(self):
+        manifest = self.root / 's.m3u8'
+        manifest.write_text('#EXTM3U\n')
+        self.runtime.config['monitors'] = {'camera': {'hlsManifest': str(manifest)}}
+        command = self.command('STREAM_START')
+        command['payload'] = {'monitorId': 'camera', 'rtmpUrl': 'rtmp://203.0.113.77/live', 'streamKey': 'secret'}
+        with patch('device_gateway_client.hls_check', return_value={'ready': True}), patch('device_gateway_client.resource_checks', return_value={}), patch('device_gateway_client.time.sleep'), patch('device_gateway_client.RetryingPublisher') as factory:
+            process = factory.return_value
+            process.poll.return_value = None
+            process.child_running.return_value = False
+            process.last_failure = {'causeCode': 'MEDIA_SOURCE_ACCESS_DENIED', 'failureStage': 'SOURCE', 'exitCode': 8, 'signal': None}
+            result = self.runtime.execute(command)
+        self.assertEqual(result['event'], 'command.failed')
+        self.assertEqual(result['causeCode'], 'MEDIA_SOURCE_ACCESS_DENIED')
+        self.assertEqual(result['errorCode'], 'RTMP_PUBLISH_FAILED')
+        self.assertNotIn('secret', json.dumps(result))
+        process.terminate.assert_called_once()
+
     def test_missing_shinobi_source_does_not_fallback_to_camera_rtsp(self):
         self.runtime.config['monitors'] = {'camera': {'rtspUrl': 'rtsp://camera.local/feed'}}
         command = self.command('STREAM_START')

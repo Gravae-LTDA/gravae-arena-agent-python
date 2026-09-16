@@ -133,12 +133,19 @@ def public_direct_status(path='/var/lib/gravae-device-client/status.json'):
             raise ValueError('status too large')
         data = json.loads(file.read_text())
         result = {key: data.get(key) for key in (
-            'publisherActive', 'activeStreamCount', 'directModeValid', 'directModeExpiresAt',
+            'agentVersion', 'publisherActive', 'activeStreamCount', 'directModeValid', 'directModeExpiresAt',
             'configSyncOk', 'lastConfigSyncAt', 'checkedAt', 'status', 'vpnReady', 'gatewayConnected',
             'shinobiProcessReady', 'shinobiDescriptorsReady', 'ffmpegReady', 'uploaderReady')}
         result['activeStreams'] = [{key: item[key] for key in ('streamId', 'monitorId')
                                     if isinstance(item.get(key), str) and re.fullmatch(r'[\w-]{1,128}', item[key])}
                                    for item in data.get('activeStreams', [])[:100] if isinstance(item, dict)]
+        failure = data.get('lastPublisherFailure')
+        result['lastPublisherFailure'] = None
+        if isinstance(failure, dict):
+            result['lastPublisherFailure'] = {key: value for key, value in failure.items()
+                if (key in ('streamId', 'monitorId', 'errorCode', 'causeCode', 'failureStage', 'occurredAt', 'agentVersion')
+                    and isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.:TZ+-]{1,128}', value))
+                or (key in ('exitCode', 'signal') and (value is None or type(value) is int))}
         error = data.get('lastConfigSyncError')
         result['lastConfigSyncError'] = None if not error else {
             'errorCode': 'CONFIG_SYNC_FAILED',

@@ -21,7 +21,7 @@ class MonitorPublishersTests(TestCase):
         self.context.enter_context(patch('device_gateway_client.resource_checks',return_value={'shmReady':True,'shinobiDescriptorsReady':True}))
         self.spawn=self.context.enter_context(patch('device_gateway_client.RetryingPublisher'))
         def process(*a,**kw):
-            p=Mock();p.poll.return_value=None;p.pid=123;return p
+            p=Mock();p.poll.return_value=None;p.pid=123;p.child_running.return_value=True;p.last_failure={};return p
         self.spawn.side_effect=process
     def command(self,s,m,kind='STREAM_START'):
         return {'commandId':kind+s,'mediaDeviceId':'device','arenaId':'arena','streamId':s,'type':kind,
@@ -44,10 +44,15 @@ class MonitorPublishersTests(TestCase):
     def test_one_failure_keeps_other_live_and_replays_failure(self):
         a=self.command('a','cam2');self.r.execute(a);self.r.execute(self.command('b','cam14'))
         failed=self.r.streams['a']['process'];failed.poll.return_value=146;failed.returncode=146
+        failed.last_failure={"causeCode":"RTMP_CONNECTION_REFUSED","failureStage":"DESTINATION","exitCode":146,"signal":None}
         self.r.reap_publishers()
         self.assertEqual(list(self.r.streams),['b'])
         self.assertTrue(self.r.marker.exists())
-        self.assertEqual(self.r.execute(a)['event'],'command.failed')
+        result=self.r.execute(a)
+        self.assertEqual(result['event'],'command.failed')
+        self.assertEqual(result['causeCode'],'RTMP_CONNECTION_REFUSED')
+        self.assertEqual(result['exitCode'],146)
+        self.assertEqual(self.r.last_publisher_failure['causeCode'],'RTMP_CONNECTION_REFUSED')
     def test_one_timeout_keeps_other_live(self):
         self.r.execute(self.command('a','cam2'));self.r.execute(self.command('b','cam14'))
         self.r.streams['a']['deadline']=time.monotonic()-1;self.r.reap_publishers()
