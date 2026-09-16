@@ -1,4 +1,4 @@
-"""Durable direct-upload spool. One worker; no permanent object-storage keys."""
+"""Durable direct-upload spool with four bounded delivery slots."""
 
 import argparse
 from datetime import datetime, timezone
@@ -20,6 +20,8 @@ from urllib.parse import quote, urlsplit
 from media_mode import direct_enabled
 from adaptive_upload import AdaptiveBandwidth, upload_file
 from video_completion_webhook import start_completion_server
+
+MAX_CONCURRENT_UPLOADS = 4
 
 
 class QueueFull(Exception):
@@ -134,6 +136,8 @@ class UploadQueue:
         with closing(self.connect()) as db:
             db.execute("UPDATE jobs SET state='retry',error='WORKER_RESTARTED',updated=? "
                        "WHERE state='uploading'", (time.time(),))
+            db.execute("UPDATE jobs SET state='fail_reporting',updated=? WHERE state='reporting'",
+                       (time.time(),))
             # Recover a crash after completion was committed but before spool unlink.
             for row in db.execute("SELECT spool FROM jobs WHERE state='completed'"):
                 Path(row[0]).unlink(missing_ok=True)
@@ -141,12 +145,16 @@ class UploadQueue:
     def claim(self, selected_ids=None):
         with closing(self.connect()) as db:
             db.execute("BEGIN IMMEDIATE")
+            active = db.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('uploading','reporting')").fetchone()[0]
+            if active >= MAX_CONCURRENT_UPLOADS:
+                db.execute("COMMIT")
+                return None
             selection = "" if selected_ids is None else " AND id IN (" + ",".join("?" for _ in selected_ids) + ")"
             row = db.execute("SELECT * FROM jobs WHERE state IN ('pending','retry','fail_reporting') "
                              "AND next_attempt<=?" + selection + " ORDER BY created LIMIT 1",
                              (time.time(), *(selected_ids or []))).fetchone()
             if row:
-                state = "fail_reporting" if row["state"] == "fail_reporting" else "uploading"
+                state = "reporting" if row["state"] == "fail_reporting" else "uploading"
                 db.execute("UPDATE jobs SET state=?,attempts=attempts+1,updated=? WHERE id=?",
                            (state, time.time(), row["id"]))
             db.execute("COMMIT")
@@ -201,7 +209,9 @@ class UploadQueue:
                 "oldestPendingSeconds": round(time.time() - oldest) if oldest else 0,
                 "diskFreeBytes": shutil.disk_usage(self.root).free,
                 "maxItems": self.max_items, "maxBytes": self.max_bytes,
-                "maxConcurrentUploads": 1}
+                "activeUploadCount": counts.get("uploading", 0),
+                "occupiedSlots": counts.get("uploading", 0) + counts.get("reporting", 0),
+                "maxConcurrentUploads": MAX_CONCURRENT_UPLOADS}
 
 
 class BackendDelivery:
@@ -306,7 +316,7 @@ class BackendDelivery:
             url = ticket["uploadUrl"]
             if urlsplit(url).scheme != "https":
                 raise PermanentUploadError("HTTPS_UPLOAD_REQUIRED")
-            rate = int(self.config.get("uploadBytesPerSecond", 256 * 1024))
+            rate = int(self.config.get("uploadBytesPerSecond", 256 * 1024)) // MAX_CONCURRENT_UPLOADS
             if self.config.get("liveActiveFile") and Path(self.config["liveActiveFile"]).exists():
                 rate = min(rate, int(self.config.get("liveUploadBytesPerSecond", 64 * 1024)))
             # Pass the signed URL on stdin, not in the process argument list or logs.
@@ -336,6 +346,8 @@ class BackendDelivery:
                     process.stdin.close()
                     deadline = time.monotonic() + 1810
                     while process.poll() is None:
+                        if not direct_enabled(self.config):
+                            raise OSError("UPLOAD_WAITING_DIRECT")
                         if self.live_active():
                             raise OSError("UPLOAD_PAUSED_FOR_LIVE")
                         if time.monotonic() >= deadline:
@@ -371,6 +383,16 @@ def accept_completion(config, payload, collect_file):
         raise ValueError("INVALID_FILENAME")
     folder = Path(config["watchDirectories"][monitor]).resolve()
     return collect_file(folder / filename, monitor, notified=True)
+
+
+def delivery_worker(queue, deliver, config, wake, stop):
+    """Claim only when this slot is free; backlog stays durable in SQLite."""
+    while not stop.is_set():
+        if (not direct_enabled(config) or not deliver or
+                (deliver.live_active() and not deliver.bandwidth) or
+                not queue.step(deliver, config.get("selectedJobIds"))):
+            wake.wait(2)
+            wake.clear()
 
 
 def serve(config):
@@ -478,12 +500,22 @@ def serve(config):
     reporter = threading.Thread(target=report, daemon=True, name="direct-status")
     collector.start()
     reporter.start()
-    while True:
-        if not collector.is_alive() or not reporter.is_alive() or (webhook_thread and not webhook_thread.is_alive()):
-            raise RuntimeError("QUEUE_BACKGROUND_THREAD_STOPPED")
-        if not direct_enabled(config) or not deliver or (deliver.live_active() and not deliver.bandwidth) or not queue.step(deliver, config.get("selectedJobIds")):
-            wake.wait(2)
-            wake.clear()
+    stop = threading.Event()
+    workers = [threading.Thread(target=delivery_worker, args=(queue, deliver, config, wake, stop),
+                                daemon=True, name="direct-upload-" + str(index + 1))
+               for index in range(MAX_CONCURRENT_UPLOADS)]
+    for worker in workers:
+        worker.start()
+    try:
+        while True:
+            if (not collector.is_alive() or not reporter.is_alive() or
+                    any(not worker.is_alive() for worker in workers) or
+                    (webhook_thread and not webhook_thread.is_alive())):
+                raise RuntimeError("QUEUE_BACKGROUND_THREAD_STOPPED")
+            time.sleep(1)
+    finally:
+        stop.set()
+        wake.set()
 
 
 def main():

@@ -3,13 +3,14 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 from unittest.mock import Mock
 from urllib.error import URLError
 
-from direct_upload_queue import BackendDelivery, PermanentUploadError, QueueFull, UploadQueue, reject_internal_credentials
+from direct_upload_queue import BackendDelivery, PermanentUploadError, QueueFull, UploadQueue, delivery_worker, reject_internal_credentials
 
 
 class BackendContractTests(unittest.TestCase):
@@ -145,6 +146,86 @@ class DurableQueueTests(unittest.TestCase):
         source = self.root / name
         source.write_bytes(b"test-video")
         return source, self.queue.enqueue(source, "camera02", "staging")
+
+    def test_four_slots_wait_for_one_release_and_drain_without_duplicates(self):
+        ids = [self.enqueue(str(i) + ".mp4")[1] for i in range(8)]
+        condition = threading.Condition()
+        releases = {job_id: threading.Event() for job_id in ids}
+        started, finished = [], []
+        active, peak = [0], [0]
+        def deliver(job, *_):
+            with condition:
+                started.append(job["id"])
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+                condition.notify_all()
+            released = releases[job["id"]].wait(5)
+            with condition:
+                active[0] -= 1
+                finished.append(job["id"])
+                condition.notify_all()
+            if not released:
+                raise TimeoutError("Test release missing")
+        deliver.live_active = lambda: False
+        deliver.bandwidth = None
+        wake, stop = threading.Event(), threading.Event()
+        workers = [threading.Thread(target=delivery_worker, args=(self.queue, deliver, {}, wake, stop))
+                   for _ in range(4)]
+        with patch("direct_upload_queue.direct_enabled", return_value=True):
+            try:
+                for worker in workers:
+                    worker.start()
+                with condition:
+                    self.assertTrue(condition.wait_for(lambda: len(started) == 4, timeout=5))
+                self.assertEqual(self.queue.status()["counts"], {"pending": 4, "uploading": 4})
+                self.assertIsNone(self.queue.claim())  # Even a fifth caller cannot take a slot.
+                releases[started[0]].set()
+                with condition:
+                    self.assertTrue(condition.wait_for(lambda: len(started) == 5, timeout=5))
+                    self.assertEqual(len(finished), 1)
+                for release in releases.values():
+                    release.set()
+                with condition:
+                    self.assertTrue(condition.wait_for(lambda: len(finished) == 8, timeout=5))
+            finally:
+                stop.set()
+                wake.set()
+                for release in releases.values():
+                    release.set()
+                for worker in workers:
+                    worker.join(5)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(peak[0], 4)
+        self.assertCountEqual(started, ids)
+        self.assertEqual(self.queue.status()["counts"], {"completed": 8})
+
+    def test_failure_reporting_claim_is_exclusive_and_recovers(self):
+        _, job_id = self.enqueue()
+        with closing(self.queue.connect()) as db:
+            db.execute("UPDATE jobs SET state='fail_reporting',error='SOURCE_MISSING'")
+        self.assertEqual(self.queue.claim()["id"], job_id)
+        self.assertIsNone(self.queue.claim())
+        self.queue.recover()
+        job = self.queue.claim()
+        self.assertEqual(job["id"], job_id)
+        self.assertEqual(job["state"], "fail_reporting")
+        self.assertEqual(job["error"], "SOURCE_MISSING")
+
+    def test_failed_upload_releases_one_slot_and_keeps_retry_backoff(self):
+        ids = [self.enqueue(str(i) + ".mp4")[1] for i in range(5)]
+        for _ in range(3):
+            self.queue.claim()
+        def offline(*_):
+            raise OSError("offline")
+        self.queue.step(offline)
+        self.assertEqual(self.queue.status()["counts"], {"uploading": 3, "retry": 1, "pending": 1})
+        self.assertEqual(self.queue.claim()["id"], ids[4])
+        self.assertIsNone(self.queue.claim())
+        self.queue.recover()
+        self.assertEqual(self.queue.status()["occupiedSlots"], 0)
+        with closing(self.queue.connect()) as db:
+            failed = db.execute("SELECT next_attempt FROM jobs WHERE id=?", (ids[3],)).fetchone()
+        self.assertGreater(failed[0], time.time())
 
     def test_burst_deduplicates_and_survives_restart(self):
         for index in range(100):
