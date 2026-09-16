@@ -67,3 +67,17 @@ class ConfigSyncTests(unittest.TestCase):
         with patch('arena_config_sync.urllib.request.build_opener') as opener:
             opener.return_value.open.return_value=response
             with self.assertRaises(ConfigSyncError): fetch_snapshot(self.config)
+
+    def test_official_config_identifies_agent_without_changing_auth(self):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = json.dumps(self.snapshot('DIRECT')).encode()
+        with patch('arena_config_sync.urllib.request.build_opener') as opener:
+            opener.return_value.open.return_value = response
+            self.assertEqual(fetch_snapshot(self.config)['mediaMode'], 'DIRECT')
+        request = opener.return_value.open.call_args.args[0]
+        self.assertEqual(request.full_url, 'https://api.test/internal/media-devices/shinobi/config')
+        self.assertEqual(request.get_header('Authorization'), 'Bearer private')
+        self.assertEqual(request.get_header('User-agent'), 'Gravae-Agent/' + Path('VERSION').read_text().strip())
+        self.assertEqual(request.get_header('Accept'), 'application/json')
