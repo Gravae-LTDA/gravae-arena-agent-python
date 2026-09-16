@@ -121,6 +121,7 @@ class DeviceRuntime:
         self.config_sync_ok = False
         self.last_config_sync_at = None
         self.last_config_sync_error = None
+        self.last_publisher_failure = None
         self.hls_health = HlsReadinessCache(config.get("hlsDecodeIntervalSeconds", 300),
                                             config.get("hlsDecodeRetrySeconds", 60))
         self.connected = False
@@ -140,8 +141,18 @@ class DeviceRuntime:
                                   commandId=command_id, eventId=str(uuid.uuid4()), occurredAt=timestamp())
                     db.execute("UPDATE commands SET result=? WHERE id=?",
                                (json.dumps(result), command_id))
+                self.remember_publisher_failure(result)
                 if result.get("eventId"):
                     self.outbox.put(result["event"], self.envelope(result), db)
+
+    def remember_publisher_failure(self, result):
+        if result.get('commandType') != 'STREAM_START' or result.get('event') != 'command.failed':
+            return
+        if self.last_publisher_failure and self.last_publisher_failure.get('occurredAt', '') > result.get('occurredAt', ''):
+            return
+        self.last_publisher_failure = {key: result[key] for key in (
+            'streamId', 'monitorId', 'errorCode', 'causeCode', 'failureStage',
+            'exitCode', 'signal', 'occurredAt', 'agentVersion') if key in result}
 
     def envelope(self, result):
         return dict({key: value for key, value in result.items() if key != "event"},
@@ -167,15 +178,16 @@ class DeviceRuntime:
     def readiness(self):
         with self.lock:
             slots = list(self.streams.values())
-            active_streams = [{"streamId": sid, "monitorId": slot["monitorId"]} for sid, slot in self.streams.items() if slot["process"].poll() is None]
+            active_streams = [{"streamId": sid, "monitorId": slot["monitorId"]} for sid, slot in self.streams.items() if slot["process"].child_running()]
         checks = {"agentVersion": AGENT_VERSION, "gatewayConnected": self.connected,
                   "ffmpegReady": shutil.which("ffmpeg") is not None,
                   "diskReady": shutil.disk_usage(self.root).free >= self.config.get("minFreeBytes", 2 * 1024**3),
-                  "publisherActive": any(slot["process"].poll() is None for slot in slots),
+                  "publisherActive": any(slot["process"].child_running() for slot in slots),
                   "liveInput": "SHINOBI_HLS",
-                  "activeStreamCount": sum(slot["process"].poll() is None for slot in slots),
-                  "activeMonitors": [slot["monitorId"] for slot in slots if slot["process"].poll() is None]}
+                  "activeStreamCount": sum(slot["process"].child_running() for slot in slots),
+                  "activeMonitors": [slot["monitorId"] for slot in slots if slot["process"].child_running()]}
         checks["activeStreams"] = active_streams
+        checks["lastPublisherFailure"] = self.last_publisher_failure
         checks.update(self.config_diagnostics())
         checks.update(resource_checks(self.config))
         checks["eventsPending"] = self.outbox.count()
@@ -288,7 +300,8 @@ class DeviceRuntime:
                         result.update(error.publisher_details)
                 if result.get("errorCode") == "ARENA_CONFIG_SYNC_FAILED":
                     result["configSyncError"] = self.last_config_sync_error
-                result.update(eventId=str(uuid.uuid4()), occurredAt=timestamp())
+                result.update(eventId=str(uuid.uuid4()), occurredAt=timestamp(), agentVersion=AGENT_VERSION)
+                self.remember_publisher_failure(result)
                 if result["event"] == "command.ack" and command.get("type") == "STREAM_START":
                     if result.get("streamId") in self.streams:
                         self.streams[result["streamId"]]["command"] = dict(result)
@@ -431,6 +444,7 @@ class DeviceRuntime:
                                   occurredAt=timestamp(), errorCode="RTMP_PUBLISH_FAILED", publisherStarted=False,
                                   agentVersion=AGENT_VERSION,
                                   errorMessage="Publisher encerrou antes do prazo", **process.last_failure)
+                    self.remember_publisher_failure(failed)
                     with closing(self.db()) as db:
                         db.execute("BEGIN IMMEDIATE")
                         db.execute("UPDATE commands SET result=? WHERE id=?", (json.dumps(failed), failed["commandId"]))

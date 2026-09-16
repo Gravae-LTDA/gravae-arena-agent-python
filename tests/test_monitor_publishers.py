@@ -52,6 +52,7 @@ class MonitorPublishersTests(TestCase):
         self.assertEqual(result['event'],'command.failed')
         self.assertEqual(result['causeCode'],'RTMP_CONNECTION_REFUSED')
         self.assertEqual(result['exitCode'],146)
+        self.assertEqual(self.r.last_publisher_failure['causeCode'],'RTMP_CONNECTION_REFUSED')
     def test_one_timeout_keeps_other_live(self):
         self.r.execute(self.command('a','cam2'));self.r.execute(self.command('b','cam14'))
         self.r.streams['a']['deadline']=time.monotonic()-1;self.r.reap_publishers()
