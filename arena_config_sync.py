@@ -27,7 +27,11 @@ def fetch_snapshot(config, config_path=None):
     parsed = urlsplit(base)
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ('', '/'):
         raise ConfigSyncError('ARENA_CONFIG_SYNC_FAILED')
-    request = urllib.request.Request(base + expected, headers={'Authorization': 'Bearer ' + config['deviceToken']})
+    request = urllib.request.Request(base + expected, headers={
+        'Authorization': 'Bearer ' + config['deviceToken'],
+        'User-Agent': 'Gravae-Agent/4.0.8',
+        'Accept': 'application/json',
+    })
     with urllib.request.build_opener(NoRedirect()).open(request, timeout=15) as response:
         raw = response.read(1024 * 1024 + 1)
         if len(raw) > 1024 * 1024:
