@@ -85,21 +85,8 @@ def camera_sources(data):
         for row in rows:
             if row.get('mid') not in {m['monitorId'] for m in data['monitors']}:
                 continue
-            details = row.get('details') or {}
-            if isinstance(details, str):
-                details = json.loads(details)
-            protocol = row.get('protocol')
-            host = row.get('host', '')
-            if protocol not in ('rtsp', 'rtsps') or not host or any(x in host for x in '/\r\n'):
-                raise ValueError()
-            auth = ''
-            if details.get('muser'):
-                auth = urllib.parse.quote(str(details['muser']), safe='') + ':' + urllib.parse.quote(str(details.get('mpass') or ''), safe='') + '@'
-            source = protocol + '://' + auth + host + ':' + str(row.get('port') or 554) + '/' + str(row.get('path') or '').lstrip('/')
-            if not urllib.parse.urlsplit(source).hostname or any(ord(c) < 32 for c in source):
-                raise ValueError()
-            # Runtime validates again before every publication.
-            sources[row['mid']] = {'rtspUrl': source, 'rtspTransport': details.get('rtsp_transport') or 'tcp', 'probeSize': int(details.get('probesize') or 1000000), 'analyzeDuration': int(details.get('aduration') or 1000000)}
+            # Reuse the local Shinobi stream; camera credentials are not publisher inputs.
+            sources[row['mid']] = {'hlsManifest': f'/dev/shm/streams/{data["groupKey"]}/{row["mid"]}/s.m3u8'}
         if len(sources) != len(data['monitors']):
             raise ValueError()
         return sources
@@ -541,7 +528,7 @@ def verify(data):
     firewall = any(subprocess.run(['systemctl', 'is-active', unit], capture_output=True, text=True).returncode == 0 for unit in ('gravae-private-services', 'gravae-direct-private'))
     if ready and services and ssh_private and firewall:
         subprocess.run(['systemctl', 'stop', 'gravae-direct-rollback.timer'], capture_output=True)
-    return {'ready': bool(ready and services and ssh_private and firewall and bool(re.fullmatch(r'4\.\d+\.\d+', str(status.get('agentVersion', ''))))), 'monitors': inventory, 'agentVersion': status.get('agentVersion'), 'checks': checks, 'privateAccessReady': bool(ssh_private and firewall), 'publisherConfigured': all(m.get('rtspUrl') for m in config.get('monitors', {}).values()), 'eventsReady': status.get('eventsPending') == 0}
+    return {'ready': bool(ready and services and ssh_private and firewall and bool(re.fullmatch(r'4\.\d+\.\d+', str(status.get('agentVersion', ''))))), 'monitors': inventory, 'agentVersion': status.get('agentVersion'), 'checks': checks, 'privateAccessReady': bool(ssh_private and firewall), 'publisherConfigured': bool(config.get('monitors')) and all(m.get('hlsManifest') for m in config.get('monitors', {}).values()), 'eventsReady': status.get('eventsPending') == 0}
 
 
 def set_mode(data):

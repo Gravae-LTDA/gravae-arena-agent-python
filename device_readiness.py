@@ -120,3 +120,33 @@ class HlsReadinessCache:
             self.results[key] = cached
         return dict(cached['result'], decodeCheckedAt=cached['checkedAt'],
                     decodeAgeSeconds=round(max(0, time.monotonic()-cached['at']), 1))
+
+
+def public_direct_status(path='/var/lib/gravae-device-client/status.json'):
+    """Read diagnostics only; never expose the enrollment/config files."""
+    import json
+    import re
+    from pathlib import Path
+    try:
+        file = Path(path)
+        if file.stat().st_size > 1024 * 1024:
+            raise ValueError('status too large')
+        data = json.loads(file.read_text())
+        result = {key: data.get(key) for key in (
+            'publisherActive', 'activeStreamCount', 'directModeValid', 'directModeExpiresAt',
+            'configSyncOk', 'lastConfigSyncAt', 'checkedAt', 'status', 'vpnReady', 'gatewayConnected',
+            'shinobiProcessReady', 'shinobiDescriptorsReady', 'ffmpegReady', 'uploaderReady')}
+        result['activeStreams'] = [{key: item[key] for key in ('streamId', 'monitorId')
+                                    if isinstance(item.get(key), str) and re.fullmatch(r'[\w-]{1,128}', item[key])}
+                                   for item in data.get('activeStreams', [])[:100] if isinstance(item, dict)]
+        error = data.get('lastConfigSyncError')
+        result['lastConfigSyncError'] = None if not error else {
+            'errorCode': 'CONFIG_SYNC_FAILED',
+            'message': 'Nao foi possivel sincronizar a configuracao oficial',
+            **({'httpStatus': error['httpStatus']} if isinstance(error, dict) and isinstance(error.get('httpStatus'), int) else {})}
+        result['stale'] = time.time() - file.stat().st_mtime > 45
+        if result['stale']:
+            result.update(status='UNKNOWN', directModeValid=False, configSyncOk=False)
+        return result
+    except (OSError, ValueError, TypeError, KeyError):
+        return {'status': 'UNKNOWN', 'stale': True, 'directModeValid': False, 'configSyncOk': False}

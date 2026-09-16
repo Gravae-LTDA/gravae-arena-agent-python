@@ -64,3 +64,30 @@ Pilot validation, 2026-09-13:
   or activated by the upgrade. Reading a mapping does not validate a physical press.
 - An initial health check used the wrong route and triggered rollback. The
   corrected installer validates the actual `/update/version` endpoint.
+
+## Live contract — 4.0.7
+
+Socket.IO receipt returns `accepted=true, received=true` when the bounded command
+inbox accepts the envelope. This is transport receipt only. Execution remains
+serialized and the persistent command/outbox store deduplicates operational
+outcomes. A full inbox returns `COMMAND_QUEUE_FULL`; backend must retain its
+operational ACK watchdog, including across process restarts.
+
+STREAM_START uses the configured local Shinobi HLS manifest, validates it before
+spawning FFmpeg, and never falls back to camera RTSP. Operational command.ack
+includes publisherStarted=true only after a publisher process starts. Only the
+stream service confirms STREAMING. Publisher failure emits RTMP_PUBLISH_FAILED.
+
+Readiness exposes activeStreams, directModeValid/directModeExpiresAt and config
+sync diagnostics. HTTP status is retained without response bodies or credentials.
+ARENA_CONFIG_SYNC_FAILED stays the command-level compatibility code; nested
+configSyncError uses CONFIG_SYNC_FAILED. No successful config sync since boot
+means configSyncOk=false. Every active binding must have validated HLS for READY.
+
+Migration preparation accepts a successfully synchronized LEGACY snapshot with
+VPN and HLS ready. Do not require directModeValid=true before the backend mode
+change; verify it after activating DIRECT. Never manufacture a DIRECT lease.
+
+Release tests do not replace real preview-service manifest/segment checks, live
+media receipt, uploader outage recovery or encoder PROCESSED acceptance. This
+release does not implement VPN repair or rotate tokens automatically.

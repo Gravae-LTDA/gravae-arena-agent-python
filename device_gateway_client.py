@@ -8,12 +8,14 @@ import json
 import os
 from pathlib import Path
 import random
+import queue
 import shutil
 import signal
 import sqlite3
 import subprocess
 import threading
 import time
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 import uuid
 
@@ -113,6 +115,9 @@ class DeviceRuntime:
         fcntl.flock(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.lock = threading.RLock()
         self.streams = {}
+        self.config_sync_ok = False
+        self.last_config_sync_at = None
+        self.last_config_sync_error = None
         self.hls_health = HlsReadinessCache(config.get("hlsDecodeIntervalSeconds", 300),
                                             config.get("hlsDecodeRetrySeconds", 60))
         self.connected = False
@@ -144,16 +149,31 @@ class DeviceRuntime:
         db.execute("PRAGMA synchronous=FULL")
         return db
 
+    def config_diagnostics(self):
+        expires = None
+        try:
+            value = json.loads(Path(self.config.get("mediaModeFile", "/var/lib/gravae-device-client/media-mode.json")).read_text())
+            if value.get("arenaId") == self.config["arenaId"] and value.get("mediaDeviceId") == media_identity(self.config):
+                expires = datetime.fromtimestamp(value["expiresAt"], timezone.utc).isoformat().replace("+00:00", "Z")
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+            pass
+        return {"directModeValid": direct_enabled(self.config), "directModeExpiresAt": expires,
+                "configSyncOk": self.config_sync_ok, "lastConfigSyncAt": self.last_config_sync_at,
+                "lastConfigSyncError": self.last_config_sync_error}
+
     def readiness(self):
         with self.lock:
             slots = list(self.streams.values())
+            active_streams = [{"streamId": sid, "monitorId": slot["monitorId"]} for sid, slot in self.streams.items() if slot["process"].poll() is None]
         checks = {"agentVersion": AGENT_VERSION, "gatewayConnected": self.connected,
                   "ffmpegReady": shutil.which("ffmpeg") is not None,
                   "diskReady": shutil.disk_usage(self.root).free >= self.config.get("minFreeBytes", 2 * 1024**3),
                   "publisherActive": any(slot["process"].poll() is None for slot in slots),
-                  "liveInput": "CAMERA_RTSP",
+                  "liveInput": "SHINOBI_HLS",
                   "activeStreamCount": sum(slot["process"].poll() is None for slot in slots),
                   "activeMonitors": [slot["monitorId"] for slot in slots if slot["process"].poll() is None]}
+        checks["activeStreams"] = active_streams
+        checks.update(self.config_diagnostics())
         checks.update(resource_checks(self.config))
         checks["eventsPending"] = self.outbox.count()
         try:
@@ -180,7 +200,14 @@ class DeviceRuntime:
             checks["vpnReady"] = bool(times) and time.time() - max(times) < 180
         except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
             checks["vpnReady"] = False
-        for monitor, binding in self.config.get("monitors", {}).items():
+        monitors = self.config.get("monitors", {})
+        active = self.config.get("activeMonitorIds", list(monitors))
+        checks["bindingsReady"] = bool(active) and all(mid in monitors for mid in active)
+        for monitor in active:
+            binding = monitors.get(monitor)
+            if not binding:
+                checks["hlsReady:" + monitor] = False
+                continue
             result = self.hls_health.check(binding["hlsManifest"])
             checks["hlsReady:" + monitor] = result["ready"]
             checks["hlsError:" + monitor] = result["errorCode"]
@@ -189,7 +216,7 @@ class DeviceRuntime:
         checks["hlsDecodeIntervalSeconds"] = self.hls_health.interval
         # Do not advertise overall READY while end-to-end uploader enrollment is pending.
         checks["status"] = "READY" if all(value for key, value in checks.items()
-                                                if key.endswith("Ready") or key.startswith("hlsReady:")) and self.connected else "DEGRADED"
+                                                if key.endswith("Ready") or key.startswith("hlsReady:")) and self.connected and self.config_sync_ok else "DEGRADED"
         return checks
 
     def execute(self, command):
@@ -239,6 +266,7 @@ class DeviceRuntime:
                         result["readiness"] = self.readiness()
                     elif command["type"] == "STREAM_START":
                         self.start(command["streamId"], payload, command_id=command_id)
+                        result["publisherStarted"] = True
                     elif command["type"] == "STREAM_STOP":
                         if self.streams and command.get("streamId") not in self.streams:
                             raise CommandError("STREAM_ID_MISMATCH")
@@ -246,7 +274,15 @@ class DeviceRuntime:
                     result["event"] = "command.ack"
                 except (CommandError, KeyError, ValueError, TypeError, OSError) as error:
                     result.update(errorCode=str(error) if isinstance(error, CommandError) else "INVALID_COMMAND",
-                                  errorMessage="Comando nao aceito pelo agent")
+                                  errorMessage={
+                                      "DIRECT_MODE_REQUIRED": "Modo DIRECT local ausente, invalido ou expirado",
+                                      "MONITOR_NOT_FOUND": "Monitor nao cadastrado na configuracao local",
+                                      "SHINOBI_SOURCE_UNAVAILABLE": "HLS local do Shinobi indisponivel ou invalido",
+                                      "RTMP_PUBLISH_FAILED": "Falha ao iniciar a publicacao RTMP/RTMPS",
+                                      "ARENA_CONFIG_SYNC_FAILED": "Falha ao sincronizar a configuracao oficial",
+                                  }.get(str(error), "Comando nao aceito pelo agent"))
+                if result.get("errorCode") == "ARENA_CONFIG_SYNC_FAILED":
+                    result["configSyncError"] = self.last_config_sync_error
                 result.update(eventId=str(uuid.uuid4()), occurredAt=timestamp())
                 if result["event"] == "command.ack" and command.get("type") == "STREAM_START":
                     if result.get("streamId") in self.streams:
@@ -279,8 +315,16 @@ class DeviceRuntime:
                             self.stop(stream_id)
                     save_mode(self.config, 'DIRECT')
                     self.readiness()
+            self.config_sync_ok = True
+            self.last_config_sync_at = timestamp()
+            self.last_config_sync_error = None
             return snapshot['mediaMode']
-        except Exception:
+        except Exception as error:
+            self.config_sync_ok = False
+            self.last_config_sync_error = {"errorCode": "CONFIG_SYNC_FAILED",
+                                           "message": "Nao foi possivel buscar ou aplicar a configuracao oficial"}
+            if isinstance(error, HTTPError):
+                self.last_config_sync_error["httpStatus"] = error.code
             raise CommandError('ARENA_CONFIG_SYNC_FAILED') from None
 
     def start(self, stream_id, payload, command_id=None):
@@ -297,19 +341,9 @@ class DeviceRuntime:
         binding = self.config.get("monitors", {}).get(payload.get("monitorId"))
         if not binding:
             raise CommandError("MONITOR_NOT_FOUND")
-        source = binding.get("rtspUrl")
-        if not isinstance(source, str) or not source or any(ord(c) < 32 for c in source):
-            raise CommandError("CAMERA_RTSP_SOURCE_REQUIRED")
-        source_url = urlsplit(source)
-        if source_url.scheme not in ("rtsp", "rtsps") or not source_url.hostname or source_url.fragment:
-            raise CommandError("CAMERA_RTSP_SOURCE_INVALID")
-        transport = binding.get("rtspTransport", "tcp")
-        if transport not in ("tcp", "udp"):
-            raise CommandError("CAMERA_RTSP_TRANSPORT_INVALID")
-        probe_size = int(binding.get("probeSize", 1000000))
-        analyze_duration = int(binding.get("analyzeDuration", 1000000))
-        if not 32768 <= probe_size <= 5000000 or not 0 <= analyze_duration <= 5000000:
-            raise CommandError("CAMERA_RTSP_PROBE_LIMIT_INVALID")
+        source = binding.get("hlsManifest")
+        if not isinstance(source, str) or not source.startswith('/') or any(ord(c) < 32 for c in source):
+            raise CommandError("SHINOBI_SOURCE_UNAVAILABLE")
         destination = payload.get("rtmpUrl", "")
         url = urlsplit(destination)
         if (url.scheme not in ("rtmp", "rtmps") or not url.hostname or any(c.isspace() or ord(c) < 32 for c in destination)
@@ -324,20 +358,21 @@ class DeviceRuntime:
         resources = resource_checks(self.config)
         if not resources.get("cpuReady", True) or not resources.get("memoryReady", True):
             raise CommandError("DEVICE_RESOURCE_DEGRADED")
+        if not hls_check(source).get("ready"):
+            raise CommandError("SHINOBI_SOURCE_UNAVAILABLE")
         self.marker.touch(mode=0o600)
         process = None
         try:
             operational_log("publisher.starting", streamId=stream_id, monitorId=payload.get("monitorId"))
             argv = [
                 "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-nostats",
-                "-progress", "pipe:1", "-rtsp_transport", transport, "-timeout", "5000000",
-                "-analyzeduration", str(analyze_duration), "-probesize", str(probe_size),
+                "-progress", "pipe:1", "-protocol_whitelist", "file,crypto,data",
                 "-fflags", "+igndts", "-i", source,
                 "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
                 "-t", str(duration), "-rw_timeout", "5000000", "-f", "flv",
                 destination.rstrip("/") + "/" + key,
             ]
-            process = RetryingPublisher(argv, [destination, key, source, source_url.username, source_url.password],
+            process = RetryingPublisher(argv, [destination, key, source],
                 operational_log, {"commandId": command_id, "streamId": stream_id, "monitorId": payload.get("monitorId")}, duration)
 
             self.streams[stream_id] = {"process": process, "monitorId": payload["monitorId"],
@@ -350,11 +385,11 @@ class DeviceRuntime:
                 self.marker.unlink(missing_ok=True)
             raise
         time.sleep(1)
-        if process.poll() is not None:
+        if process.poll() is not None or process.pid is None:
             operational_log("publisher.start_failed", streamId=stream_id, monitorId=payload.get("monitorId"),
                             exitCode=process.returncode)
             self.stop(stream_id)
-            raise CommandError("PUBLISHER_START_FAILED")
+            raise CommandError("RTMP_PUBLISH_FAILED")
         operational_log("publisher.prepared", streamId=stream_id, monitorId=payload.get("monitorId"), pid=process.pid)
 
     def stop(self, stream_id=None):
@@ -385,7 +420,7 @@ class DeviceRuntime:
                     continue
                 if exited and time.monotonic() < slot["deadline"] and slot["command"]:
                     failed = dict(slot["command"], event="command.failed", eventId=str(uuid.uuid4()),
-                                  occurredAt=timestamp(), errorCode="PUBLISHER_EXITED",
+                                  occurredAt=timestamp(), errorCode="RTMP_PUBLISH_FAILED", publisherStarted=False,
                                   errorMessage="Publisher encerrou antes do prazo", exitCode=process.returncode)
                     with closing(self.db()) as db:
                         db.execute("BEGIN IMMEDIATE")
@@ -396,10 +431,42 @@ class DeviceRuntime:
                 self.stop(stream_id)
 
 
+class CommandInbox:
+    """Transport receipt is separate from serialized operational execution."""
+    def __init__(self, runtime, stopping):
+        self.runtime, self.stopping = runtime, stopping
+        self.pending = queue.Queue(maxsize=64)
+
+    def receive(self, command):
+        try:
+            self.pending.put_nowait(dict(command))
+        except queue.Full:
+            return {"accepted": False, "errorCode": "COMMAND_QUEUE_FULL", "commandId": command.get("commandId")}
+        return {"accepted": True, "received": True, "commandId": command.get("commandId")}
+
+    def run(self):
+        while not self.stopping.is_set():
+            try:
+                command = self.pending.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                result = self.runtime.execute(command)
+                operational_log(result["event"], **{key: result.get(key) for key in
+                                ("commandId", "commandType", "streamId", "monitorId", "errorCode")})
+            except Exception as error:
+                operational_log("command.execution_failed", commandId=command.get("commandId"),
+                                exceptionType=type(error).__name__)
+            finally:
+                self.pending.task_done()
+
+
 def serve(config):
     import socketio
     runtime = DeviceRuntime(config)
     stopping = threading.Event()
+    inbox = CommandInbox(runtime, stopping)
+    threading.Thread(target=inbox.run, daemon=True, name="device-commands").start()
 
     def emit(event, payload):
         envelope = dict(payload, eventId=str(uuid.uuid4()), occurredAt=timestamp(),
@@ -431,15 +498,7 @@ def serve(config):
             metadata = {key: command.get(key) for key in ("commandId", "streamId")}
             metadata["commandType"] = command.get("type")
             operational_log("command.received", **metadata)
-            try:
-                result = runtime.execute(command)
-                operational_log(result["event"], **{key: result.get(key) for key in
-                                ("commandId", "commandType", "streamId", "monitorId", "errorCode")})
-                return {"accepted": result["event"] == "command.ack", "commandId": result.get("commandId"),
-                        "eventId": result.get("eventId"), "errorCode": result.get("errorCode")}
-            except CommandError as error:
-                operational_log("command.rejected", **metadata, errorCode=str(error))
-                return {"accepted": False, "errorCode": str(error)}
+            return inbox.receive(command)
 
     connection = GatewayConnection(config, socketio.Client, register)
 
