@@ -107,12 +107,12 @@ class DeviceCommandTests(unittest.TestCase):
             self.assertEqual(args[args.index('-c')+1], 'copy')
             self.assertNotIn('-r', args)
             self.assertNotIn('-re', args)
-            self.assertEqual(args[args.index('-i')+1], 'rtsp://camera.local/feed')
-            self.assertEqual(args[args.index('-rtsp_transport')+1], 'tcp')
-            self.assertNotIn(str(manifest), args)
+            self.assertEqual(args[args.index('-i')+1], str(manifest))
+            self.assertNotIn('-rtsp_transport', args)
+            self.assertTrue(result['publisherStarted'])
             self.assertEqual(result['event'], 'command.ack')
 
-    def test_rtsp_live_does_not_require_shinobi_or_hls(self):
+    def test_missing_shinobi_source_does_not_fallback_to_camera_rtsp(self):
         self.runtime.config['monitors'] = {'camera': {'rtspUrl': 'rtsp://camera.local/feed'}}
         command = self.command('STREAM_START')
         command['payload'] = {'monitorId': 'camera', 'rtmpUrl': 'rtmp://worker/live', 'streamKey': 'stream'}
@@ -122,7 +122,8 @@ class DeviceCommandTests(unittest.TestCase):
              patch('device_gateway_client.RetryingPublisher') as publisher:
             publisher.return_value.poll.return_value = None
             publisher.return_value.pid = 123
-            self.assertEqual(self.runtime.execute(command)['event'], 'command.ack')
+            self.assertEqual(self.runtime.execute(command)['errorCode'], 'SHINOBI_SOURCE_UNAVAILABLE')
+            publisher.assert_not_called()
             hls.assert_not_called()
 
     def test_destination_is_restricted(self):

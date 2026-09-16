@@ -37,6 +37,25 @@ class ConfigSyncTests(unittest.TestCase):
         with patch('device_gateway_client.RetryingPublisher') as publisher:
             with self.assertRaisesRegex(Exception,'DIRECT_MODE_REQUIRED'): self.runtime.start('live',{'monitorId':'camera'})
         publisher.assert_not_called()
+    def test_sync_http_failure_reports_status_without_secret_body(self):
+        from urllib.error import HTTPError
+        with patch('device_gateway_client.fetch_snapshot', side_effect=HTTPError('https://secret',403,'secret',{},None)):
+            result = self.runtime.execute(self.command())
+        diagnostics = self.runtime.config_diagnostics()
+        self.assertFalse(diagnostics['configSyncOk'])
+        self.assertEqual(diagnostics['lastConfigSyncError']['httpStatus'],403)
+        self.assertNotIn('secret',json.dumps(diagnostics))
+        self.assertEqual(result['event'],'command.failed')
+
+    def test_successful_legacy_sync_is_valid_preparation_but_not_direct(self):
+        with patch('device_gateway_client.fetch_snapshot',return_value=self.snapshot('LEGACY')):
+            self.runtime.sync_config()
+        diagnostics = self.runtime.config_diagnostics()
+        self.assertTrue(diagnostics['configSyncOk'])
+        self.assertFalse(diagnostics['directModeValid'])
+        self.assertIsNotNone(diagnostics['lastConfigSyncAt'])
+        self.assertIsNotNone(diagnostics['directModeExpiresAt'])
+
     def test_no_token_to_arbitrary_config_path_or_redirect(self):
         with patch('arena_config_sync.urllib.request.build_opener') as opener:
             for path in ['https://other.test/config','/internal/media-devices/other/config','//other.test']:
