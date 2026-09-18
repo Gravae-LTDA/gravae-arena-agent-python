@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "4.0.10"
+VERSION = "4.0.12"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -1271,9 +1271,79 @@ def _perform_update_direct():
     except Exception as e:
         update_status = {"status": "error", "progress": 0, "message": "Erro no download", "error": str(e)}
 
+# Modulos DIRECT deployados junto do agent. Espelham exatamente a lista copiada
+# pelo direct_installer.install(); mante-los em sync com a fonte do agent evita o
+# Pi ficar com agent novo e modulos velhos (ex.: agent 4.0.12 mas device-client
+# 4.0.6 sem o User-Agent -> Cloudflare 1010 no config sync/upload).
+DIRECT_MODULE_TARGETS = (
+    ('/opt/gravae-device-client', (
+        'device_gateway_client.py', 'device_readiness.py', 'device_event_outbox.py',
+        'direct_publisher.py', 'arena_config_sync.py', 'media_mode.py', 'VERSION',
+        'direct_installer.py',
+    )),
+    ('/opt/gravae-direct-queue', (
+        'direct_upload_queue.py', 'adaptive_upload.py', 'video_completion_webhook.py',
+        'confirmed_video_cleanup.py', 'media_mode.py',
+    )),
+)
+
+
+def _sync_direct_modules():
+    """Re-deploya os modulos DIRECT a partir da fonte do agent (AGENT_PATH) e
+    reinicia os servicos DIRECT so quando algum arquivo mudou.
+
+    O update do agent (git pull) atualiza apenas /opt/gravae-agent; os modulos em
+    /opt/gravae-device-client e /opt/gravae-direct-queue so eram copiados no
+    install() do enrollment. Sem este sync, um agent atualizado convive com modulos
+    velhos (a causa do Cloudflare 1010 na Leal Butanta: agent 4.0.11, modulos 4.0.6).
+    Idempotente (compara conteudo) e no-op em arena nao-DIRECT (pasta ausente)."""
+    try:
+        if not os.path.isdir(DIRECT_MODULE_TARGETS[0][0]):
+            return  # arena nao-DIRECT: nada a fazer
+        import tempfile
+        changed = False
+        for folder, names in DIRECT_MODULE_TARGETS:
+            if not os.path.isdir(folder):
+                continue
+            for name in names:
+                source = os.path.join(AGENT_PATH, name)
+                if not os.path.exists(source):
+                    continue
+                with open(source, 'rb') as fh:
+                    content = fh.read()
+                target = os.path.join(folder, name)
+                try:
+                    with open(target, 'rb') as fh:
+                        if fh.read() == content:
+                            continue  # ja identico
+                except OSError:
+                    pass  # target ausente/ilegivel -> (re)escreve
+                with tempfile.NamedTemporaryFile(mode='wb', suffix='_' + name, delete=False) as tf:
+                    temp_path = tf.name
+                    tf.write(content)
+                subprocess.run(['sudo', 'cp', temp_path, target], check=True)
+                subprocess.run(['sudo', 'chmod', '600', target], capture_output=True)
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                changed = True
+        if changed:
+            log.info("DIRECT modules re-synced from agent source; restarting DIRECT services")
+            for svc in ('gravae-device-client', 'gravae-direct-queue'):
+                subprocess.run(['sudo', 'systemctl', 'restart', svc], capture_output=True)
+    except Exception as e:
+        log.warning("DIRECT module sync failed (non-fatal)", extra={"error": str(e)})
+
+
 def _restart_services():
     """Restart phoenix first, then agent (agent restart kills this process)"""
     global update_status
+
+    # DIRECT modules ride the same update as the agent (senao ficam na versao velha
+    # do ultimo enrollment). Idempotente e no-op em arena nao-DIRECT.
+    update_status = {"status": "installing", "progress": 52, "message": "Sincronizando modulos DIRECT...", "error": None}
+    _sync_direct_modules()
 
     # Install recovery service BEFORE restarting (safety net for crash loops)
     update_status = {"status": "installing", "progress": 55, "message": "Instalando recovery service...", "error": None}
@@ -6233,6 +6303,12 @@ def run_startup_repairs():
 
     # Start post-update health check if needed (background thread)
     threading.Thread(target=_startup_health_check, daemon=True).start()
+
+    # Mantem os modulos DIRECT na mesma versao do agent. Cobre o caso em que o
+    # agent ja atualizou mas /opt/gravae-device-client|direct-queue ficaram na
+    # versao velha do enrollment (ex.: agent 4.0.12 x modulos 4.0.6 -> 1010).
+    # Idempotente e no-op em arena nao-DIRECT; basta reiniciar o agent p/ reconciliar.
+    threading.Thread(target=_sync_direct_modules, daemon=True).start()
 
     # Ensure Shinobi PM2 process is running (background, 10s delay)
     threading.Thread(target=_ensure_shinobi_running, daemon=True).start()
