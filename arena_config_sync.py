@@ -29,7 +29,7 @@ def fetch_snapshot(config, config_path=None):
         raise ConfigSyncError('ARENA_CONFIG_SYNC_FAILED')
     request = urllib.request.Request(base + expected, headers={
         'Authorization': 'Bearer ' + config['deviceToken'],
-        'User-Agent': 'Gravae-Agent/4.0.11',
+        'User-Agent': 'Gravae-Agent/4.0.12',
         'Accept': 'application/json',
     })
     with urllib.request.build_opener(NoRedirect()).open(request, timeout=15) as response:

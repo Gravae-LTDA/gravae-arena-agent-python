@@ -289,7 +289,7 @@ class BackendDelivery:
                                          # com erro 1010 -> o upload R2 (original-videos/upload-complete/
                                          # upload-fail) falha. UA nao-library passa (mesmo fix ja aplicado
                                          # em arena_config_sync/phoenix_daemon/gravae_agent).
-                                         "User-Agent": "Gravae-Agent/4.0.11",
+                                         "User-Agent": "Gravae-Agent/4.0.12",
                                          "Idempotency-Key": job_id}, method="POST")
         try:
             with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as response:
