@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.16.1"
+VERSION = "1.17.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -388,6 +388,94 @@ class ServiceGuardian:
             return result == 0
         except:
             return False
+
+    def _shinobi_db_base(self):
+        """mysql base cmd for the ccio DB, or None. Reuses conf.json db creds."""
+        for p in ("/home/Shinobi/conf.json", "/opt/shinobi/conf.json"):
+            try:
+                with open(p) as f:
+                    db = json.load(f).get("db", {})
+                if db:
+                    return ["mysql", "-N", "-B",
+                            "-u", db.get("user", "majesticflame"),
+                            f"-p{db.get('password', '')}",
+                            "-h", db.get("host", "127.0.0.1"),
+                            db.get("database", "ccio")]
+            except Exception:
+                pass
+        return None
+
+    def _ffmpeg_major(self):
+        try:
+            out = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=8).stdout
+            m = re.search(r"ffmpeg version (\d+)", out)
+            return int(m.group(1)) if m else 4
+        except Exception:
+            return 4
+
+    def ensure_rtsp_timeout(self):
+        """Add an RTSP read timeout to monitors that lack one.
+
+        ffmpeg 7 removed `-stimeout`; without a timeout, when the RTSP stream
+        stalls ffmpeg FREEZES on the last frame and never reconnects, so every
+        recording is the same frozen clip. `-timeout` (ffmpeg>=5) / `-stimeout`
+        (ffmpeg 4) makes it detect the stall and reconnect. Idempotent: also
+        covers newly-created monitors, so provisioning gaps self-heal."""
+        base = self._shinobi_db_base()
+        if not base:
+            return 0
+        flag = "-timeout" if self._ffmpeg_major() >= 5 else "-stimeout"
+        val = flag + " 10000000"
+        try:
+            rows = subprocess.run(
+                base + ["-e", "SELECT mid, COALESCE(JSON_UNQUOTE(JSON_EXTRACT(details,'$.cust_input')),'') FROM Monitors WHERE mode='start';"],
+                capture_output=True, text=True, timeout=12).stdout.strip()
+        except Exception:
+            return 0
+        changed = 0
+        for line in rows.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            mid, cust = parts[0], parts[1]
+            if "-timeout" in cust or "-stimeout" in cust or "'" in mid:
+                continue
+            new = (cust + " " + val).strip()
+            try:
+                subprocess.run(
+                    base + ["-e", "UPDATE Monitors SET details=JSON_SET(details,'$.cust_input',%r) WHERE mid=%r;" % (new, mid)],
+                    capture_output=True, text=True, timeout=12)
+                changed += 1
+            except Exception:
+                pass
+        if changed:
+            log.warning("[rtsp-timeout] added '%s' to %d monitor(s) missing it; restarting camera" % (val, changed))
+            try:
+                self.restart_pm2_process("shinobi")
+            except Exception:
+                pass
+        return changed
+
+    def check_frozen_streams(self):
+        """Restart camera when ALL HLS streams are frozen while Shinobi is up.
+
+        Safety net for the ffmpeg RTSP-freeze: if the s.m3u8 files stop updating,
+        the streams (and every recording) are frozen. Requires the FRESHEST
+        stream to also be stale, so a single offline camera never triggers it."""
+        try:
+            if not self.check_port(8080):
+                return  # Shinobi itself down → handled by the service check
+            m3u8s = list(Path("/dev/shm/streams").glob("*/*/s.m3u8"))
+            if not m3u8s:
+                return
+            now = time.time()
+            freshest = min(now - p.stat().st_mtime for p in m3u8s)
+            if freshest > 240:
+                log.warning("[frozen-stream] all %d HLS streams stale (freshest %ds) — restarting camera"
+                            % (len(m3u8s), int(freshest)))
+                self.restart_pm2_process("shinobi")
+        except Exception as e:
+            log.debug("check_frozen_streams error: %s" % e)
 
     def check_shinobi(self):
         # Shinobi runs via pm2, check port 8080
@@ -2721,6 +2809,7 @@ class PhoenixDaemon:
         log.info(f"Phoenix v{VERSION} started (reboot after 4h offline, max {MAX_REBOOTS_PER_DAY}/day, no network config changes)")
 
         last_service_check = 0
+        last_rtsp_heal = 0
         last_connectivity_check = 0
         last_resource_check = 0
         last_monitor_check = 0
@@ -2745,6 +2834,17 @@ class PhoenixDaemon:
                     self.service_guardian._cleanup_duplicate_pm2_daemons()
                     self.service_guardian.check_all_services_v2()
                     last_service_check = now
+
+                # RTSP-freeze prevention (every 5 min): ensure monitors carry a
+                # read timeout so ffmpeg7 reconnects instead of freezing on the
+                # last frame (same-video bug), + restart camera if streams froze.
+                if now - last_rtsp_heal >= 300:
+                    try:
+                        self.service_guardian.ensure_rtsp_timeout()
+                        self.service_guardian.check_frozen_streams()
+                    except Exception:
+                        pass
+                    last_rtsp_heal = now
 
                 # Connectivity check (every minute)
                 if now - last_connectivity_check >= CONNECTIVITY_CHECK_INTERVAL:
