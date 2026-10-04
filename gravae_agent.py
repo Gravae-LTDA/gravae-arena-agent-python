@@ -5781,19 +5781,11 @@ def _get_shinobi_ffmpeg_binary():
     return '/usr/bin/ffmpeg'
 
 
-def _get_ffmpeg_timeout_flag():
-    """Detect the correct RTSP timeout flag for the FFmpeg Shinobi runs.
-    - FFmpeg < 5: -stimeout (microseconds)
-    - FFmpeg >= 5: -timeout (microseconds), -stimeout was removed in 5.0
-
-    Using the wrong one is fatal, in both directions: -stimeout on >= 5 gives
-    "Unrecognized option 'stimeout'", and -timeout on 4.x makes the RTSP demuxer
-    listen instead of connect ("Unable to open RTSP for listening"). Either way
-    ffmpeg never starts and the monitors go to Died.
+def _get_shinobi_ffmpeg_major():
+    """Major version of the ffmpeg Shinobi runs, or None if it can't be read.
 
     Retries up to 3 times to handle slow boot.
     """
-    import re
     binary = _get_shinobi_ffmpeg_binary()
     for attempt in range(3):
         try:
@@ -5805,16 +5797,31 @@ def _get_ffmpeg_timeout_flag():
             match = re.search(r'version\s+(\d+)\.', first_line)
             if match:
                 major = int(match.group(1))
-                flag = '-timeout' if major >= 5 else '-stimeout'
-                print(f"[Shinobi] FFmpeg {major}.x detected at {binary}, using {flag}")
-                return flag
-            else:
-                print(f"[Shinobi] Could not parse ffmpeg version: {first_line[:80]}")
+                print(f"[Shinobi] FFmpeg {major}.x detected at {binary}")
+                return major
+            print(f"[Shinobi] Could not parse ffmpeg version: {first_line[:80]}")
         except Exception as e:
             print(f"[Shinobi] ffmpeg version check attempt {attempt+1} failed: {e}")
         if attempt < 2:
-            import time
             time.sleep(5)
+    return None
+
+
+def _get_ffmpeg_timeout_flag():
+    """Detect the correct RTSP timeout flag for the FFmpeg Shinobi runs.
+    - FFmpeg < 5: -stimeout (microseconds)
+    - FFmpeg >= 5: -timeout (microseconds), -stimeout was removed in 5.0
+
+    Using the wrong one is fatal, in both directions: -stimeout on >= 5 gives
+    "Unrecognized option 'stimeout'", and -timeout on 4.x makes the RTSP demuxer
+    listen instead of connect ("Unable to open RTSP for listening"). Either way
+    ffmpeg never starts and the monitors go to Died.
+    """
+    major = _get_shinobi_ffmpeg_major()
+    if major is not None:
+        flag = '-timeout' if major >= 5 else '-stimeout'
+        print(f"[Shinobi] Using {flag} for FFmpeg {major}.x")
+        return flag
     # Default to -stimeout (safe for Bullseye which is ~70% of devices)
     print("[Shinobi] ffmpeg version detection failed, defaulting to -stimeout")
     return '-stimeout'
@@ -6073,6 +6080,105 @@ def _fix_shinobi_monitors_stimeout():
             print(f"[Shinobi] Failed to update monitors: {result.stderr}")
     except Exception as e:
         print(f"[Shinobi] timeout fix error: {e}")
+
+
+# Shinobi recente monta o corte SIP com `-c:a ${audioCodec}` (o codec do buffer).
+# Com o buffer em ac3 -- que e o que faz o corte mapear o audio (-map 0:1) -- o mp4
+# final sai com audio AC3, que navegador/celular nao tocam: o video chega no app mas
+# "nao abre/corrompido". Versoes antigas faziam `-c:a aac` fixo.
+_CUT_AUDIO_CODEC_RE = re.compile(r'`-c:a \$\{audioCodec\}`')
+_CUT_AUDIO_PROBE = '5000000'
+
+
+def _patch_cut_audio_aac(src):
+    """Return utils.js source with the SIP cut forced to AAC audio, or None if
+    there is nothing to patch (already patched or older Shinobi)."""
+    if not _CUT_AUDIO_CODEC_RE.search(src):
+        return None
+    return _CUT_AUDIO_CODEC_RE.sub('`-c:a aac`', src)
+
+
+def ensure_shinobi_cut_audio_aac():
+    """Keep button clips with playable AAC audio (Vitor quer o audio, nao desligar).
+
+    1) Any ffmpeg: patch libs/events/utils.js so the SIP cut re-encodes audio to
+       AAC instead of copying the buffer codec (AC3 in mp4 doesn't play in the app).
+       Validated AA Bahia (ffmpeg 4.3), Pio X (4.3), Super Padel (7.1).
+    2) FFmpeg >= 7: monitors with an ac3 buffer also need event_record_probesize /
+       event_record_aduration = 5000000. The cut runs with Shinobi's defaults
+       (probesize 32, analyzeduration 1000) and ffmpeg 7 can't read the ac3 track
+       params that fast -> "aac encoder ... -22" -> 0-byte mp4 (CTF Marcelinho,
+       Padel Paradise). The buffer stays ac3 on purpose: with an aac buffer Shinobi
+       drops `-map 0:1` and the clip comes out mute.
+
+    Idempotent; restarts Shinobi only when something changed. Runs on every agent
+    start so it re-applies after a Shinobi update overwrites utils.js.
+    """
+    time.sleep(38)  # settle after boot; runs after the other Shinobi self-heals
+    changed = False
+
+    try:
+        shinobi_dir = _find_shinobi_dir()
+        utils_path = os.path.join(shinobi_dir, 'libs', 'events', 'utils.js')
+        if os.path.exists(utils_path):
+            with open(utils_path, 'r') as f:
+                src = f.read()
+            patched = _patch_cut_audio_aac(src)
+            if patched is not None:
+                bak = utils_path + '.bak-audioaac'
+                if not os.path.exists(bak):
+                    try:
+                        with open(bak, 'w') as f:
+                            f.write(src)
+                    except Exception:
+                        pass
+                with open(utils_path, 'w') as f:
+                    f.write(patched)
+                changed = True
+                print("[Shinobi] Patched SIP cut audio in events/utils.js -> AAC (was buffer codec/AC3)")
+    except Exception as e:
+        print(f"[Shinobi] cut audio aac patch failed: {e}")
+
+    group_key = CONFIG.get('shinobiGroupKey')
+    major = _get_shinobi_ffmpeg_major()
+    if group_key and major is not None and major >= 7:
+        try:
+            db_config = get_shinobi_db_config()
+            if db_config:
+                db_name = db_config.get('database', 'ccio')
+                env = os.environ.copy()
+                if db_config.get('password'):
+                    env['MYSQL_PWD'] = db_config['password']
+                where = (
+                    f"WHERE ke='{group_key}' "
+                    f"AND JSON_UNQUOTE(JSON_EXTRACT(details, '$.detector_buffer_acodec')) = 'ac3' "
+                    f"AND (COALESCE(JSON_UNQUOTE(JSON_EXTRACT(details, '$.event_record_probesize')), '') <> '{_CUT_AUDIO_PROBE}' "
+                    f"OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(details, '$.event_record_aduration')), '') <> '{_CUT_AUDIO_PROBE}')"
+                )
+                check = subprocess.run(
+                    ['sudo', 'mysql', '-N', db_name, '-e', f"SELECT COUNT(*) FROM Monitors {where};"],
+                    capture_output=True, text=True, env=env, timeout=10
+                )
+                count = int(check.stdout.strip()) if check.returncode == 0 and check.stdout.strip() else 0
+                if count:
+                    result = subprocess.run(
+                        ['sudo', 'mysql', db_name, '-e',
+                         f"UPDATE Monitors SET details = JSON_SET(details, "
+                         f"'$.event_record_probesize', '{_CUT_AUDIO_PROBE}', "
+                         f"'$.event_record_aduration', '{_CUT_AUDIO_PROBE}') {where};"],
+                        capture_output=True, text=True, env=env, timeout=10
+                    )
+                    if result.returncode == 0:
+                        changed = True
+                        print(f"[Shinobi] FFmpeg {major}.x: set event_record_probesize/aduration="
+                              f"{_CUT_AUDIO_PROBE} on {count} ac3-buffer monitor(s)")
+                    else:
+                        print(f"[Shinobi] Failed to set cut probesize: {result.stderr}")
+        except Exception as e:
+            print(f"[Shinobi] cut probesize fix error: {e}")
+
+    if changed:
+        _restart_shinobi()
 
 
 def ensure_shinobi_detector_use_motion_off():
@@ -6346,6 +6452,11 @@ def run_startup_repairs():
     # toa e estoura a CPU durante os jogos. Forca '0' nos monitores existentes.
     # Idempotent: no-op se ja desligado; nao afeta a gravacao por botao.
     threading.Thread(target=ensure_shinobi_detector_use_motion_off, daemon=True).start()
+
+    # Audio do corte SIP sempre em AAC (AC3 no mp4 nao toca no app) e, no ffmpeg 7+,
+    # probesize maior nos monitores com buffer ac3 (senao o corte sai 0 byte).
+    # Idempotent: reaplica o patch se um update do Shinobi sobrescrever o utils.js.
+    threading.Thread(target=ensure_shinobi_cut_audio_aac, daemon=True).start()
 
     # Desliga detector_send_frames onde NAO ha deteccao de movimento/objeto: o Shinobi
     # decode 1080p em software (CPU/calor) sem afetar gravacao por botao. Condicional

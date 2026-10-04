@@ -33,6 +33,7 @@ class ControlledStartup(unittest.TestCase):
         targets = [c.kwargs['target'] for c in self.scope['threading'].Thread.call_args_list]
         self.assertIn(self.scope['_fix_shinobi_monitors_stimeout'], targets)
         self.assertIn(self.scope['ensure_shinobi_probe_disabled'], targets)
+        self.assertIn(self.scope['ensure_shinobi_cut_audio_aac'], targets)
 
 if __name__ == '__main__':
     unittest.main()
