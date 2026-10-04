@@ -405,13 +405,35 @@ class ServiceGuardian:
                 pass
         return None
 
+    def _shinobi_ffmpeg_binary(self):
+        """The ffmpeg Shinobi actually runs.
+
+        conf.json `ffmpegDir` may point to a bundled static build (e.g. 4.2.1 on a
+        Debian 12/13 host whose system ffmpeg is 5.x/7.x). Reading /usr/bin/ffmpeg
+        there picks the wrong timeout flag and every monitor goes to Died.
+        Mirrors gravae_agent._get_shinobi_ffmpeg_binary."""
+        for p in ("/home/Shinobi/conf.json", "/opt/shinobi/conf.json"):
+            try:
+                with open(p) as f:
+                    d = (json.load(f).get("ffmpegDir") or "").strip()
+            except Exception:
+                continue
+            if d:
+                cand = os.path.join(d, "ffmpeg") if os.path.isdir(d) else d
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    return cand
+            break
+        return "ffmpeg"
+
     def _ffmpeg_major(self):
+        """Major version of Shinobi's ffmpeg, or None when it can't be read."""
         try:
-            out = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=8).stdout
-            m = re.search(r"ffmpeg version (\d+)", out)
-            return int(m.group(1)) if m else 4
+            out = subprocess.run([self._shinobi_ffmpeg_binary(), "-version"],
+                                 capture_output=True, text=True, timeout=8).stdout
+            m = re.search(r"ffmpeg version n?(\d+)\.", out)
+            return int(m.group(1)) if m else None
         except Exception:
-            return 4
+            return None
 
     def ensure_rtsp_timeout(self):
         """Add an RTSP read timeout to monitors that lack one.
@@ -424,16 +446,25 @@ class ServiceGuardian:
         base = self._shinobi_db_base()
         if not base:
             return 0
-        flag = "-timeout" if self._ffmpeg_major() >= 5 else "-stimeout"
+        major = self._ffmpeg_major()
+        if major is None:
+            # Guessing is worse than doing nothing: the wrong flag kills every
+            # monitor (Died) on the next restart.
+            log.warning("[rtsp-timeout] ffmpeg version unreadable; skipping")
+            return 0
+        flag = "-timeout" if major >= 5 else "-stimeout"
         val = flag + " 10000000"
         try:
             rows = subprocess.run(
                 base + ["-e", "SELECT mid, COALESCE(JSON_UNQUOTE(JSON_EXTRACT(details,'$.cust_input')),'') FROM Monitors WHERE mode='start';"],
-                capture_output=True, text=True, timeout=12).stdout.strip()
+                capture_output=True, text=True, timeout=12).stdout
+            # rstrip só da quebra de linha: .strip() comia o TAB final da última
+            # linha quando o cust_input estava vazio (o caso que mais precisa) e
+            # o monitor era pulado por len(parts) < 2.
         except Exception:
             return 0
         changed = 0
-        for line in rows.splitlines():
+        for line in rows.rstrip("\n").splitlines():
             parts = line.split("\t")
             if len(parts) < 2:
                 continue
