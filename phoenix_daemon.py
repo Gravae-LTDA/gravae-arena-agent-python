@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.17.1"
+VERSION = "1.17.2"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -1522,6 +1522,11 @@ class ConnectivitySentinel:
     def __init__(self):
         self.is_online = True
         self.offline_since = None
+        # Relógio monotônico: o de parede PULA dias numa Pi sem bateria no RTC
+        # quando o NTP acerta a hora (às vezes por IPv6, com o IPv4 fora). Medir
+        # com datetime.now() fazia o tempo offline saltar de 0 pra "236h" logo
+        # no boot e o escalonamento ir direto pro reboot (Glory Soccer, 30/09).
+        self._offline_since_mono = None
         self.last_successful_ping = datetime.now()
         self.escalation_level = 0  # 0=none, 1=cloudflared, 2=networking, 3=dhcp_fallback, 4=reboot
         self.actions_taken = []
@@ -1615,8 +1620,8 @@ class ConnectivitySentinel:
         return False
 
     def get_offline_minutes(self):
-        if self.offline_since:
-            return (datetime.now() - self.offline_since).total_seconds() / 60
+        if self._offline_since_mono is not None:
+            return (time.monotonic() - self._offline_since_mono) / 60
         return 0
 
     def restart_cloudflared(self):
@@ -1641,6 +1646,10 @@ class ConnectivitySentinel:
             # Try different methods
             subprocess.run(["systemctl", "restart", "networking"], capture_output=True, timeout=30)
             subprocess.run(["systemctl", "restart", "dhcpcd"], capture_output=True, timeout=30)
+            # Bookworm/Trixie: quem gerencia é o NetworkManager — os dois acima
+            # nem existem. Reativar a conexão da interface força um DHCP novo
+            # (lease perdido com o IPv6 ainda de pé era o caso da Glory Soccer).
+            self._reactivate_networkmanager()
 
             self.actions_taken.append(("restart_networking", datetime.now().isoformat()))
             alerts.add(
@@ -1652,6 +1661,29 @@ class ConnectivitySentinel:
             return True
         except Exception as e:
             log.error(f"Failed to restart networking: {e}")
+            return False
+
+    def _reactivate_networkmanager(self):
+        """Reativa a conexão do NetworkManager na interface principal (pede DHCP de novo).
+
+        Não muda configuração nenhuma — só `nmcli connection up` na conexão ativa
+        da interface. No-op se o NetworkManager não estiver rodando.
+        """
+        try:
+            if subprocess.run(["systemctl", "is-active", "--quiet", "NetworkManager"], timeout=10).returncode != 0:
+                return False
+            iface = self._get_primary_interface() or "eth0"
+            r = subprocess.run(["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", iface],
+                               capture_output=True, text=True, timeout=10)
+            conn = (r.stdout or "").strip()
+            if not conn:
+                subprocess.run(["nmcli", "device", "connect", iface], capture_output=True, timeout=45)
+            else:
+                subprocess.run(["nmcli", "connection", "up", conn], capture_output=True, timeout=45)
+            log.info(f"Escalation: NetworkManager reativado em {iface} ({conn or 'device connect'})")
+            return True
+        except Exception as e:
+            log.error(f"Falha ao reativar NetworkManager: {e}")
             return False
 
     def _get_primary_interface(self):
@@ -2194,6 +2226,7 @@ class ConnectivitySentinel:
 
             # Reset state
             self.offline_since = None
+            self._offline_since_mono = None
             self.last_successful_ping = datetime.now()
             self.escalation_level = 0
             self.actions_taken = []
@@ -2203,29 +2236,35 @@ class ConnectivitySentinel:
         # We're offline
         if was_online:
             self.offline_since = datetime.now()
+            self._offline_since_mono = time.monotonic()
             log.warning("Connectivity lost")
             alerts.add("connectivity_lost", "warning", "Internet connectivity lost")
 
         offline_minutes = self.get_offline_minutes()
 
         # Escalation: cloudflared(30m) → networking(60m) → DHCP fallback(120m) → reboot(240m)
-        if offline_minutes >= ESCALATION_REBOOT and self.escalation_level < 4:
-            # Level 4: Reboot after 4 hours offline (with safety checks)
-            self.escalation_level = 4
-            self.reboot_system()
+        # UM degrau por ciclo, em ordem: mesmo que o tempo offline já passe de
+        # 4h, reiniciar a rede vem antes do reboot (era o que teria resolvido a
+        # Glory Soccer — lease DHCP perdido). E o reboot só conta como feito se
+        # aconteceu: bloqueado (uptime < 5 min, teto diário) o nível fica em 3 e
+        # o próximo ciclo tenta de novo — antes ficava preso em 4 pra sempre.
+        if self.escalation_level < 1 and offline_minutes >= ESCALATION_RESTART_CLOUDFLARED:
+            self.escalation_level = 1
+            self.restart_cloudflared()
 
-        elif offline_minutes >= ESCALATION_DHCP_FALLBACK and self.escalation_level < 3:
+        elif self.escalation_level < 2 and offline_minutes >= ESCALATION_RESTART_NETWORKING:
+            self.escalation_level = 2
+            self.restart_networking()
+
+        elif self.escalation_level < 3 and offline_minutes >= ESCALATION_DHCP_FALLBACK:
             # Level 3: Try DHCP fallback after 2 hours (only for static IP interfaces)
             self.escalation_level = 3
             self.try_dhcp_fallback()
 
-        elif offline_minutes >= ESCALATION_RESTART_NETWORKING and self.escalation_level < 2:
-            self.escalation_level = 2
-            self.restart_networking()
-
-        elif offline_minutes >= ESCALATION_RESTART_CLOUDFLARED and self.escalation_level < 1:
-            self.escalation_level = 1
-            self.restart_cloudflared()
+        elif self.escalation_level < 4 and offline_minutes >= ESCALATION_REBOOT:
+            # Level 4: Reboot after 4 hours offline (with safety checks)
+            if self.reboot_system():
+                self.escalation_level = 4
 
         # After Level 4 (reboot attempted), log periodically
         if offline_minutes >= ESCALATION_REBOOT and self.escalation_level >= 4:
