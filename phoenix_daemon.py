@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.17.2"
+VERSION = "1.17.3"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -94,6 +94,36 @@ SERVICES = {
     "shinobi": {"critical": True, "port": 8080, "pm2": True, "pm2_names": ["camera", "cron"]},  # Shinobi via pm2
     "mariadb": {"critical": True, "port": 3306},  # MariaDB database server
 }
+
+# Conexão DIRECT (instalação pelo OPS sem PiTunnel/Cloudflare): o canal da Pi
+# é a VPN WireGuard (wg-quick@wg0), não existe cloudflared. Vigiar cloudflared
+# aqui geraria "Service cloudflared is down" eterno, restart de serviço que não
+# existe e setup "incompleto" (watchdog desligado).
+WG_UNIT = "wg-quick@wg0"
+WG_CONF = Path("/etc/wireguard/wg0.conf")
+
+
+def is_direct_connection():
+    """device.json marca connectionMode=DIRECT; sem a marca, wg0 sem cloudflared instalado."""
+    try:
+        if json.loads(Path("/etc/gravae/device.json").read_text()).get("connectionMode") == "DIRECT":
+            return True
+    except Exception:
+        pass
+    try:
+        if not WG_CONF.exists():
+            return False
+        units = subprocess.run(["systemctl", "list-unit-files", "cloudflared.service"],
+                               capture_output=True, text=True, timeout=10).stdout
+        return "cloudflared.service" not in units
+    except Exception:
+        return False
+
+
+DIRECT_CONNECTION = is_direct_connection()
+if DIRECT_CONNECTION:
+    SERVICES.pop("cloudflared", None)
+    SERVICES[WG_UNIT] = {"critical": True, "port": None}
 
 # Webhook configuration
 WEBHOOK_SECRET = "b36d1655-99ea-45b1-a627-984eb7e376a9"
@@ -1625,14 +1655,16 @@ class ConnectivitySentinel:
         return 0
 
     def restart_cloudflared(self):
-        log.info("Escalation: Restarting cloudflared")
+        # DIRECT: o primeiro degrau é reabrir a VPN (mesmo papel do túnel).
+        unit = WG_UNIT if DIRECT_CONNECTION else "cloudflared"
+        log.info(f"Escalation: Restarting {unit}")
         try:
-            subprocess.run(["systemctl", "restart", "cloudflared"], timeout=30)
+            subprocess.run(["systemctl", "restart", unit], timeout=30)
             self.actions_taken.append(("restart_cloudflared", datetime.now().isoformat()))
             alerts.add(
                 "connectivity_action",
                 "warning",
-                "Restarted cloudflared due to connectivity issues",
+                f"Restarted {unit} due to connectivity issues",
                 {"offline_minutes": self.get_offline_minutes()}
             )
             return True
@@ -2586,6 +2618,7 @@ class WebhookSender:
     SERVICE_NAME_MAP = {
         "gravae-agent": "agent",
         "cloudflared": "cloudflared",
+        WG_UNIT: "vpn",
         "gravae-buttons": "button_daemon",
         "shinobi": "shinobi",
         "mariadb": "shinobi",  # MariaDB down = Shinobi problem
@@ -2612,6 +2645,8 @@ class WebhookSender:
             what = alert_type
         else:
             event_type, what = mapped
+        if DIRECT_CONNECTION and what == "cloudflared":
+            what = "vpn"
 
         # Extract 'what' from message (service name) or details
         details = alert.get("details") or {}
@@ -2819,6 +2854,12 @@ class PhoenixDaemon:
         Without cloudflared configured, the watchdog would cause boot loops
         since Phoenix can't maintain connectivity checks."""
         try:
+            if DIRECT_CONNECTION:
+                # DIRECT: completo = device.json + wg0 configurado pela instalação.
+                if CONFIG_PATH.exists() and WG_CONF.exists():
+                    return True
+                log.warning("Setup incomplete: DIRECT without device.json or wg0.conf")
+                return False
             # Check if cloudflared is actively running (strongest signal)
             try:
                 result = subprocess.run(
