@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "4.1.0"
+VERSION = "4.1.1"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -4398,7 +4398,9 @@ def get_phoenix_status():
             with open(speed_file) as f:
                 speed_data = json.load(f)
             status["resources"]["download_speed_mbps"] = speed_data.get("speed_mbps")
+            status["resources"]["upload_speed_mbps"] = speed_data.get("upload_mbps")
             status["resources"]["slow_internet"] = speed_data.get("slow", False)
+            status["resources"]["very_slow"] = speed_data.get("very_slow", False)
     except:
         pass
 
