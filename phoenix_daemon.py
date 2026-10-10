@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.17.3"
+VERSION = "1.17.4"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -143,6 +143,18 @@ DISK_CRITICAL = 95
 MEMORY_WARNING = 85
 MEMORY_CRITICAL = 95
 VOLTAGE_LOW = 4.63  # Volts - RPi hardware undervoltage threshold (firmware-defined)
+
+# Internet: o que importa pra nós é o UPLOAD (live + clipes sobem da Pi).
+# Mali (10/10/2026): o teste era só de download e nem rodava no Debian 13
+# (speedtest-cli ausente, pip bloqueado pela PEP 668) → nunca alertava.
+DOWNLOAD_SLOW_MBPS = 30.0
+DOWNLOAD_VERY_SLOW_MBPS = 10.0
+UPLOAD_SLOW_MBPS = 10.0
+UPLOAD_VERY_SLOW_MBPS = 5.0
+SPEED_TEST_FILE = "/tmp/gravae_speed_test.json"
+CF_SPEED_DOWN_URL = "https://speed.cloudflare.com/__down?bytes=25000000"
+CF_SPEED_UP_URL = "https://speed.cloudflare.com/__up"
+CF_SPEED_UP_BYTES = 10_000_000
 
 # === Logging Setup ===
 def setup_logging():
@@ -2312,6 +2324,35 @@ class ConnectivitySentinel:
 # DHCP fallback ADDED in v1.11.0 with safety: backup+restore, kill switch, 1 attempt per cycle.
 # Reboot RE-ADDED in v1.10.0 with safety: 4h threshold, 3/day limit, 5min uptime guard.
 
+
+def parse_speedtest_simple(stdout):
+    """Lê a saída de `speedtest-cli --simple` → (download, upload) em Mbps (None se faltar)."""
+    vals = {}
+    for line in (stdout or '').splitlines():
+        m = re.match(r'^(Download|Upload):\s+([\d.]+)\s+Mbit/s', line.strip())
+        if m:
+            vals[m.group(1)] = round(float(m.group(2)), 1)
+    return vals.get('Download'), vals.get('Upload')
+
+
+def classify_speed(download_mbps, upload_mbps):
+    """(slow, very_slow, motivo). Upload baixo pesa tanto quanto download baixo."""
+    very = []
+    slow = []
+    if download_mbps is not None:
+        if download_mbps < DOWNLOAD_VERY_SLOW_MBPS:
+            very.append(f"download {download_mbps} Mbps")
+        elif download_mbps < DOWNLOAD_SLOW_MBPS:
+            slow.append(f"download {download_mbps} Mbps")
+    if upload_mbps is not None:
+        if upload_mbps < UPLOAD_VERY_SLOW_MBPS:
+            very.append(f"upload {upload_mbps} Mbps")
+        elif upload_mbps < UPLOAD_SLOW_MBPS:
+            slow.append(f"upload {upload_mbps} Mbps")
+    very_slow = bool(very)
+    return (very_slow or bool(slow)), very_slow, ', '.join(very + slow)
+
+
 # === Resource Monitor ===
 class ResourceMonitor:
     def __init__(self):
@@ -2319,8 +2360,10 @@ class ResourceMonitor:
         self.last_voltage_check = 0  # Timestamp for daily voltage check
         self.last_speed_test = 0  # Timestamp for speed test
         self.download_speed_mbps = None  # Last measured download speed
-        self.slow_internet = False  # True if < 30 Mbps
-        self.very_slow_internet = False  # True if < 10 Mbps
+        self.upload_speed_mbps = None  # Last measured upload speed
+        self.slow_internet = False  # download < 30 ou upload < 10 Mbps
+        self.very_slow_internet = False  # download < 10 ou upload < 5 Mbps
+        self.speedtest_install_tried = False  # apt-get install só uma vez por processo
 
     def get_throttled(self):
         """Check Raspberry Pi throttling/voltage status via vcgencmd.
@@ -2394,58 +2437,81 @@ class ResourceMonitor:
         except:
             return None
 
-    def check_speed(self):
-        """Speed test via speedtest-cli (accurate, multi-connection)."""
-        mbps = None
-
-        # Try speedtest-cli first (most accurate)
+    def _speedtest_cli(self):
+        """speedtest-cli (download + upload). Instala via apt uma vez se faltar."""
+        cmd = ['speedtest-cli', '--simple', '--secure']
         try:
-            result = subprocess.run(
-                ['speedtest-cli', '--simple', '--no-upload', '--secure'],
-                capture_output=True, text=True, timeout=120
-            )
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
-                    if line.startswith('Download:'):
-                        mbps = round(float(line.split()[1]), 1)
-                        break
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         except FileNotFoundError:
-            # Install speedtest-cli if not available
+            if self.speedtest_install_tried:
+                return None, None
+            self.speedtest_install_tried = True
+            # Debian 13 recusa `pip3 install` (PEP 668); o pacote do apt existe.
             try:
-                subprocess.run(['pip3', 'install', 'speedtest-cli'], capture_output=True, timeout=30)
-                result = subprocess.run(
-                    ['speedtest-cli', '--simple', '--no-upload', '--secure'],
-                    capture_output=True, text=True, timeout=120
-                )
-                if result.returncode == 0:
-                    for line in result.stdout.strip().split('\n'):
-                        if line.startswith('Download:'):
-                            mbps = round(float(line.split()[1]), 1)
-                            break
-            except:
-                log.debug("Failed to install speedtest-cli")
+                subprocess.run(['apt-get', 'install', '-y', '-q', 'speedtest-cli'],
+                               capture_output=True, timeout=300,
+                               env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'})
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            except Exception as e:
+                log.debug(f"speedtest-cli install failed: {e}")
+                return None, None
         except Exception as e:
             log.debug(f"speedtest-cli failed: {e}")
+            return None, None
+        if result.returncode != 0:
+            log.debug(f"speedtest-cli rc={result.returncode}: {result.stderr.strip()[:200]}")
+            return None, None
+        return parse_speedtest_simple(result.stdout)
 
-        if mbps is not None:
-            self.download_speed_mbps = mbps
+    def _speedtest_cloudflare(self):
+        """Fallback sem dependência: curl contra speed.cloudflare.com."""
+        down = up = None
+        try:
+            r = subprocess.run(['curl', '-s', '-o', '/dev/null', '-m', '40', '-w', '%{speed_download}',
+                                CF_SPEED_DOWN_URL], capture_output=True, text=True, timeout=50)
+            if r.returncode == 0 and r.stdout.strip():
+                down = round(float(r.stdout) * 8 / 1e6, 1)
+        except Exception as e:
+            log.debug(f"cloudflare download test failed: {e}")
+        try:
+            r = subprocess.run(['curl', '-s', '-o', '/dev/null', '-m', '60', '-w', '%{speed_upload}',
+                                '--data-binary', '@-', CF_SPEED_UP_URL],
+                               input=os.urandom(CF_SPEED_UP_BYTES), capture_output=True, timeout=70)
+            out = r.stdout.decode().strip()
+            if r.returncode == 0 and out:
+                up = round(float(out) * 8 / 1e6, 1)
+        except Exception as e:
+            log.debug(f"cloudflare upload test failed: {e}")
+        return down, up
+
+    def check_speed(self):
+        """Download e upload. speedtest-cli primeiro; Cloudflare via curl se falhar."""
+        down, up = self._speedtest_cli()
+        if down is None and up is None:
+            down, up = self._speedtest_cloudflare()
+
+        if down is not None or up is not None:
+            self.download_speed_mbps = down
+            self.upload_speed_mbps = up
             was_slow = self.slow_internet
             was_very_slow = self.very_slow_internet
-            self.slow_internet = mbps < 30.0
-            self.very_slow_internet = mbps < 10.0
+            self.slow_internet, self.very_slow_internet, motivo = classify_speed(down, up)
+            data = {"speed_mbps": down, "upload_mbps": up}
             if self.very_slow_internet and not was_very_slow:
-                alerts.add("very_slow_internet", "critical", f"Internet muito lenta: {mbps} Mbps", {"speed_mbps": mbps})
-            elif self.slow_internet and not was_slow:
-                alerts.add("slow_internet", "warning", f"Internet lenta: {mbps} Mbps", {"speed_mbps": mbps})
+                alerts.add("very_slow_internet", "critical", f"Internet muito lenta: {motivo}", data)
+            elif self.slow_internet and not was_slow and not self.very_slow_internet:
+                alerts.add("slow_internet", "warning", f"Internet lenta: {motivo}", data)
             elif not self.slow_internet and was_slow:
-                alerts.add("internet_recovered", "info", f"Internet normalizada: {mbps} Mbps", {"speed_mbps": mbps})
+                alerts.add("internet_recovered", "info",
+                           f"Internet normalizada: download {down} / upload {up} Mbps", data)
             label = '(muito lenta!)' if self.very_slow_internet else '(lenta)' if self.slow_internet else '(ok)'
-            log.info(f"Speed test: {mbps} Mbps {label}")
+            log.info(f"Speed test: download {down} / upload {up} Mbps {label}")
             try:
                 import json as _json
-                with open('/tmp/gravae_speed_test.json', 'w') as _f:
-                    _json.dump({"speed_mbps": mbps, "slow": self.slow_internet, "very_slow": self.very_slow_internet, "timestamp": time.time()}, _f)
-            except:
+                with open(SPEED_TEST_FILE, 'w') as _f:
+                    _json.dump({"speed_mbps": down, "upload_mbps": up, "slow": self.slow_internet,
+                                "very_slow": self.very_slow_internet, "timestamp": time.time()}, _f)
+            except Exception:
                 pass
         else:
             log.warning("Speed test failed")
@@ -2889,6 +2955,12 @@ class PhoenixDaemon:
             log.warning(f"Setup check failed: {e}")
             return False
 
+    def _run_speed_test(self):
+        try:
+            self.resources.check_speed()
+        except Exception as e:
+            log.debug(f"Speed test error: {e}")
+
     def run(self):
         log.info(f"Phoenix Daemon v{VERSION} starting")
 
@@ -2932,6 +3004,7 @@ class PhoenixDaemon:
         last_voltage_check = 0
         last_speed_test = 0
         SPEED_TEST_INTERVAL = 4 * 60 * 60  # 4 hours
+        speed_thread = None
         SHINOBI_EPIPE_CHECK_INTERVAL = 120  # 2 minutes
         PRESS_AUDIT_INTERVAL = 300  # 5 minutes
 
@@ -3007,11 +3080,12 @@ class PhoenixDaemon:
                     last_resource_check = now
 
                 # Speed test (every 4 hours, only when online)
+                # Em thread: com upload + instalação via apt o teste pode levar
+                # minutos e não pode segurar o loop (conectividade, serviços).
                 if now - last_speed_test >= SPEED_TEST_INTERVAL and self.connectivity.is_online:
-                    try:
-                        self.resources.check_speed()
-                    except Exception as e:
-                        log.debug(f"Speed test error: {e}")
+                    if speed_thread is None or not speed_thread.is_alive():
+                        speed_thread = threading.Thread(target=self._run_speed_test, name="speed-test", daemon=True)
+                        speed_thread.start()
                     last_speed_test = now
 
                 # Daily undervoltage check (every 24 hours)
