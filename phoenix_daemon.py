@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.17.5"
+VERSION = "1.17.6"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -124,6 +124,20 @@ DIRECT_CONNECTION = is_direct_connection()
 if DIRECT_CONNECTION:
     SERVICES.pop("cloudflared", None)
     SERVICES[WG_UNIT] = {"critical": True, "port": None}
+
+
+def has_alarm_input():
+    """Arena de alarm input: o aperto chega pela câmera (FTP), não existe gravae-buttons.
+    Vigiá-lo gerava "Service gravae-buttons found down on startup" crítico a cada
+    partida do phoenix (FitSoccer, 30/10/2026). A marca vem do device.json."""
+    try:
+        return json.loads(Path("/etc/gravae/device.json").read_text()).get("hasAlarmInput") is True
+    except Exception:
+        return False
+
+
+if has_alarm_input():
+    SERVICES.pop("gravae-buttons", None)
 
 # Webhook configuration
 WEBHOOK_SECRET = "b36d1655-99ea-45b1-a627-984eb7e376a9"
