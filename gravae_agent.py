@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "4.1.2"
+VERSION = "4.1.3"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -5185,6 +5185,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                 save_config()
                 print(f"[Shinobi Setup] Saved credentials to config: apiKey={result['apiKey'][:8]}..., groupKey={result['groupKey']}")
             if result.get('success') and data.get('hasAlarmInput'):
+                # Persistir: o phoenix lê do device.json pra não vigiar gravae-buttons
+                CONFIG['hasAlarmInput'] = True
+                save_config()
                 print("[Shinobi Setup] hasAlarmInput=True, starting FTP events setup in background...")
                 setup_ftp_events_async()
                 result['ftpInstalling'] = True
@@ -5200,6 +5203,8 @@ class AgentHandler(BaseHTTPRequestHandler):
         elif path == '/shinobi/ftp-setup':
             # Trigger FTP events setup (for alarm input cameras)
             # Can be called directly for retry if the initial setup failed
+            CONFIG['hasAlarmInput'] = True
+            save_config()
             setup_ftp_events_async()
             self._send_json({"success": True, "message": "FTP setup started in background"})
 
