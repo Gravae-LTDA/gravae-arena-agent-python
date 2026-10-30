@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.17.4"
+VERSION = "1.17.5"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -2335,6 +2335,18 @@ def parse_speedtest_simple(stdout):
     return vals.get('Download'), vals.get('Upload')
 
 
+def curl_speed_mbps(returncode, out):
+    """%{speed_*} do curl (B/s) → Mbps. Timeout (rc 28) com bytes transferidos ainda é
+    medição válida — é justamente o link lento que estoura o -m. Qualquer outro erro → None."""
+    out = (out or '').strip()
+    if not out:
+        return None
+    bps = float(out)
+    if returncode == 0 or (returncode == 28 and bps > 0):
+        return round(bps * 8 / 1e6, 1)
+    return None
+
+
 def classify_speed(download_mbps, upload_mbps):
     """(slow, very_slow, motivo). Upload baixo pesa tanto quanto download baixo."""
     very = []
@@ -2464,31 +2476,34 @@ class ResourceMonitor:
         return parse_speedtest_simple(result.stdout)
 
     def _speedtest_cloudflare(self):
-        """Fallback sem dependência: curl contra speed.cloudflare.com."""
+        """curl contra speed.cloudflare.com — mesmo caminho do túnel e dos clipes."""
         down = up = None
         try:
             r = subprocess.run(['curl', '-s', '-o', '/dev/null', '-m', '40', '-w', '%{speed_download}',
                                 CF_SPEED_DOWN_URL], capture_output=True, text=True, timeout=50)
-            if r.returncode == 0 and r.stdout.strip():
-                down = round(float(r.stdout) * 8 / 1e6, 1)
+            down = curl_speed_mbps(r.returncode, r.stdout)
         except Exception as e:
             log.debug(f"cloudflare download test failed: {e}")
         try:
             r = subprocess.run(['curl', '-s', '-o', '/dev/null', '-m', '60', '-w', '%{speed_upload}',
                                 '--data-binary', '@-', CF_SPEED_UP_URL],
                                input=os.urandom(CF_SPEED_UP_BYTES), capture_output=True, timeout=70)
-            out = r.stdout.decode().strip()
-            if r.returncode == 0 and out:
-                up = round(float(out) * 8 / 1e6, 1)
+            up = curl_speed_mbps(r.returncode, r.stdout.decode())
         except Exception as e:
             log.debug(f"cloudflare upload test failed: {e}")
         return down, up
 
     def check_speed(self):
-        """Download e upload. speedtest-cli primeiro; Cloudflare via curl se falhar."""
-        down, up = self._speedtest_cli()
+        """Download e upload. Cloudflare via curl primeiro; speedtest-cli só se o Cloudflare não medir.
+
+        FitSoccer (30/10/2026): o speedtest-cli 2.1.3 não consegue mais a lista de
+        servidores, cai num servidor a 2.400 km (Fremont, CA) e devolve 1,9/2,7 Mbps
+        num link de 62/27 Mbps — alerta de "internet muito lenta" falso. Como ele
+        "funcionava", o Cloudflare (que mede certo) nunca rodava.
+        """
+        down, up = self._speedtest_cloudflare()
         if down is None and up is None:
-            down, up = self._speedtest_cloudflare()
+            down, up = self._speedtest_cli()
 
         if down is not None or up is not None:
             self.download_speed_mbps = down
