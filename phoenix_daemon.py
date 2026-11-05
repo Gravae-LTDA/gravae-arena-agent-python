@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.17.6"
+VERSION = "1.17.7"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -51,6 +51,20 @@ CHECK_INTERVAL = 120  # Check every 2 minutes
 CONNECTIVITY_CHECK_INTERVAL = 60  # Check connectivity every minute
 SERVICE_RESTART_MAX_ATTEMPTS = 3
 SERVICE_RESTART_COOLDOWN = 300  # 5 minutes between restart attempts
+SERVICE_RESTART_RESET_WINDOW = 3600  # sem tentativa há 1h → contador volta a zero
+
+
+def decay_restart_attempts(attempts, last_attempt, now):
+    """Zera o contador de tentativas quando a última foi há mais de RESET_WINDOW.
+
+    Antes o contador só zerava quando o serviço caía e voltava (transição da porta).
+    Um restart por frozen-stream é rápido e a porta 8080 nunca chega a cair, então
+    depois de 3 congelamentos (mesmo com horas entre eles) o phoenix ficava para
+    sempre em "exceeded max restart attempts" e parava de agir até o próximo boot
+    (AAB Rasp 3, 05/11/2026: congelou 04:38 e a Pi travou 05:01 sem restart)."""
+    if attempts and now - last_attempt > SERVICE_RESTART_RESET_WINDOW:
+        return 0, last_attempt
+    return attempts, last_attempt
 
 # Escalation thresholds (in minutes)
 ESCALATION_RESTART_CLOUDFLARED = 30  # Restart cloudflared service
@@ -776,6 +790,7 @@ class ServiceGuardian:
         Uses cooldown and max attempts like restart_service()."""
         now = time.time()
         attempts, last_attempt = self.restart_attempts.get(service_name, (0, 0))
+        attempts, last_attempt = decay_restart_attempts(attempts, last_attempt, now)
 
         # Check cooldown
         if now - last_attempt < SERVICE_RESTART_COOLDOWN:
@@ -909,6 +924,7 @@ class ServiceGuardian:
     def restart_service(self, service_name):
         now = time.time()
         attempts, last_attempt = self.restart_attempts.get(service_name, (0, 0))
+        attempts, last_attempt = decay_restart_attempts(attempts, last_attempt, now)
 
         # Check cooldown
         if now - last_attempt < SERVICE_RESTART_COOLDOWN:
