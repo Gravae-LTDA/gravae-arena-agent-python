@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.17.6"
+VERSION = "1.18.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -1308,6 +1308,153 @@ class ShinobiCrashLoopDetector:
         except Exception as e:
             log.debug(f"[shinobi-epipe] check error: {e}")
         return False
+
+# === Empty-Cut Watchdog ===
+class EmptyCutWatchdog:
+    """Reinicia o monitor que esta gerando corte de 0 byte.
+
+    Arena Pio X, 07/11/2026: das 19h19 as 9h as quadras 4-6 (Uniview OEM)
+    geraram TODO corte com 0 byte. O HLS seguia vivo, o monitor em Watching,
+    o aperto virava Event e o Shinobi respondia "Trigger Successful", entao
+    nenhum outro check enxergou. Nem o restart do camera.js resolveu; voltou
+    quando a conexao RTSP das tres caiu e reconectou. O que cura e' reiniciar
+    o monitor (stop -> start), e nenhum outro caminho pega esse estado.
+
+    So' olha arquivos que nasceram depois que o watcher subiu (sem backlog) e
+    que ja' tiveram tempo de terminar (SETTLE_SECONDS). Reinicia so' aquele
+    monitor, nunca o processo inteiro. Cooldown por monitor e teto diario
+    impedem loop; se o corte seguinte ao restart ainda sair vazio, sobe um
+    alerta critico em vez de insistir.
+    """
+
+    SETTLE_SECONDS = 180          # corte de ate' ~2 min ja' terminou
+    LOOKBACK_SECONDS = 3600       # nao varre arquivo velho
+    RESTART_COOLDOWN = 600        # por monitor
+    MAX_RESTARTS_PER_DAY = 6      # por monitor
+    VIDEOS_DIRS = [Path("/home/Shinobi/videos"), Path("/opt/shinobi/videos")]
+
+    def __init__(self):
+        self.started_at = time.time()
+        self.seen = set()          # arquivos vazios ja' tratados
+        self.restarts = {}         # mid -> [timestamps]
+        self.pending_verify = {}   # mid -> ts do restart (aguardando 1o corte)
+
+    def _config(self):
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+            return cfg.get("shinobiApiKey"), cfg.get("shinobiGroupKey")
+        except Exception:
+            return None, None
+
+    def _videos_dir(self, group_key):
+        for d in self.VIDEOS_DIRS:
+            p = d / group_key
+            if p.is_dir():
+                return p
+        return None
+
+    def _scan(self, group_key, now):
+        """-> {mid: [(mtime, size, path)]} dos cortes prontos e recentes."""
+        base = self._videos_dir(group_key)
+        out = {}
+        if not base:
+            return out
+        floor = max(self.started_at, now - self.LOOKBACK_SECONDS)
+        for f in base.glob("*/*.mp4"):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if st.st_mtime < floor or now - st.st_mtime < self.SETTLE_SECONDS:
+                continue
+            out.setdefault(f.parent.name, []).append((st.st_mtime, st.st_size, str(f)))
+        for v in out.values():
+            v.sort()
+        return out
+
+    def _shinobi(self, api_key, group_key, mid, step):
+        import urllib.request
+        from urllib.parse import quote
+        url = "http://127.0.0.1:8080/%s/monitor/%s/%s%s" % (
+            quote(api_key, safe=''), group_key, mid, ("/" + step) if step else "")
+        req = urllib.request.Request(url, headers={"User-Agent": "gravae-phoenix"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read(262144))
+
+    def _restart_monitor(self, api_key, group_key, mid):
+        try:
+            cur = self._shinobi(api_key, group_key, mid, None)
+            mon = cur[0] if isinstance(cur, list) and cur else cur
+            mode = (mon or {}).get("mode")
+            if mode not in ("start", "record"):
+                log.info("[empty-cut] %s em mode=%s; nao reinicio" % (mid, mode))
+                return False
+            self._shinobi(api_key, group_key, mid, "stop")
+            time.sleep(2)
+            res = self._shinobi(api_key, group_key, mid, mode)
+            return isinstance(res, dict) and res.get("ok") is True
+        except Exception as e:
+            # Sem URL no log: a api key vai nela.
+            log.warning("[empty-cut] restart de %s falhou: %s" % (mid, type(e).__name__))
+            return False
+
+    def check(self):
+        api_key, group_key = self._config()
+        if not api_key or not group_key or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", group_key):
+            return 0
+        now = time.time()
+        acted = 0
+        for mid, cuts in self._scan(group_key, now).items():
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", mid):
+                continue
+            # Verificacao pos-restart: o 1o corte depois do restart decide.
+            t_restart = self.pending_verify.get(mid)
+            if t_restart:
+                after = [c for c in cuts if c[0] > t_restart + 5]
+                if after:
+                    first = after[0]
+                    del self.pending_verify[mid]
+                    if first[1] > 0:
+                        log.info("[empty-cut] %s voltou a gravar apos restart" % mid)
+                        alerts.add("empty_cut_recovered", "info",
+                                   f"Monitor {mid} voltou a gerar video apos restart automatico",
+                                   {"monitor_id": mid, "file": first[2], "size": first[1]})
+                    else:
+                        self.seen.add(first[2])
+                        log.error("[empty-cut] %s segue gerando corte vazio mesmo apos restart" % mid)
+                        alerts.add("empty_cut_persistent", "critical",
+                                   f"Monitor {mid} segue gerando video de 0 byte mesmo apos restart — checar camera/rede",
+                                   {"monitor_id": mid, "file": first[2]})
+            empties = [c for c in cuts if c[1] == 0 and c[2] not in self.seen]
+            if not empties:
+                continue
+            for c in empties:
+                self.seen.add(c[2])
+            hist = [t for t in self.restarts.get(mid, []) if now - t < 86400]
+            self.restarts[mid] = hist
+            if hist and now - hist[-1] < self.RESTART_COOLDOWN:
+                continue
+            if len(hist) >= self.MAX_RESTARTS_PER_DAY:
+                log.warning("[empty-cut] %s atingiu %d restarts/dia; so' alerto" % (mid, len(hist)))
+                alerts.add("empty_cut_persistent", "critical",
+                           f"Monitor {mid} gerando video de 0 byte; limite diario de restart atingido",
+                           {"monitor_id": mid, "empty_files": [c[2] for c in empties][-5:]})
+                continue
+            log.warning("[empty-cut] %s gerou %d corte(s) de 0 byte (%s) — reiniciando o monitor"
+                        % (mid, len(empties), os.path.basename(empties[-1][2])))
+            ok = self._restart_monitor(api_key, group_key, mid)
+            hist.append(now)
+            if ok:
+                self.pending_verify[mid] = now
+                acted += 1
+            alerts.add("empty_cut_recovery", "warning",
+                       f"Monitor {mid} gerou video de 0 byte — monitor reiniciado automaticamente"
+                       + ("" if ok else " (restart FALHOU)"),
+                       {"monitor_id": mid, "empty_files": [c[2] for c in empties][-5:], "restart_ok": ok})
+        # nao deixa o set crescer pra sempre
+        if len(self.seen) > 5000:
+            self.seen = set(list(self.seen)[-1000:])
+        return acted
 
 # === Press-to-Video Auditor ===
 class PressToVideoAuditor:
@@ -2892,6 +3039,7 @@ class PhoenixDaemon:
         self.shinobi_watcher = None  # Lazy loaded to save memory
         self.shinobi_epipe_detector = ShinobiCrashLoopDetector(self.service_guardian)
         self.press_auditor = PressToVideoAuditor()
+        self.empty_cut_watchdog = EmptyCutWatchdog()
 
         # Setup signal handlers
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -3036,6 +3184,8 @@ class PhoenixDaemon:
         speed_thread = None
         SHINOBI_EPIPE_CHECK_INTERVAL = 120  # 2 minutes
         PRESS_AUDIT_INTERVAL = 300  # 5 minutes
+        EMPTY_CUT_CHECK_INTERVAL = 120  # 2 minutes
+        last_empty_cut_check = 0
 
         while self.running:
             now = time.time()
@@ -3091,6 +3241,14 @@ class PhoenixDaemon:
                     except Exception as e:
                         log.debug(f"Shinobi EPIPE check error: {e}")
                     last_shinobi_epipe_check = now
+
+                # Corte de 0 byte -> reinicia so' aquele monitor (a cada 2 min)
+                if now - last_empty_cut_check >= EMPTY_CUT_CHECK_INTERVAL:
+                    try:
+                        self.empty_cut_watchdog.check()
+                    except Exception as e:
+                        log.debug(f"Empty-cut check error: {e}")
+                    last_empty_cut_check = now
 
                 # Auditoria aperto -> video (a cada 5 minutos)
                 # Pega a falha que nenhum outro check enxerga: o Shinobi responde
