@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.18.0"
+VERSION = "1.18.1"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -1478,6 +1478,10 @@ class PressToVideoAuditor:
 
     STATE_FILE = LOG_DIR / "press_audit.state"
     STATUS_FILE = LOG_DIR / "press_audit.json"   # lido pelo agent -> /phoenix/status
+    HISTORY_FILE = LOG_DIR / "press_audit_history.json"  # resultados da janela (status acumulado)
+    VIDEO_BEFORE = 180         # video comeca ate' N s ANTES do aperto (seconds_before do corte)
+    VIDEO_AFTER = 15           # ... ou ate' N s depois (fila/latencia do trigger)
+    VIDEOS_DIRS = (Path("/home/Shinobi/videos"), Path("/opt/shinobi/videos"))
     SETTLE_SECONDS = 90        # so' audita aperto com tempo de virar evento
     MATCH_TOLERANCE = 3        # casamento aperto <-> evento, em segundos
     LOCK_WINDOW = 15           # motion_lock do Shinobi (libs/monitor/utils.js)
@@ -1571,8 +1575,8 @@ class PressToVideoAuditor:
             log.debug(f"[press-audit] erro lendo log de apertos: {e}")
         return sorted(out)
 
-    def _events_since(self, since):
-        """{mid: [datetime, ...]} da tabela Events do Shinobi."""
+    def _mysql(self, sql):
+        """stdout da query no banco do Shinobi, ou None sem acesso."""
         db = {}
         for path in ("/home/Shinobi/conf.json", "/opt/shinobi/conf.json"):
             try:
@@ -1583,18 +1587,17 @@ class PressToVideoAuditor:
                 pass
         if not db:
             return None
-        sql = (
-            "SELECT mid, DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') FROM Events "
-            f"WHERE time >= '{since.strftime('%Y-%m-%d %H:%M:%S')}';"
-        )
+        # Senha pelo ambiente: com senha vazia (padrao Shinobi) o `-p` sozinho
+        # faz o mysql pedir senha no stdin e a query depende de quem e' o stdin.
+        env = dict(os.environ, MYSQL_PWD=str(db.get("password") or ""))
         try:
             r = subprocess.run(
                 ["mysql", "-N", "-B",
                  "-u", db.get("user", "majesticflame"),
-                 f"-p{db.get('password', '')}",
                  "-h", db.get("host", "localhost"),
                  db.get("database", "ccio"), "-e", sql],
                 capture_output=True, text=True, timeout=15,
+                stdin=subprocess.DEVNULL, env=env,
             )
             if r.returncode != 0:
                 log.debug(f"[press-audit] mysql rc={r.returncode}: {r.stderr.strip()[:120]}")
@@ -1602,8 +1605,18 @@ class PressToVideoAuditor:
         except Exception as e:
             log.debug(f"[press-audit] mysql erro: {e}")
             return None
+        return r.stdout
+
+    def _events_since(self, since):
+        """{mid: [datetime, ...]} da tabela Events do Shinobi."""
+        stdout = self._mysql(
+            "SELECT mid, DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') FROM Events "
+            f"WHERE time >= '{since.strftime('%Y-%m-%d %H:%M:%S')}';"
+        )
+        if stdout is None:
+            return None
         out = {}
-        for line in r.stdout.splitlines():
+        for line in stdout.splitlines():
             parts = line.split("\t")
             if len(parts) < 2:
                 continue
@@ -1616,6 +1629,96 @@ class PressToVideoAuditor:
         for v in out.values():
             v.sort()
         return out
+
+    @staticmethod
+    def _parse_video_time(t):
+        """'2026-11-08T23:35:25.000Z' (UTC) ou '2026-11-08 20:35:25' (local) -> datetime local naive."""
+        t = (t or "").strip()
+        if not t:
+            return None
+        try:
+            if "T" in t:
+                dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone().replace(tzinfo=None)
+                return dt.replace(microsecond=0)
+            return datetime.strptime(t[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+
+    def _videos_since(self, since):
+        """{mid: [inicio do video, ...]} de TODA evidencia de corte com conteudo.
+
+        Existe porque Events sozinho da' falso positivo em massa: ha' instalacao
+        do Shinobi que nao grava a tabela Events (Sunset MT, Queiroz BT: zero
+        linhas) e gera e sobe video normalmente. Fontes, todas so' com size > 0
+        (corte de 0 byte NAO e' video — ver EmptyCutWatchdog):
+          - Videos (ainda nao puxado pela fila)
+          - Logs 'Video Deleted' (a fila puxou, subiu e apagou)
+          - mp4 na pasta do monitor (nome = inicio, hora local)
+        """
+        out = {}
+        desde = since - timedelta(seconds=self.VIDEO_BEFORE)
+        d0 = desde.strftime("%Y-%m-%d %H:%M:%S")
+
+        def add(mid, dt):
+            if mid and dt:
+                out.setdefault(mid, []).append(dt)
+
+        stdout = self._mysql(
+            "SELECT mid, DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') FROM Videos "
+            f"WHERE time >= '{d0}' AND size > 0;"
+        ) or ""
+        for line in stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                add(parts[0], self._parse_video_time(parts[1]))
+
+        stdout = self._mysql(
+            "SELECT info FROM Logs WHERE info LIKE '%Video Deleted%' "
+            f"AND time >= '{since.strftime('%Y-%m-%d %H:%M:%S')}';"
+        ) or ""
+        for line in stdout.splitlines():
+            try:
+                v = (json.loads(line).get("msg") or {}).get("video") or {}
+            except (ValueError, AttributeError):
+                continue
+            try:
+                if int(v.get("size") or 0) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            add(v.get("mid"), self._parse_video_time(v.get("time")))
+
+        for base in self.VIDEOS_DIRS:
+            for f in base.glob("*/*/*.mp4"):
+                m = re.match(r"(\d{4}-\d\d-\d\d)T(\d\d)-(\d\d)-(\d\d)", f.name)
+                if not m:
+                    continue
+                try:
+                    if f.stat().st_size <= 0:
+                        continue
+                    dt = datetime.strptime("%s %s:%s:%s" % m.groups(), "%Y-%m-%d %H:%M:%S")
+                except (OSError, ValueError):
+                    continue
+                if dt >= desde:
+                    add(f.parent.name, dt)
+        for v in out.values():
+            v.sort()
+        return out
+
+    def _load_history(self):
+        try:
+            return json.loads(self.HISTORY_FILE.read_text())
+        except Exception:
+            return []
+
+    def _save_history(self, hist):
+        try:
+            self.HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.HISTORY_FILE.write_text(json.dumps(hist))
+        except Exception as e:
+            log.debug(f"[press-audit] falha ao persistir historico: {e}")
 
     # ---------- auditoria ----------
     def check(self):
@@ -1630,8 +1733,17 @@ class PressToVideoAuditor:
             except ValueError:
                 pass
         limite = now - timedelta(seconds=self.SETTLE_SECONDS)
+        ultimo = None
+        if self.last_ts:
+            try:
+                ultimo = datetime.strptime(self.last_ts, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                ultimo = None
 
-        presses = [(t, l) for t, l in self._recent_presses(janela_inicio) if t <= limite]
+        # Estritamente depois do ultimo auditado: com `>=` o ultimo aperto de
+        # cada rodada era auditado de novo na seguinte (contagem dupla).
+        presses = [(t, l) for t, l in self._recent_presses(janela_inicio)
+                   if t <= limite and (ultimo is None or t > ultimo)]
         if not presses:
             return False
 
@@ -1640,6 +1752,7 @@ class PressToVideoAuditor:
         if eventos is None:
             log.debug("[press-audit] sem acesso ao banco do Shinobi; pulando")
             return False
+        videos = self._videos_since(janela_inicio)
 
         auditados = 0
         perdidos = []
@@ -1651,6 +1764,10 @@ class PressToVideoAuditor:
             for mid in mids:
                 ev = eventos.get(mid, [])
                 if any(abs((ts - e).total_seconds()) <= self.MATCH_TOLERANCE for e in ev):
+                    continue
+                # sem Event, mas saiu video com conteudo cobrindo o aperto: ok
+                if any(-self.VIDEO_AFTER <= (ts - v).total_seconds() <= self.VIDEO_BEFORE
+                       for v in videos.get(mid, [])):
                     continue
                 # lockout: houve evento aceito nos 15 s anteriores NESTE monitor?
                 if any(0 < (ts - e).total_seconds() <= self.LOCK_WINDOW for e in ev):
@@ -1674,9 +1791,25 @@ class PressToVideoAuditor:
             for t, lbl, fs in perdidos[:10]
         ]
 
+        # Status ACUMULADO na janela (STATUS_TTL). Antes publicava so' a rodada
+        # de 5 min: CFE Clayton (31/10-08/11) perdeu todo aperto de uma camera
+        # por 8 dias, o log tinha 154 "APERTO SEM VIDEO" e o /phoenix/status
+        # mostrava lost=0 porque a ultima rodada calhou de ser limpa.
+        corte = (now - timedelta(seconds=self.STATUS_TTL)).strftime("%Y-%m-%d %H:%M:%S")
+        hist = [h for h in self._load_history() if h.get("t", "") >= corte]
+        hist.append({"t": now.strftime("%Y-%m-%d %H:%M:%S"), "audited": auditados,
+                     "lost": [[f"{t:%Y-%m-%d %H:%M:%S}", lbl, fs] for t, lbl, fs in perdidos]})
+        self._save_history(hist)
+        tot_aud = sum(h.get("audited", 0) for h in hist)
+        tot_lost = [x for h in hist for x in h.get("lost", [])]
+        quadra_janela = {}
+        for _, lbl, _ in tot_lost:
+            quadra_janela[lbl] = quadra_janela.get(lbl, 0) + 1
+        ex_janela = [f"{t} {lbl} (sem evento em: {', '.join(fs)})" for t, lbl, fs in tot_lost[-10:]]
+
         # Status sempre publicado (inclusive limpo), para o OPS distinguir
         # "auditado e sem perda" de "sem dado nenhum".
-        self._write_status(auditados, len(perdidos), por_quadra, exemplos)
+        self._write_status(tot_aud, len(tot_lost), quadra_janela, ex_janela)
 
         if not perdidos:
             return False
