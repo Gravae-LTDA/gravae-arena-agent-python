@@ -1740,9 +1740,23 @@ class PressToVideoAuditor:
             except ValueError:
                 ultimo = None
 
+        todos = self._recent_presses(janela_inicio)
+        # Aperto "no futuro" = button-daemon em outro fuso (Pi trocou de fuso e
+        # o daemon nao reiniciou; Beach Premier 08/11/2026: daemon em UTC, Pi
+        # em -03). Comparar com Events em hora local da' 100% de perda falsa.
+        futuros = [t for t, _ in todos if t > now + timedelta(seconds=120)]
+        if futuros:
+            log.warning(f"[press-audit] {len(futuros)} aperto(s) com hora no futuro "
+                        f"(ex.: {futuros[-1]:%Y-%m-%d %H:%M:%S}) — fuso do button-daemon "
+                        "diferente do sistema; reinicie gravae-buttons. Auditoria suspensa.")
+            alerts.add("press_audit_clock_skew", "warning",
+                       "Hora dos apertos no futuro: button-daemon em outro fuso — reiniciar gravae-buttons",
+                       {"futuros": len(futuros), "exemplo": f"{futuros[-1]:%Y-%m-%d %H:%M:%S}"})
+            return False
+
         # Estritamente depois do ultimo auditado: com `>=` o ultimo aperto de
         # cada rodada era auditado de novo na seguinte (contagem dupla).
-        presses = [(t, l) for t, l in self._recent_presses(janela_inicio)
+        presses = [(t, l) for t, l in todos
                    if t <= limite and (ultimo is None or t > ultimo)]
         if not presses:
             return False

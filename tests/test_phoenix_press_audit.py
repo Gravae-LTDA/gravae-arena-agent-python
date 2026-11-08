@@ -100,6 +100,14 @@ class PressAudit(unittest.TestCase):
         self.assertEqual(st['lost'], 1)      # perda de t1 continua visivel
         self.assertEqual(st['byCourt'], {'Campo 1': 1})
 
+    def test_future_presses_suspend_audit(self):
+        # daemon em UTC numa Pi em -03: hora do aperto 3 h no futuro
+        self.presses = [(self.now + timedelta(hours=3), 'Campo 1')]
+        self.a._recent_presses = lambda since: self.presses
+        self.assertFalse(self.a.check())
+        self.assertEqual(self.alerts.add.call_args[0][0], 'press_audit_clock_skew')
+        self.assertFalse((Path(self.tmp) / 'press_audit.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()
