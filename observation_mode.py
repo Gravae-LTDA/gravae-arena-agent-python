@@ -81,6 +81,17 @@ NTP_GRACE_SEC = 900                   # NTP leva alguns minutos após o boot
 REPROBE_SEC = 5
 MODES = ("semana", "fixo")
 
+# Vídeo corrompido. Mesmo layout que o phoenix_daemon (EmptyCutWatchdog /
+# PressToVideoAuditor) varre: <base>/<groupKey>/<monitor>/*.mp4.
+VIDEO_DIRS = ("/home/Shinobi/videos", "/opt/shinobi/videos")
+VIDEO_SETTLE_SEC = 15          # mtime ≥15s ⇒ Shinobi terminou de escrever
+VIDEO_LOOKBACK_SEC = 1800      # não sonda arquivo antigo
+VIDEO_PROBES_PER_CYCLE = 6     # teto de ffprobe por ciclo (Pi 3B)
+VIDEO_SEEN_MAX = 2000          # nomes já sondados (conjunto limitado)
+FFPROBE_TIMEOUT = 10
+VIDEO_MIN_DURATION = 0.5
+_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
 _SD_ERR_RE = re.compile(r"(mmc\d*:.*(error|timeout|stuck|reset)|mmcblk\d.*error|"
                         r"I/O error|EXT4-fs (error|warning)|Buffer I/O error|"
                         r"Remounting filesystem read-only)", re.I)
@@ -98,6 +109,10 @@ _local_seen = {}    # chave -> ciclos seguidos em estado ruim (confirmação loc
 _prev_throttled = None  # último get_throttled lido (detecta transição do bit 16)
 _hb_401 = 0         # heartbeats seguidos recusados com 401
 _kernel_lines = []  # linhas do kernel lidas neste ciclo (sd_errors / oom_kill)
+_video_seen = {}    # caminho -> None (ordem de inserção = FIFO limitado)
+_video_floor = None  # não sonda vídeo anterior ao início da observação
+_ffprobe_missing = False
+_loaded = False
 
 
 def _log(msg):
@@ -105,7 +120,8 @@ def _log(msg):
 
 
 def load_state():
-    global _state
+    global _state, _loaded
+    _loaded = True
     try:
         with open(STATE_PATH) as f:
             _state = json.load(f)
@@ -926,6 +942,133 @@ def check_buttons_service_down(snap):
                             "serviço gravae-buttons parado — apertos não disparam gravação")
 
 
+# ---------------------------------------------------------------- vídeo corrompido
+def _video_candidates(group_key, now):
+    """[(mtime, size, path, monitor)] dos MP4 prontos, recentes e ainda não sondados,
+    do mais antigo para o mais novo."""
+    floor = now - VIDEO_LOOKBACK_SEC
+    if _video_floor is not None:
+        floor = max(floor, _video_floor)
+    out = []
+    for base in VIDEO_DIRS:
+        root = os.path.join(base, group_key)
+        try:
+            monitors = os.listdir(root)
+        except OSError:
+            continue
+        for mon in monitors:
+            d = os.path.join(root, mon)
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            for n in names:
+                if not n.endswith(".mp4"):
+                    continue
+                path = os.path.join(d, n)
+                if path in _video_seen:
+                    continue
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue   # a fila já puxou e apagou
+                if st.st_mtime < floor or now - st.st_mtime < VIDEO_SETTLE_SEC:
+                    continue
+                out.append((st.st_mtime, st.st_size, path, mon))
+    out.sort()
+    return out
+
+
+def _mark_video_seen(path):
+    _video_seen[path] = None
+    while len(_video_seen) > VIDEO_SEEN_MAX:
+        del _video_seen[next(iter(_video_seen))]
+
+
+def probe_video(path):
+    """Motivo da corrupção, None se o vídeo está bom, ou "skip" quando não dá para
+    afirmar nada (arquivo sumiu — a fila puxa e apaga —, ffprobe ausente/lento)."""
+    global _ffprobe_missing
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return "skip"
+    if size == 0:
+        return "zero_bytes"
+    if _ffprobe_missing:
+        return "skip"
+    cmd = ["nice", "-n", "19", "ffprobe", "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=codec_type:format=duration", "-of", "json", path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT)
+    except FileNotFoundError:
+        _ffprobe_missing = True
+        _log("ffprobe não instalado — check de vídeo corrompido só vê arquivo de 0 byte")
+        return "skip"
+    except subprocess.TimeoutExpired:
+        return "skip"   # Pi carregada; lento não é corrompido
+    if not os.path.exists(path):
+        return "skip"
+    if r.returncode != 0:
+        err = (r.stderr or "").strip().splitlines()
+        return "ffprobe_failed" + (": " + err[0][:200] if err else "")
+    try:
+        info = json.loads(r.stdout or "{}")
+    except ValueError:
+        return "ffprobe_failed: saída ilegível"
+    if not any((s or {}).get("codec_type") == "video" for s in info.get("streams") or []):
+        return "no_video_stream"
+    try:
+        dur = float((info.get("format") or {}).get("duration"))
+    except (TypeError, ValueError):
+        dur = None
+    if dur is None or dur <= VIDEO_MIN_DURATION:
+        return "too_short"
+    return None
+
+
+def check_video_corrupted(deadline=None):
+    """MP4 que o Shinobi terminou e não abre: 0 byte, ffprobe falha, sem trilha
+    de vídeo ou duração ≤0,5s. Cada arquivo é sondado uma vez; no máximo
+    VIDEO_PROBES_PER_CYCLE por ciclo. Um aviso por monitor a cada 10 min."""
+    global _video_floor
+    now = time.time()
+    if _video_floor is None:
+        _video_floor = now - 600
+    _, gk = _shinobi_creds()
+    if not gk or not _KEY_RE.fullmatch(gk):
+        return []
+    per_mon = {}
+    probes = 0
+    for _mt, _size, path, mon in _video_candidates(gk, now):
+        if probes >= VIDEO_PROBES_PER_CYCLE or (deadline and time.time() >= deadline):
+            break
+        probes += 1
+        reason = probe_video(path)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = _size
+        _mark_video_seen(path)
+        rec = per_mon.setdefault(mon, {"probed": 0, "files": []})
+        rec["probed"] += 1
+        if reason and reason != "skip":
+            rec["files"].append({"name": os.path.basename(path), "sizeBytes": size, "reason": reason})
+    out = []
+    bucket = _bucket(600)
+    for mon, rec in per_mon.items():
+        if not rec["files"]:
+            continue
+        out.append({
+            "type": "video_corrupted", "severity": "high",
+            "detail": f"{len(rec['files'])} vídeo(s) corrompido(s) em {mon} ({rec['files'][0]['reason']})",
+            "evidence": {"monitor": mon, "files": rec["files"][:5],
+                         "probed": rec["probed"], "corrupted": len(rec["files"])},
+            "dedupKey": f"video_corrupted:{mon}:{bucket}",
+        })
+    return out
+
+
 # ---------------------------------------------------------------- caixa preta (journald)
 def _entry_unit(e):
     if e.get("_TRANSPORT") == "kernel":
@@ -1159,6 +1302,7 @@ def _cycle():
         (check_tunnel_down, (snap,)),
         (check_database_down, (snap,)),
         (check_buttons_service_down, (snap,)),
+        (check_video_corrupted, (deadline,)),
     ):
         try:
             found.extend(fn(*args))
@@ -1219,12 +1363,13 @@ def _loop():
 
 
 def enable(secret, ops_url, interval=DEFAULT_INTERVAL, until=None, autoheal=True, mode=None):
-    global _thread, _state
+    global _thread, _state, _loaded
     if type(autoheal) is not bool:
         raise ValueError("autoheal must be boolean")
     if mode is not None and mode not in MODES:
         raise ValueError("mode must be 'semana' or 'fixo'")
     with _lock:
+        _loaded = True
         keep = _state if _state.get("enabled") else {}
         _state = {"enabled": True, "secret": secret, "opsUrl": ops_url,
                   "interval": int(interval or DEFAULT_INTERVAL), "until": until,
@@ -1243,8 +1388,9 @@ def enable(secret, ops_url, interval=DEFAULT_INTERVAL, until=None, autoheal=True
 
 
 def disable():
-    global _state
+    global _state, _loaded
     with _lock:
+        _loaded = True
         # Mantém o seq da caixa preta: uma nova ativação continua a numeração.
         _state = {"enabled": False, "journalSeq": int(_state.get("journalSeq") or 0)}
         save_state()
@@ -1263,6 +1409,10 @@ def resume_if_enabled():
 
 
 def status():
+    # Logo após update/restart o /observation/status pode chegar antes da thread
+    # de resume_if_enabled: lê o estado persistido para não responder "desligado".
+    if not _loaded:
+        load_state()
     return {
         "enabled": bool(_state.get("enabled")),
         "interval": _state.get("interval"),

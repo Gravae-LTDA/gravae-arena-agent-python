@@ -297,5 +297,113 @@ class Lifecycle(Base):
         obs._stop.clear()
 
 
+class VideoCorrupted(Base):
+    def setUp(self):
+        super().setUp()
+        self.videos = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.videos, True)
+        for name, value in [('VIDEO_DIRS', (self.videos,)), ('_video_seen', {}),
+                            ('_video_floor', None), ('_ffprobe_missing', False)]:
+            p = patch.object(obs, name, value); p.start(); self.addCleanup(p.stop)
+        p = patch.object(obs, '_shinobi_creds', return_value=('api', 'GK1')); p.start(); self.addCleanup(p.stop)
+        self.mon = os.path.join(self.videos, 'GK1', 'quadra01_camera01')
+        os.makedirs(self.mon)
+
+    def _mp4(self, name, size=1000, age=60):
+        path = os.path.join(self.mon, name)
+        with open(path, 'wb') as fh:
+            fh.write(b'x' * size)
+        t = time.time() - age
+        os.utime(path, (t, t))
+        return path
+
+    @staticmethod
+    def _ffprobe(stdout='', code=0, stderr=''):
+        r = Mock()
+        r.returncode, r.stdout, r.stderr = code, stdout, stderr
+        return r
+
+    GOOD = json.dumps({'streams': [{'codec_type': 'video'}], 'format': {'duration': '12.0'}})
+
+    def test_zero_byte_is_corrupted_without_ffprobe(self):
+        self._mp4('a.mp4', size=0)
+        with patch.object(obs.subprocess, 'run') as run:
+            out = obs.check_video_corrupted()
+        run.assert_not_called()
+        self.assertEqual(out[0]['type'], 'video_corrupted')
+        self.assertEqual(out[0]['severity'], 'high')
+        ev = out[0]['evidence']
+        self.assertEqual(ev['monitor'], 'quadra01_camera01')
+        self.assertEqual(ev['files'], [{'name': 'a.mp4', 'sizeBytes': 0, 'reason': 'zero_bytes'}])
+        self.assertEqual((ev['probed'], ev['corrupted']), (1, 1))
+        self.assertTrue(out[0]['dedupKey'].startswith('video_corrupted:quadra01_camera01:'))
+        # cada arquivo é sondado uma vez só
+        self.assertEqual(obs.check_video_corrupted(), [])
+
+    def test_ffprobe_failure_no_stream_and_short(self):
+        self._mp4('a.mp4', age=90)
+        self._mp4('b.mp4', age=80)
+        self._mp4('c.mp4', age=70)
+        self._mp4('d.mp4', age=60)
+        results = [self._ffprobe(code=1, stderr='moov atom not found\n'),
+                   self._ffprobe(json.dumps({'streams': [], 'format': {'duration': '9'}})),
+                   self._ffprobe(json.dumps({'streams': [{'codec_type': 'video'}], 'format': {'duration': '0.2'}})),
+                   self._ffprobe(self.GOOD)]
+        with patch.object(obs.subprocess, 'run', side_effect=results) as run:
+            out = obs.check_video_corrupted()
+        self.assertEqual(run.call_args.args[0][:4], ['nice', '-n', '19', 'ffprobe'])
+        reasons = [f['reason'] for f in out[0]['evidence']['files']]
+        self.assertEqual(reasons, ['ffprobe_failed: moov atom not found', 'no_video_stream', 'too_short'])
+        self.assertEqual(out[0]['evidence']['probed'], 4)
+
+    def test_vanished_file_is_not_corrupted(self):
+        path = self._mp4('a.mp4')
+
+        def gone(*a, **k):
+            os.remove(path)
+            return self._ffprobe(code=1, stderr='No such file or directory')
+
+        with patch.object(obs.subprocess, 'run', side_effect=gone):
+            self.assertEqual(obs.check_video_corrupted(), [])
+
+    def test_file_still_being_written_is_skipped(self):
+        self._mp4('a.mp4', size=0, age=3)
+        self.assertEqual(obs.check_video_corrupted(), [])
+        self.assertEqual(obs._video_seen, {})
+
+    def test_cap_per_cycle_and_rest_next_cycle(self):
+        for i in range(9):
+            self._mp4('v%d.mp4' % i, size=0, age=100 - i)
+        first = obs.check_video_corrupted()
+        self.assertEqual(first[0]['evidence']['probed'], obs.VIDEO_PROBES_PER_CYCLE)
+        self.assertEqual(len(first[0]['evidence']['files']), 5)
+        second = obs.check_video_corrupted()
+        self.assertEqual(second[0]['evidence']['probed'], 3)
+
+    def test_ffprobe_timeout_is_not_corrupted(self):
+        self._mp4('a.mp4')
+        with patch.object(obs.subprocess, 'run', side_effect=obs.subprocess.TimeoutExpired('ffprobe', 10)):
+            self.assertEqual(obs.check_video_corrupted(), [])
+
+    def test_old_files_before_observation_are_ignored(self):
+        self._mp4('old.mp4', size=0, age=1200)
+        self.assertEqual(obs.check_video_corrupted(), [])
+
+
+class StatusAfterRestart(Base):
+    def test_status_reads_persisted_state_before_resume_thread(self):
+        persisted = {'enabled': True, 'secret': 'k', 'opsUrl': 'https://ops', 'mode': 'fixo', 'until': None}
+
+        def fake_load():
+            obs._state.clear(); obs._state.update(persisted); obs._loaded = True
+
+        with patch.object(obs, '_loaded', False), patch.object(obs, 'load_state', side_effect=fake_load) as ld:
+            st = obs.status()
+            ld.assert_called_once()
+        self.assertTrue(st['enabled'])
+        self.assertEqual(st['mode'], 'fixo')
+        self.assertTrue(st['supportsJournal'])
+
+
 if __name__ == '__main__':
     unittest.main()

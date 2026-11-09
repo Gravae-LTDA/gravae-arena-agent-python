@@ -8,6 +8,8 @@ Agent de monitoramento e controle para Raspberry Pi nas arenas Gravae/Replayme.
 - O heartbeat leva `snapshot` com temperatura, `get_throttled`, memória, disco, rootfs somente leitura, load, uptime, NTP, DNS e estado do cloudflared, MariaDB e gravae-buttons.
 - Caixa preta: as linhas novas do journald (serviços Gravaê, cloudflared, MariaDB, kernel com prioridade warning ou mais grave e qualquer erro) vão para `POST /api/observation/journal` em chunks com `seq`. Sem internet, os chunks ficam em `/var/lib/gravae/obs-spool/` (até 2 MB, descarta os mais antigos) e são enviados quando a conexão volta.
 - Checks novos: `undervoltage`, `high_temperature`, `disk_full`, `sd_readonly`, `sd_errors`, `oom_kill`, `clock_unsynced`, `dns_failure`, `tunnel_down`, `database_down` e `buttons_service_down`.
+- `video_corrupted`: MP4 terminado (mtime de 15 s ou mais) com 0 byte, ffprobe com falha, sem trilha de vídeo ou com 0,5 s ou menos. Cada arquivo é sondado uma vez, até 6 por ciclo, com `nice`. Arquivo que a fila apagou não conta.
+- `/observation/status` lê o estado salvo mesmo antes da retomada, logo após update ou restart.
 - Menos falso positivo: `monitor_died`, memória e os checks de serviço exigem 2 ciclos seguidos. `service_down` e `shinobi_port_dead` testam de novo após 5 s.
 - Heartbeat com 2 tentativas de 10 s. Após 10 respostas 401 seguidas (modo desligado no OPS), a Pi desliga a observação.
 
