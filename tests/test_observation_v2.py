@@ -368,7 +368,12 @@ class VideoCorrupted(Base):
                    self._ffprobe(self.GOOD)]
         with patch.object(obs.subprocess, 'run', side_effect=results) as run:
             out = obs.check_video_corrupted()
-        self.assertEqual(run.call_args.args[0][:4], ['nice', '-n', '19', 'ffprobe'])
+        # Com ionice instalado (Linux/CI) o prefixo é ionice -c3; sem ele, só nice.
+        cmd = run.call_args.args[0]
+        if cmd[0] == 'ionice':
+            self.assertEqual(cmd[:2], ['ionice', '-c3'])
+            cmd = cmd[2:]
+        self.assertEqual(cmd[:4], ['nice', '-n', '19', 'ffprobe'])
         reasons = [f['reason'] for f in out[0]['evidence']['files']]
         self.assertEqual(reasons, ['ffprobe_failed: moov atom not found', 'no_video_stream', 'too_short'])
         self.assertEqual(out[0]['evidence']['probed'], 4)
