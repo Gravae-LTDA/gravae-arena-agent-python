@@ -2,6 +2,15 @@
 
 Agent de monitoramento e controle para Raspberry Pi nas arenas Gravae/Replayme.
 
+### Ultra Watch 2.0 (agent 4.2.0)
+
+- `POST /observation/enable` aceita `mode` (`semana` ou `fixo`). Sem `until` o modo roda até ser desligado. `/observation/status` informa `mode`, `obsVersion` e `supportsJournal`.
+- O heartbeat leva `snapshot` com temperatura, `get_throttled`, memória, disco, rootfs somente leitura, load, uptime, NTP, DNS e estado do cloudflared, MariaDB e gravae-buttons.
+- Caixa preta: as linhas novas do journald (serviços Gravaê, cloudflared, MariaDB, kernel com prioridade warning ou mais grave e qualquer erro) vão para `POST /api/observation/journal` em chunks com `seq`. Sem internet, os chunks ficam em `/var/lib/gravae/obs-spool/` (até 2 MB, descarta os mais antigos) e são enviados quando a conexão volta.
+- Checks novos: `undervoltage`, `high_temperature`, `disk_full`, `sd_readonly`, `sd_errors`, `oom_kill`, `clock_unsynced`, `dns_failure`, `tunnel_down`, `database_down` e `buttons_service_down`.
+- Menos falso positivo: `monitor_died`, memória e os checks de serviço exigem 2 ciclos seguidos. `service_down` e `shinobi_port_dead` testam de novo após 5 s.
+- Heartbeat com 2 tentativas de 10 s. Após 10 respostas 401 seguidas (modo desligado no OPS), a Pi desliga a observação.
+
 ### Correções 4.0.4
 
 - Instalação Hands-up aceita `revision` com SHA completo e verifica o checkout antes de executar o instalador. Alterações locais impedem a instalação fixada.

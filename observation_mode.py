@@ -9,6 +9,10 @@ e roda checks locais baratos (Pi 3B friendly); cada anomalia vira um POST /repor
 Fase 1: heartbeat + service_down + press_without_video.
 Fase 2: monitor_died + camera_frozen + gpio_idle_24h + gpio_stuck.
 Fase 4: high_memory + ffmpeg_memory_leak (antecipa o OOM que trava a Pi).
+2.0: modo fixo (sem prazo), snapshot de saúde no heartbeat, "caixa preta" do
+journald enviada ao OPS (com spool em disco quando a Pi está sem internet) e
+checks de hardware/serviços (subtensão, temperatura, disco, SD, OOM, NTP, DNS,
+túnel, MariaDB, botões). Checks antigos agora confirmam antes de reportar.
 """
 import os
 import re
@@ -16,16 +20,18 @@ import json
 import time
 import hmac
 import hashlib
+import socket
 import threading
 import subprocess
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone
 
 STATE_PATH = "/etc/gravae/observation.json"
 DEVICE_PATH = "/etc/gravae/device.json"
 DEFAULT_INTERVAL = 45
-OBS_VERSION = "1.6.0"
+OBS_VERSION = "2.0.0"
 PM2_HOME = "/root/.pm2"
 
 # Fase 2 — parâmetros dos checks (conservadores p/ evitar falso-positivo).
@@ -53,6 +59,33 @@ AUTOHEAL_MIN_CONSECUTIVE = 2   # ciclos seguidos de press_without_video antes de
 AUTOHEAL_COOLDOWN = 900        # segundos entre restarts de camera (evita loop; ~70s p/ re-armar)
 AUTOHEAL_SHINOBI_PORT_DEAD = True  # tb reinicia camera se o 8080 do Shinobi estiver morto (pm2 "online" mas porta caída)
 
+# 2.0 — caixa preta (journald → OPS) e checks de hardware.
+SPOOL_DIR = "/var/lib/gravae/obs-spool"
+SPOOL_MAX_BYTES = 2 * 1024 * 1024     # ring: acima disto descarta os chunks mais antigos
+JOURNAL_UNITS = ("gravae-agent", "gravae-phoenix", "gravae-buttons",
+                 "gravae-device-client", "cloudflared", "mariadb")
+JOURNAL_FETCH_MAX = 2000              # linhas lidas do journald por ciclo
+CHUNK_MAX_LINES = 300
+MSG_MAX_CHARS = 500
+POST_MAX_CHUNKS = 10
+POST_MAX_BYTES = 256 * 1024
+HB_TIMEOUT = 10                       # heartbeat: 2 tentativas de 10s (não estoura o ciclo)
+HB_401_DISABLE = 10                   # OPS recusou 10 heartbeats seguidos ⇒ modo desligado no OPS
+TEMP_WARN_C = 75
+TEMP_CRIT_C = 80
+DISK_CRIT_PCT = 5
+DISK_CRIT_MB = 500
+DISK_WARN_PCT = 10
+CONFIRM_CYCLES = 2                    # estado ruim visto em N ciclos seguidos antes de reportar
+NTP_GRACE_SEC = 900                   # NTP leva alguns minutos após o boot
+REPROBE_SEC = 5
+MODES = ("semana", "fixo")
+
+_SD_ERR_RE = re.compile(r"(mmc\d*:.*(error|timeout|stuck|reset)|mmcblk\d.*error|"
+                        r"I/O error|EXT4-fs (error|warning)|Buffer I/O error|"
+                        r"Remounting filesystem read-only)", re.I)
+_OOM_RE = re.compile(r"(Out of memory: Kill|oom-kill:|invoked oom-killer|Killed process \d+)", re.I)
+
 _state = {}
 _thread = None
 _stop = threading.Event()
@@ -61,6 +94,10 @@ _consecutive = {}   # dedupKey -> ciclos consecutivos
 _snap = {}          # mid -> {"sig": [seg,size], "identical": int}
 _cyc = 0            # contador de ciclos
 _last_autoheal = 0.0  # epoch do último pm2 restart camera do watchdog
+_local_seen = {}    # chave -> ciclos seguidos em estado ruim (confirmação local)
+_prev_throttled = None  # último get_throttled lido (detecta transição do bit 16)
+_hb_401 = 0         # heartbeats seguidos recusados com 401
+_kernel_lines = []  # linhas do kernel lidas neste ciclo (sd_errors / oom_kill)
 
 
 def _log(msg):
@@ -92,7 +129,8 @@ def _sign(secret, raw):
     return hmac.new(secret.encode(), raw.encode(), hashlib.sha256).hexdigest()
 
 
-def _post(path, obj, serial, secret, ops):
+def _post_status(path, obj, serial, secret, ops, timeout=20, attempts=3):
+    """POST assinado. Devolve (http_status|None, corpo|None). None = rede/DNS."""
     raw = json.dumps(obj)
     sig = _sign(secret, raw)
     req = urllib.request.Request(
@@ -106,20 +144,25 @@ def _post(path, obj, serial, secret, ops):
         method="POST",
     )
     last_err = None
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                return json.loads(r.read().decode() or "{}")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read().decode() or "{}")
         except urllib.error.HTTPError as e:
             if e.code < 500:   # 4xx não adianta retentar
                 _log(f"POST {path} HTTP {e.code}")
-                return None
+                return e.code, None
             last_err = f"HTTP {e.code}"
         except Exception as e:
             last_err = str(e)   # DNS/timeout transiente -> retenta
-        time.sleep(2 * (attempt + 1))
-    _log(f"POST {path} falhou apos 3 tentativas: {last_err}")
-    return None
+        if attempt + 1 < attempts:
+            time.sleep(1 if attempts <= 2 else 2 * (attempt + 1))
+    _log(f"POST {path} falhou apos {attempts} tentativa(s): {last_err}")
+    return None, None
+
+
+def _post(path, obj, serial, secret, ops, timeout=20, attempts=3):
+    return _post_status(path, obj, serial, secret, ops, timeout, attempts)[1]
 
 
 def _local_get(path):
@@ -186,40 +229,76 @@ def _recent_presses(minutes=3):
     return out
 
 
+# ---------------------------------------------------------------- confirmação
+def _confirm(key, bad, need=CONFIRM_CYCLES):
+    """Conta ciclos seguidos em estado ruim. True só quando visto em `need` ciclos
+    seguidos (evita falso positivo de restart/oscilação de segundos)."""
+    if not bad:
+        _local_seen.pop(key, None)
+        return False
+    _local_seen[key] = _local_seen.get(key, 0) + 1
+    return _local_seen[key] >= need
+
+
+def _forget_unseen(prefix, keys_seen):
+    for k in [k for k in _local_seen if k.startswith(prefix) and k not in keys_seen]:
+        del _local_seen[k]
+
+
 # ---------------------------------------------------------------- checks
-def check_shinobi_8080():
-    """Shinobi 8080 morto enquanto o pm2 diz 'online' (hung) — PONTO CEGO do
-    check_service_down (que le /phoenix/status, reportado pelo pm2). Bate direto no 8080."""
-    out = []
+def _shinobi_port_ok():
     try:
         req = urllib.request.Request("http://127.0.0.1:8080/", method="GET")
         with urllib.request.urlopen(req, timeout=6) as r:
-            if r.status == 200:
-                return out
+            return r.status == 200
     except Exception:
-        pass
+        return False
+
+
+def check_shinobi_8080():
+    """Shinobi 8080 morto enquanto o pm2 diz 'online' (hung) — PONTO CEGO do
+    check_service_down (que le /phoenix/status, reportado pelo pm2). Bate direto no 8080.
+    Re-testa uma vez depois de ~5s: restart do camera.js derruba a porta por segundos."""
+    out = []
+    if _shinobi_port_ok():
+        return out
+    time.sleep(REPROBE_SEC)
+    if _shinobi_port_ok():
+        return out
     out.append({
         "type": "shinobi_port_dead", "severity": "critical",
         "detail": "Shinobi 8080 nao responde (processo pode estar 'online' no pm2 mas travado)",
-        "evidence": {"port": 8080},
+        "evidence": {"port": 8080, "reprobed": True},
         "dedupKey": "shinobi_port_dead",
     })
     return out
 
 
-def check_service_down():
-    out = []
+def _down_services():
     st = _local_get("/phoenix/status")
     if not st:
+        return None
+    return {name for name, ok in (st.get("services", {}) or {}).items() if ok is False}
+
+
+def check_service_down():
+    """Serviço caído segundo o Phoenix. Re-consulta após ~5s e só reporta o que
+    continua caído (restart do pm2 aparecia como 'caído' por 1 amostra)."""
+    out = []
+    down = _down_services()
+    if not down:
         return out
-    for name, ok in (st.get("services", {}) or {}).items():
-        if ok is False:
-            out.append({
-                "type": "service_down", "severity": "critical",
-                "detail": f"serviço {name} caído",
-                "evidence": {"service": name},
-                "dedupKey": f"service_down:{name}",
-            })
+    time.sleep(REPROBE_SEC)
+    again = _down_services()
+    if again is None:
+        return out
+    for name in sorted(down & again):
+        out.append({
+            "type": "service_down", "severity": "critical",
+            "detail": f"serviço {name} caído",
+            "evidence": {"service": name, "reprobed": True},
+            "dedupKey": f"service_down:{name}",
+        })
     return out
 
 
@@ -256,19 +335,29 @@ def check_press_without_video(presses, tolerance=20):
 
 
 def check_monitor_died():
-    """Monitor Shinobi que deveria estar gravando (mode=start) mas morreu."""
+    """Monitor Shinobi que deveria estar gravando (mode=start) mas morreu.
+    Só reporta se o status ruim aparece em 2 ciclos seguidos: o Shinobi passa por
+    'died' por alguns segundos ao reiniciar o ffmpeg (125 de 310 avisos antigos
+    duraram menos de 5 min)."""
     out = []
     mons = _local_get("/phoenix/monitors")
     if not mons:
         return out
+    seen = set()
     for mo in (mons.get("monitors", []) or []):
-        if mo.get("mode") == "start" and str(mo.get("status", "")).lower() in ("died", "failed", "error"):
+        bad = mo.get("mode") == "start" and str(mo.get("status", "")).lower() in ("died", "failed", "error")
+        key = f"monitor_died:{mo.get('mid')}"
+        if bad:
+            seen.add(key)
+        if _confirm(key, bad):
             out.append({
                 "type": "monitor_died", "severity": "critical",
                 "detail": f"câmera {mo.get('name')} caiu (status={mo.get('status')})",
-                "evidence": {"mid": mo.get("mid"), "monitor": mo.get("name"), "status": mo.get("status")},
-                "dedupKey": f"monitor_died:{mo.get('mid')}",
+                "evidence": {"mid": mo.get("mid"), "monitor": mo.get("name"), "status": mo.get("status"),
+                             "cyclesSeen": _local_seen.get(key)},
+                "dedupKey": key,
             })
+    _forget_unseen("monitor_died:", seen)
     return out
 
 
@@ -513,7 +602,7 @@ def check_memory_pressure():
     procs = _ffmpeg_rss_mb()
     worst = max(procs, key=lambda x: x["rssMb"]) if procs else None
 
-    if avail is not None and avail < MEM_AVAIL_WARN_MB:
+    if _confirm("high_memory:device", avail is not None and avail < MEM_AVAIL_WARN_MB):
         sev = "high" if avail < MEM_AVAIL_CRIT_MB else "medium"
         out.append({
             "type": "high_memory", "severity": sev,
@@ -525,7 +614,7 @@ def check_memory_pressure():
             "dedupKey": "high_memory:device",
         })
 
-    if worst and worst["rssMb"] >= FFMPEG_RSS_WARN_MB:
+    if _confirm("ffmpeg_memory_leak", bool(worst and worst["rssMb"] >= FFMPEG_RSS_WARN_MB)):
         sev = "high" if worst["rssMb"] >= FFMPEG_RSS_CRIT_MB else "medium"
         alvo = worst["monitor"] or ("pid %d" % worst["pid"])
         out.append({
@@ -541,29 +630,513 @@ def check_memory_pressure():
     return out
 
 
+# ---------------------------------------------------------------- snapshot (2.0)
+def _run(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except Exception:
+        return None, ""
+
+
+def parse_throttled(text):
+    """'throttled=0x50005' -> 0x50005 (int). None se ilegível."""
+    m = re.search(r"throttled=(0x[0-9a-fA-F]+)", text or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1), 16)
+    except ValueError:
+        return None
+
+
+def _read_temp_c():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as fh:
+            return round(int(fh.read().strip()) / 1000.0, 1)
+    except Exception:
+        return None
+
+
+def _rootfs_readonly(mounts_text=None):
+    """True se / está montado ro (última entrada de / em /proc/mounts vence)."""
+    try:
+        if mounts_text is None:
+            with open("/proc/mounts") as fh:
+                mounts_text = fh.read()
+        opts = None
+        for line in mounts_text.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[1] == "/":
+                opts = parts[3].split(",")
+        return None if opts is None else ("ro" in opts)
+    except Exception:
+        return None
+
+
+def _uptime_sec():
+    try:
+        with open("/proc/uptime") as fh:
+            return int(float(fh.read().split()[0]))
+    except Exception:
+        return None
+
+
+def _ntp_synced():
+    code, out = _run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])
+    v = (out or "").strip().lower()
+    if code != 0 or v not in ("yes", "no"):
+        return None
+    return v == "yes"
+
+
+def _dns_ok(host, timeout=4):
+    """Resolve o host do OPS numa thread (getaddrinfo não tem timeout)."""
+    if not host:
+        return None
+    res = {}
+
+    def work():
+        try:
+            socket.getaddrinfo(host, 443)
+            res["ok"] = True
+        except Exception:
+            res["ok"] = False
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    return res.get("ok", False)
+
+
+def _unit_active(*names):
+    """True/False para uma unit instalada E habilitada; None se não existe ou foi
+    desabilitada de propósito (ex.: arena de alarm input sem gravae-buttons)."""
+    for name in names:
+        code, out = _run(["systemctl", "show", name, "-p", "LoadState", "-p", "ActiveState",
+                          "-p", "UnitFileState"])
+        if code != 0:
+            continue
+        kv = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        if kv.get("LoadState") != "loaded":
+            continue
+        if kv.get("UnitFileState") not in ("enabled", "enabled-runtime", "static"):
+            return None
+        return kv.get("ActiveState") == "active"
+    return None
+
+
+def _spool_files():
+    try:
+        return sorted(f for f in os.listdir(SPOOL_DIR) if f.endswith(".json"))
+    except Exception:
+        return []
+
+
+def build_snapshot():
+    """Retrato barato da saúde da Pi, enviado em todo heartbeat. Cada campo é
+    best-effort (None quando não dá pra ler)."""
+    thr = parse_throttled(_run(["vcgencmd", "get_throttled"])[1])
+    avail, total = _meminfo_mb()
+    disk_mb = disk_pct = None
+    try:
+        st = os.statvfs("/")
+        free = st.f_bavail * st.f_frsize
+        disk_mb = int(free / (1024 * 1024))
+        disk_pct = round(100.0 * free / (st.f_blocks * st.f_frsize), 1) if st.f_blocks else None
+    except Exception:
+        pass
+    try:
+        load1 = round(os.getloadavg()[0], 2)
+    except Exception:
+        load1 = None
+    host = None
+    try:
+        host = urllib.parse.urlparse(_state.get("opsUrl") or "").hostname
+    except Exception:
+        pass
+    return {
+        "tempC": _read_temp_c(),
+        "throttled": hex(thr) if thr is not None else None,
+        "undervoltageNow": bool(thr & 0x1) if thr is not None else None,
+        "memAvailMb": avail,
+        "memTotalMb": total,
+        "diskFreeMb": disk_mb,
+        "diskFreePct": disk_pct,
+        "rootfsReadOnly": _rootfs_readonly(),
+        "load1": load1,
+        "uptimeSec": _uptime_sec(),
+        "ntpSynced": _ntp_synced(),
+        "dnsOk": _dns_ok(host),
+        "cloudflaredActive": _unit_active("cloudflared"),
+        "mariadbActive": _unit_active("mariadb", "mysql"),
+        "buttonsActive": _unit_active("gravae-buttons"),
+        "spoolChunks": len(_spool_files()),
+    }
+
+
+# ---------------------------------------------------------------- checks 2.0
+def _bucket(seconds):
+    return int(time.time() // seconds)
+
+
+def check_undervoltage(snap):
+    """Subtensão agora (bit 0) ou nova ocorrência desde o boot (bit 16 passou de
+    0 para 1 enquanto observávamos). Se a Pi já bootou com o bit 16 ligado não
+    dá para saber quando foi: não reporta (conservador)."""
+    global _prev_throttled
+    out = []
+    thr = parse_throttled(snap.get("throttled") and f"throttled={snap['throttled']}")
+    if thr is None:
+        return out
+    if thr & 0x1:
+        out.append({
+            "type": "undervoltage", "severity": "high",
+            "detail": "subtensão AGORA (fonte/cabo fraco) — causa travamento, SD corrompido e câmera caindo",
+            "evidence": {"throttled": hex(thr)},
+            "dedupKey": "undervoltage",
+        })
+    elif _prev_throttled is not None and not (_prev_throttled & 0x10000) and (thr & 0x10000):
+        out.append({
+            "type": "undervoltage", "severity": "high",
+            "detail": "houve subtensão desde a última checagem (fonte/cabo fraco)",
+            "evidence": {"throttled": hex(thr), "previous": hex(_prev_throttled)},
+            "dedupKey": f"undervoltage_event:{_bucket(3600)}",
+        })
+    _prev_throttled = thr
+    return out
+
+
+def check_high_temperature(snap):
+    t = snap.get("tempC")
+    if not _confirm("high_temperature", t is not None and t >= TEMP_WARN_C):
+        return []
+    sev = "high" if t >= TEMP_CRIT_C else "medium"
+    return [{
+        "type": "high_temperature", "severity": sev,
+        "detail": f"Pi a {t}°C (CPU estrangula acima de 80°C)",
+        "evidence": {"tempC": t, "throttled": snap.get("throttled")},
+        "dedupKey": "high_temperature",
+    }]
+
+
+def check_disk_full(snap):
+    pct, mb = snap.get("diskFreePct"), snap.get("diskFreeMb")
+    if pct is None or mb is None:
+        return []
+    if pct < DISK_CRIT_PCT or mb < DISK_CRIT_MB:
+        sev = "high"
+    elif pct < DISK_WARN_PCT:
+        sev = "medium"
+    else:
+        return []
+    return [{
+        "type": "disk_full", "severity": sev,
+        "detail": f"disco com {mb} MB livres ({pct}%)",
+        "evidence": {"diskFreeMb": mb, "diskFreePct": pct},
+        "dedupKey": "disk_full",
+    }]
+
+
+def check_sd_readonly(snap):
+    if snap.get("rootfsReadOnly") is not True:
+        return []
+    return [{
+        "type": "sd_readonly", "severity": "critical",
+        "detail": "sistema de arquivos em SOMENTE LEITURA — SD com defeito; botões e gravação param",
+        "evidence": {"rootfsReadOnly": True},
+        "dedupKey": "sd_readonly",
+    }]
+
+
+def _match_kernel(regex):
+    return [l["m"] for l in _kernel_lines if regex.search(l.get("m") or "")]
+
+
+def check_sd_errors():
+    hits = _match_kernel(_SD_ERR_RE)
+    if not hits:
+        return []
+    return [{
+        "type": "sd_errors", "severity": "high",
+        "detail": f"{len(hits)} erro(s) de SD/disco no kernel",
+        "evidence": {"lines": hits[:10]},
+        "dedupKey": f"sd_errors:{_bucket(600)}",
+    }]
+
+
+def check_oom_kill():
+    hits = _match_kernel(_OOM_RE)
+    if not hits:
+        return []
+    return [{
+        "type": "oom_kill", "severity": "high",
+        "detail": "kernel matou processo por falta de memória (OOM)",
+        "evidence": {"lines": hits[:10]},
+        "dedupKey": f"oom_kill:{_bucket(600)}",
+    }]
+
+
+def check_clock_unsynced(snap):
+    up = snap.get("uptimeSec") or 0
+    bad = snap.get("ntpSynced") is False and up > NTP_GRACE_SEC
+    if not _confirm("clock_unsynced", bad, need=4):
+        return []
+    return [{
+        "type": "clock_unsynced", "severity": "medium",
+        "detail": "relógio sem sincronizar com NTP — apertos podem cair fora da janela do vídeo",
+        "evidence": {"ntpSynced": False, "uptimeSec": up},
+        "dedupKey": "clock_unsynced",
+    }]
+
+
+def check_dns_failure(snap):
+    if not _confirm("dns_failure", snap.get("dnsOk") is False):
+        return []
+    return [{
+        "type": "dns_failure", "severity": "medium",
+        "detail": "a Pi não consegue resolver DNS (o OPS) — internet/roteador/DNS",
+        "evidence": {"dnsOk": False},
+        "dedupKey": "dns_failure",
+    }]
+
+
+def _unit_down_check(snap, field, type_, severity, detail):
+    if not _confirm(type_, snap.get(field) is False):
+        return []
+    return [{
+        "type": type_, "severity": severity, "detail": detail,
+        "evidence": {field: False},
+        "dedupKey": type_,
+    }]
+
+
+def check_tunnel_down(snap):
+    return _unit_down_check(snap, "cloudflaredActive", "tunnel_down", "high",
+                            "cloudflared (túnel de acesso remoto) parado")
+
+
+def check_database_down(snap):
+    return _unit_down_check(snap, "mariadbActive", "database_down", "critical",
+                            "MariaDB parado — Shinobi não registra eventos/vídeos")
+
+
+def check_buttons_service_down(snap):
+    return _unit_down_check(snap, "buttonsActive", "buttons_service_down", "critical",
+                            "serviço gravae-buttons parado — apertos não disparam gravação")
+
+
+# ---------------------------------------------------------------- caixa preta (journald)
+def _entry_unit(e):
+    if e.get("_TRANSPORT") == "kernel":
+        return "kernel"
+    u = e.get("_SYSTEMD_UNIT") or e.get("SYSLOG_IDENTIFIER") or "?"
+    return u[:-8] if u.endswith(".service") else u
+
+
+def _entry_msg(e):
+    m = e.get("MESSAGE")
+    if isinstance(m, list):
+        try:
+            m = bytes(m).decode("utf-8", "replace")
+        except Exception:
+            m = ""
+    return (m or "")[:MSG_MAX_CHARS]
+
+
+def parse_journal(stdout):
+    """journalctl -o json → (linhas filtradas, linhas do kernel, último cursor)."""
+    keep, kernel, cursor = [], [], None
+    for raw in (stdout or "").splitlines():
+        try:
+            e = json.loads(raw)
+        except Exception:
+            continue
+        cursor = e.get("__CURSOR") or cursor
+        try:
+            p = int(e.get("PRIORITY", 6))
+        except (TypeError, ValueError):
+            p = 6
+        try:
+            t = int(e.get("__REALTIME_TIMESTAMP")) / 1e6
+        except (TypeError, ValueError):
+            t = time.time()
+        u = _entry_unit(e)
+        line = {"t": t, "u": u, "p": p, "m": _entry_msg(e)}
+        if u == "kernel":
+            kernel.append(line)
+        if u in JOURNAL_UNITS or (u == "kernel" and p <= 4) or p <= 3:
+            keep.append(line)
+    return keep, kernel, cursor
+
+
+def collect_journal():
+    """Lê do journald o que é novo desde o cursor salvo."""
+    cursor = _state.get("journalCursor")
+    cmd = ["journalctl", "-o", "json", "--no-pager", "-n", str(JOURNAL_FETCH_MAX)]
+    cmd += ["--after-cursor", cursor] if cursor else ["--since", "-5 min"]
+    code, out = _run(cmd, timeout=15)
+    if code not in (0, None) and not out and cursor:
+        _state.pop("journalCursor", None)   # cursor inválido (journal rotacionou)
+        return [], []
+    keep, kernel, new_cursor = parse_journal(out)
+    if new_cursor:
+        _state["journalCursor"] = new_cursor
+    return keep, kernel
+
+
+def make_chunks(lines):
+    chunks = []
+    for i in range(0, len(lines), CHUNK_MAX_LINES):
+        part = lines[i:i + CHUNK_MAX_LINES]
+        seq = int(_state.get("journalSeq") or 0) + 1
+        _state["journalSeq"] = seq
+        chunks.append({
+            "seq": seq,
+            "from": datetime.fromtimestamp(part[0]["t"], timezone.utc).isoformat(),
+            "to": datetime.fromtimestamp(part[-1]["t"], timezone.utc).isoformat(),
+            "lines": part,
+        })
+    return chunks
+
+
+def _spool_path(seq):
+    return os.path.join(SPOOL_DIR, "%012d.json" % seq)
+
+
+def spool_write(chunks):
+    """Guarda chunks não enviados e aplica o ring (descarta os mais antigos)."""
+    if not chunks:
+        return
+    try:
+        os.makedirs(SPOOL_DIR, exist_ok=True)
+        for c in chunks:
+            with open(_spool_path(c["seq"]), "w") as fh:
+                json.dump(c, fh)
+        files = _spool_files()
+        sizes = {f: os.path.getsize(os.path.join(SPOOL_DIR, f)) for f in files}
+        total = sum(sizes.values())
+        for f in files:
+            if total <= SPOOL_MAX_BYTES:
+                break
+            os.remove(os.path.join(SPOOL_DIR, f))
+            total -= sizes[f]
+    except Exception as e:
+        _log(f"spool falhou: {e}")
+
+
+def spool_read():
+    out = []
+    for f in _spool_files():
+        try:
+            with open(os.path.join(SPOOL_DIR, f)) as fh:
+                out.append(json.load(fh))
+        except Exception:
+            try:
+                os.remove(os.path.join(SPOOL_DIR, f))
+            except Exception:
+                pass
+    return out
+
+
+def spool_prune(accepted_seq):
+    for f in _spool_files():
+        try:
+            if int(f.split(".")[0]) <= accepted_seq:
+                os.remove(os.path.join(SPOOL_DIR, f))
+        except Exception:
+            pass
+
+
+def _batch(chunks):
+    """Até POST_MAX_CHUNKS chunks, corpo ≤ POST_MAX_BYTES (sempre ao menos 1)."""
+    out, size = [], 0
+    for c in chunks[:POST_MAX_CHUNKS]:
+        n = len(json.dumps(c))
+        if out and size + n > POST_MAX_BYTES:
+            break
+        out.append(c)
+        size += n
+    return out
+
+
+def ship_journal(new_chunks, serial, secret, ops, deadline, online=True):
+    """Envia spool (mais antigo primeiro) + chunks novos. O que não sair fica no
+    spool em disco — é o que mostra o que aconteceu enquanto a Pi estava sem
+    internet."""
+    pending_spool = spool_read()
+    pending_new = list(new_chunks)
+    sent_any = False
+    while online and (pending_spool or pending_new) and time.time() < deadline:
+        batch = _batch(pending_spool + pending_new)
+        code, body = _post_status("/api/observation/journal",
+                                  {"obsVersion": OBS_VERSION, "chunks": batch},
+                                  serial, secret, ops, timeout=10, attempts=1)
+        if code != 200 or not isinstance(body, dict) or "acceptedSeq" not in body:
+            break
+        try:
+            acc = int(body["acceptedSeq"])
+        except (TypeError, ValueError):
+            break
+        sent_any = True
+        spool_prune(acc)
+        before = len(pending_spool) + len(pending_new)
+        pending_spool = [c for c in pending_spool if c["seq"] > acc]
+        pending_new = [c for c in pending_new if c["seq"] > acc]
+        if len(pending_spool) + len(pending_new) == before:
+            break   # OPS não avançou: tenta no próximo ciclo
+    spool_write(pending_new)
+    return sent_any
+
+
 def _cycle():
-    global _cyc
+    global _cyc, _hb_401, _kernel_lines
     _cyc += 1
+    started = time.time()
+    interval = int(_state.get("interval") or DEFAULT_INTERVAL)
+    deadline = started + max(10, interval - 5)
     serial = get_serial()
     secret = _state.get("secret")
     ops = _state.get("opsUrl")
     if not secret or not ops:
         return
 
-    _post("/api/observation/heartbeat", {"ts": time.time(), "obsVersion": OBS_VERSION}, serial, secret, ops)
+    # 1) heartbeat primeiro, com prazo curto, levando o retrato da saúde.
+    try:
+        snap = build_snapshot()
+    except Exception as e:
+        _log(f"snapshot erro: {e}")
+        snap = {}
+    code, _ = _post_status("/api/observation/heartbeat",
+                           {"ts": time.time(), "obsVersion": OBS_VERSION, "snapshot": snap},
+                           serial, secret, ops, timeout=HB_TIMEOUT, attempts=2)
+    online = code is not None
+    if code == 401:
+        _hb_401 += 1
+        if _hb_401 >= HB_401_DISABLE:
+            _log(f"OPS recusou {_hb_401} heartbeats seguidos (401) — modo desligado no OPS; desligando")
+            _hb_401 = 0
+            disable()
+            return
+    elif code is not None:
+        _hb_401 = 0
+
+    # 2) caixa preta: lê o journald novo. Sem internet vai para o spool em disco.
+    try:
+        lines, _kernel_lines = collect_journal()
+        new_chunks = make_chunks(lines)
+    except Exception as e:
+        _log(f"journal erro: {e}")
+        _kernel_lines, new_chunks = [], []
 
     # apertos recentes (3min) — alimenta press_without_video, gpio_stuck e o
     # lastPress persistido (base do gpio_idle_24h).
     presses = _recent_presses(3)
     if presses:
         lp = _state.setdefault("lastPress", {})
-        changed = False
         for mon, rec in presses.items():
             if rec["last"] > float(lp.get(mon, 0)):
                 lp[mon] = rec["last"]
-                changed = True
-        if changed:
-            save_state()
 
     found = []
     for fn, args in (
@@ -575,6 +1148,17 @@ def _cycle():
         (check_gpio_stuck, (presses,)),
         (check_gpio_idle_24h, ()),
         (check_memory_pressure, ()),
+        (check_undervoltage, (snap,)),
+        (check_high_temperature, (snap,)),
+        (check_disk_full, (snap,)),
+        (check_sd_readonly, (snap,)),
+        (check_sd_errors, ()),
+        (check_oom_kill, ()),
+        (check_clock_unsynced, (snap,)),
+        (check_dns_failure, (snap,)),
+        (check_tunnel_down, (snap,)),
+        (check_database_down, (snap,)),
+        (check_buttons_service_down, (snap,)),
     ):
         try:
             found.extend(fn(*args))
@@ -588,7 +1172,10 @@ def _cycle():
         _consecutive[dk] = _consecutive.get(dk, 0) + 1
         a["consecutiveCount"] = _consecutive[dk]
         a["firstSeenAt"] = datetime.now(timezone.utc).isoformat()
-        _post("/api/observation/report", a, serial, secret, ops)
+        # Sem internet não adianta reportar (o watchdog do OPS já vê o offline);
+        # a anomalia continua no próximo ciclo e o journal guarda o contexto.
+        if online and time.time() < deadline:
+            _post("/api/observation/report", a, serial, secret, ops, timeout=10, attempts=2)
     for dk in list(_consecutive):
         if dk not in seen:
             del _consecutive[dk]
@@ -602,12 +1189,19 @@ def _cycle():
     except Exception as e:
         _log(f"auto-heal erro: {e}")
 
+    # 3) envia a caixa preta por último, dentro do que sobra do ciclo.
+    try:
+        ship_journal(new_chunks, serial, secret, ops, deadline, online=online)
+    except Exception as e:
+        _log(f"envio do journal erro: {e}")
+    save_state()
+
 
 def _loop():
     while not _stop.is_set():
         interval = int(_state.get("interval") or DEFAULT_INTERVAL)
         until = _state.get("until")
-        if until:
+        if until:   # modo "fixo" vem sem prazo e roda até ser desligado
             try:
                 if datetime.fromisoformat(str(until).replace("Z", "+00:00")) < datetime.now(timezone.utc):
                     _log("observationUntil expirou — desligando")
@@ -619,31 +1213,40 @@ def _loop():
             _cycle()
         except Exception as e:
             _log(f"cycle erro: {e}")
+        if not _state.get("enabled"):
+            return
         _stop.wait(interval)
 
 
-def enable(secret, ops_url, interval=DEFAULT_INTERVAL, until=None, autoheal=True):
+def enable(secret, ops_url, interval=DEFAULT_INTERVAL, until=None, autoheal=True, mode=None):
     global _thread, _state
     if type(autoheal) is not bool:
         raise ValueError("autoheal must be boolean")
+    if mode is not None and mode not in MODES:
+        raise ValueError("mode must be 'semana' or 'fixo'")
     with _lock:
-        prev_lp = _state.get("lastPress", {}) if _state.get("enabled") else {}
+        keep = _state if _state.get("enabled") else {}
         _state = {"enabled": True, "secret": secret, "opsUrl": ops_url,
                   "interval": int(interval or DEFAULT_INTERVAL), "until": until,
-                  "lastPress": prev_lp, "autoheal": autoheal}
+                  "lastPress": keep.get("lastPress", {}), "autoheal": autoheal, "mode": mode,
+                  # cursor/seq da caixa preta sobrevivem a re-ativações (o OPS
+                  # descarta seq já aceito; zerar perderia o journal).
+                  "journalCursor": keep.get("journalCursor") or _state.get("journalCursor"),
+                  "journalSeq": max(int(keep.get("journalSeq") or 0), int(_state.get("journalSeq") or 0))}
         save_state()
         _stop.clear()
         if _thread is None or not _thread.is_alive():
             _thread = threading.Thread(target=_loop, daemon=True)
             _thread.start()
-    _log(f"ativado (interval={interval}s, until={until})")
+    _log(f"ativado (interval={interval}s, until={until}, mode={mode})")
     return True
 
 
 def disable():
     global _state
     with _lock:
-        _state = {"enabled": False}
+        # Mantém o seq da caixa preta: uma nova ativação continua a numeração.
+        _state = {"enabled": False, "journalSeq": int(_state.get("journalSeq") or 0)}
         save_state()
         _stop.set()
     _log("desativado")
@@ -653,7 +1256,8 @@ def disable():
 def resume_if_enabled():
     load_state()
     if _state.get("enabled") and _state.get("secret") and _state.get("opsUrl"):
-        enable(_state["secret"], _state["opsUrl"], int(_state.get("interval") or DEFAULT_INTERVAL), _state.get("until"), _state.get("autoheal", True))
+        enable(_state["secret"], _state["opsUrl"], int(_state.get("interval") or DEFAULT_INTERVAL),
+               _state.get("until"), _state.get("autoheal", True), mode=_state.get("mode"))
         return True
     return False
 
@@ -663,8 +1267,10 @@ def status():
         "enabled": bool(_state.get("enabled")),
         "interval": _state.get("interval"),
         "until": _state.get("until"),
+        "mode": _state.get("mode"),
         "running": _thread is not None and _thread.is_alive(),
         "obsVersion": OBS_VERSION,
         "supportsAutohealPolicy": True,
+        "supportsJournal": True,
         "autohealEnabled": bool(_state.get("enabled")) and _state.get("autoheal", True),
     }
