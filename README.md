@@ -21,7 +21,7 @@ Agent de monitoramento e controle para Raspberry Pi nas arenas Gravae/Replayme.
   - Limites relativos à RAM: aviso com ffmpeg em max(300 MB, 20%) ou RAM livre abaixo de 20%; ação com ffmpeg em max(450 MB, 35%) ou RAM livre abaixo de 12% com um ffmpeg no topo.
   - Acompanha a tendência de cada ffmpeg e tem uma via rápida a cada 10 s.
   - Com autoheal ligado, derruba o ffmpeg que está vazando (SIGTERM, depois SIGKILL). Se a memória continua no limite 60 s depois, roda `pm2 restart camera`.
-  - Cooldown de 10 min por monitor. Com 3 kills em 2 h, para de derrubar e escala com `ffmpeg_leak_recurring`.
+  - Cooldown de 10 min por monitor. Com 3 kills em 2 h, escala com `ffmpeg_leak_recurring` (até 1 vez a cada 2 h) e continua protegendo.
 - Orçamento de recursos:
   - Ciclo barato abre no máximo 3 processos: 1 `journalctl` para todos os checks de log, 1 `systemctl show` para todas as units e o `vcgencmd` só se não houver sysfs.
   - Pings a cada 3 ciclos, numa thread que não bloqueia o ciclo.

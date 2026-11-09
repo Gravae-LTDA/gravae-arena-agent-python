@@ -60,7 +60,7 @@ ACTIVE_RECENT_HOURS = 2   # ...enquanto a arena teve aperto nas últimas 2h
 GUARD_TICK_SEC = 10            # via rápida: só lê /proc/meminfo
 GUARD_KILL_COOLDOWN = 600      # por monitor
 GUARD_RECUR_WINDOW = 7200
-GUARD_RECUR_KILLS = 3          # 3 kills em 2 h ⇒ para de matar e escala (é config)
+GUARD_RECUR_KILLS = 3          # 3 kills em 2 h ⇒ escala como config (e continua protegendo)
 GUARD_VERIFY_SEC = 60          # ainda no limite 60s depois ⇒ pm2 restart camera
 GUARD_TERM_WAIT = 5
 LEAK_GROWTH_MB = 150
@@ -876,20 +876,22 @@ def guard_act(target, avail, total, now=None):
         return "reported"
     kills = [t for t in _guard["kills"].get(mon, []) if now - t <= GUARD_RECUR_WINDOW]
     _guard["kills"][mon] = kills
-    if len(kills) >= GUARD_RECUR_KILLS:
-        bucket = int(now // 600)
-        if _guard["recurReported"].get(mon) != bucket:
-            _guard["recurReported"][mon] = bucket
+    recurring = len(kills) >= GUARD_RECUR_KILLS
+    if recurring:
+        # Recorrente é problema de configuração, mas a proteção NÃO para: a Pi
+        # não pode travar por OOM. Escala no máximo 1× a cada 2 h por monitor.
+        last_rep = _guard["recurReported"].get(mon)
+        if last_rep is None or now - last_rep >= GUARD_RECUR_WINDOW:
+            _guard["recurReported"][mon] = now
             _queue({
                 "type": "ffmpeg_leak_recurring", "severity": "high",
-                "detail": "ffmpeg de %s vazou memória %d vezes em 2 h — parei de derrubar; é configuração do monitor"
-                          % (mon, len(kills)),
+                "detail": "ffmpeg de %s vazou memória %d vezes em 2 h — o guardião continua derrubando, "
+                          "mas é configuração do monitor" % (mon, len(kills)),
                 "evidence": {"monitor": target.get("monitor"), "pid": target.get("pid"), "rssMb": target.get("rssMb"),
                              "killsIn2h": len(kills), "memAvailMb": avail, "memTotalMb": total,
                              "config": _leak_config(target.get("monitor"))},
-                "dedupKey": "ffmpeg_leak_recurring:%s:%d" % (mon, bucket),
+                "dedupKey": "ffmpeg_leak_recurring:%s:%d" % (mon, int(now // GUARD_RECUR_WINDOW)),
             })
-        return "recurring"
     last = _guard["lastKill"].get(mon)
     if last is not None and now - last < GUARD_KILL_COOLDOWN:
         return "cooldown"
@@ -905,7 +907,7 @@ def guard_act(target, avail, total, now=None):
     _guard["pending"] = {"ts": now, "target": target}
     _log("memory-guard: ffmpeg de %s derrubado, liberou %s MB" % (mon, freed))
     _queue(_action_event("kill_ffmpeg", target, avail, total, freed))
-    return "killed"
+    return "killed_recurring" if recurring else "killed"
 
 
 def _current_ffmpeg(pids=None):
@@ -2170,8 +2172,6 @@ def monitor_config_problems(mid, mode, details, buttons=(), name=None, hevc=Fals
         probs.append("det_trigger_tags com tagLegend vazio — trigger quebra (TypeError)")
     if str(d.get("vcodec", "")).lower() == "libx264":
         probs.append("vcodec=libx264 (deveria ser copy) — CPU alta/temperatura")
-    if str(d.get("detector_buffer", "")) == "1":
-        probs.append("detector_buffer=1 (fora do padrão; infla memória do ffmpeg)")
     if str(d.get("detector_use_motion", "")) == "1":
         probs.append("detector_use_motion=1 (fora do padrão; infla memória do ffmpeg)")
     if mode not in ("start", "record") and (mid in buttons or (name and name in buttons)):

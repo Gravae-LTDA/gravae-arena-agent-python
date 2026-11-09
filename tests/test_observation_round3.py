@@ -266,7 +266,8 @@ class ConfigDrift(Base):
              'vcodec': 'libx264', 'detector_buffer': '1', 'detector_use_motion': '1'}
         probs = obs.monitor_config_problems('mon_123', 'stop', d, {'mon_123'}, 'q1', hevc=True)
         joined = ' | '.join(probs)
-        for needle in ['details.detector salvo como número', 'tagLegend', 'libx264', 'detector_buffer=1',
+        self.assertNotIn('detector_buffer', joined)   # '1' é a correção do caso SIP: não é drift
+        for needle in ['details.detector salvo como número', 'tagLegend', 'libx264',
                        'detector_use_motion=1', 'mode=stop', "mid 'mon_", 'H.265']:
             self.assertIn(needle, joined)
         self.assertEqual(obs.monitor_config_problems('quadra01_camera01', 'start',
@@ -357,20 +358,26 @@ class MemoryGuard(Base):
             self.assertEqual(obs.guard_tick(now=10_061.0), 'recovered')
         rc.assert_not_called()
 
-    def test_cooldown_and_recurring_escalation(self):
+    def test_cooldown_and_recurring_keeps_protecting(self):
         obs._state['autoheal'] = True
-        self.assertEqual(self._act(now=0.0 + 1)[0], 'killed')
+        self.assertEqual(self._act(now=1.0)[0], 'killed')
         self.assertEqual(self._act(now=300.0)[0], 'cooldown')
         self.assertEqual(self._act(now=700.0)[0], 'killed')
         self.assertEqual(self._act(now=1400.0)[0], 'killed')
         obs.drain_guard_events()
         with patch.object(obs, '_leak_config', return_value={'mid': 'q1_camera01', 'wall_clock_timestamp_ignore': '1'}):
             res, kill = self._act(now=2100.0)
-        self.assertEqual(res, 'recurring')
-        kill.assert_not_called()
-        ev = obs.drain_guard_events()[0]
-        self.assertEqual(ev['type'], 'ffmpeg_leak_recurring')
-        self.assertEqual(ev['evidence']['config']['wall_clock_timestamp_ignore'], '1')
+        self.assertEqual(res, 'killed_recurring')
+        kill.assert_called_once_with(4242)             # continua derrubando
+        evs = obs.drain_guard_events()
+        types = [e['type'] for e in evs]
+        self.assertEqual(sorted(types), ['ffmpeg_leak_recurring', 'memory_guard_action'])
+        rec = [e for e in evs if e['type'] == 'ffmpeg_leak_recurring'][0]
+        self.assertEqual(rec['evidence']['config']['wall_clock_timestamp_ignore'], '1')
+        self.assertEqual(self._act(now=2400.0)[0], 'cooldown')   # cooldown de 10 min vale também
+        with patch.object(obs, '_leak_config', return_value=None):
+            self.assertEqual(self._act(now=2800.0)[0], 'killed_recurring')
+        self.assertNotIn('ffmpeg_leak_recurring', [e['type'] for e in obs.drain_guard_events()])  # 1× a cada 2 h
 
     def test_policy_off_only_reports(self):
         obs._state['autoheal'] = False
