@@ -32,7 +32,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 PORT = 8888
-VERSION = "4.1.5"
+VERSION = "4.2.0"
 
 # PM2: sempre usar o home canonico do root. Rodar pm2 sem PM2_HOME (ou via `sudo pm2`
 # com HOME diferente) spawna God daemon duplicado (Bug6). Pinar root + este home.
@@ -5092,7 +5092,11 @@ class AgentHandler(BaseHTTPRequestHandler):
             if type(data.get('autoheal', True)) is not bool:
                 self._send_json({"error": "autoheal deve ser booleano"}, 400)
                 return
-            observation_mode.enable(secret, ops, data.get('interval', 45), data.get('until'), data.get('autoheal', True))
+            mode = data.get('mode')
+            if mode is not None and mode not in observation_mode.MODES:
+                self._send_json({"error": "mode deve ser 'semana' ou 'fixo'"}, 400)
+                return
+            observation_mode.enable(secret, ops, data.get('interval', 45), data.get('until'), data.get('autoheal', True), mode)
             self._send_json({"ok": True, **observation_mode.status()})
             return
 

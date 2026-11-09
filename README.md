@@ -2,6 +2,37 @@
 
 Agent de monitoramento e controle para Raspberry Pi nas arenas Gravae/Replayme.
 
+### Ultra Watch 2.0 (agent 4.2.0)
+
+- `POST /observation/enable` aceita `mode` (`semana` ou `fixo`). Sem `until` o modo roda até ser desligado. `/observation/status` informa `mode`, `obsVersion` e `supportsJournal`.
+- O heartbeat leva `snapshot` com temperatura, `get_throttled`, memória, disco, rootfs somente leitura, load, uptime, NTP, DNS e estado do cloudflared, MariaDB e gravae-buttons.
+- Caixa preta: as linhas novas do journald (serviços Gravaê, cloudflared, MariaDB, kernel com prioridade warning ou mais grave e qualquer erro) vão para `POST /api/observation/journal` em chunks com `seq`. Sem internet, os chunks ficam em `/var/lib/gravae/obs-spool/` (até 2 MB, descarta os mais antigos) e são enviados quando a conexão volta.
+- Checks novos: `undervoltage`, `high_temperature`, `disk_full`, `sd_readonly`, `sd_errors`, `oom_kill`, `clock_unsynced`, `dns_failure`, `tunnel_down`, `database_down` e `buttons_service_down`.
+- `video_corrupted`: MP4 terminado (mtime de 15 s ou mais) com 0 byte, ffprobe com falha, sem trilha de vídeo ou com 0,5 s ou menos. Cada arquivo é sondado uma vez, até 6 por ciclo, com `nice`. Arquivo que a fila apagou não conta.
+- `/observation/status` lê o estado salvo mesmo antes da retomada, logo após update ou restart.
+- Menos falso positivo: `monitor_died`, memória e os checks de serviço exigem 2 ciclos seguidos. `service_down` e `shinobi_port_dead` testam de novo após 5 s.
+- Checks do sistema de vídeo:
+  - Botões: `gpio_held_low`, `gpio_ghost_presses` e `trigger_rejected`.
+  - Upload: `upload_stuck` e `upload_sync_failed`.
+  - Shinobi: `shinobi_log_errors` e `shinobi_duplicate`.
+  - Pi e rede: `unexpected_reboot`, `network_degraded`, `ethernet_flapping`, `high_cpu`, `phoenix_down` e `disk_filling`.
+  - Câmeras e configuração: `camera_unstable` e `config_drift`.
+- Guardião de memória:
+  - Limites relativos à RAM: aviso com ffmpeg em max(300 MB, 20%) ou RAM livre abaixo de 20%; ação com ffmpeg em max(450 MB, 35%) ou RAM livre abaixo de 12% com um ffmpeg no topo.
+  - Acompanha a tendência de cada ffmpeg e tem uma via rápida a cada 10 s.
+  - Com autoheal ligado, derruba o ffmpeg que está vazando (SIGTERM, depois SIGKILL). Se a memória continua no limite 60 s depois, roda `pm2 restart camera`.
+  - Cooldown de 10 min por monitor. Com 3 kills em 2 h, escala com `ffmpeg_leak_recurring` (até 1 vez a cada 2 h) e continua protegendo.
+- Orçamento de recursos:
+  - Ciclo barato abre no máximo 3 processos: 1 `journalctl` para todos os checks de log, 1 `systemctl show` para todas as units e o `vcgencmd` só se não houver sysfs.
+  - Pings a cada 3 ciclos, numa thread que não bloqueia o ciclo.
+  - Consulta de vídeos parados a cada ~10 min. `config_drift` 1 vez por hora.
+  - `ffprobe` com `ionice -c3` e `nice 19`.
+  - Com load acima do nº de núcleos ou RAM livre abaixo de 350 MB, pula as camadas caras.
+  - Estado gravado no SD a cada ~90 s.
+  - O snapshot leva `obsCpuMs`, `obsRssMb`, `obsSkipped`, `tz` e `bootId`.
+- Heartbeat com 2 tentativas de 10 s. Após 40 respostas 401 seguidas (~30 min, modo desligado no OPS), a Pi desliga a observação. O guardião de memória continua ativo.
+- Nada sai da Pi com segredo: API key, groupKey, tokens e senhas são trocados por `***` no journal e nas evidências.
+
 ### Correções 4.0.4
 
 - Instalação Hands-up aceita `revision` com SHA completo e verifica o checkout antes de executar o instalador. Alterações locais impedem a instalação fixada.

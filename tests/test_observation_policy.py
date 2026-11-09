@@ -32,7 +32,15 @@ class ObservationPolicy(unittest.TestCase):
                  'check_gpio_idle_24h', 'check_memory_pressure']
         for name in names:
             p = patch.object(obs, name, return_value=[]); p.start(); self.addCleanup(p.stop)
-        with patch.object(obs, 'get_serial', return_value='pilot'), patch.object(obs, '_recent_presses', return_value={}), patch.object(obs, '_post') as post, patch.object(obs, '_maybe_autoheal') as heal:
+        names += ['check_undervoltage', 'check_high_temperature', 'check_disk_full', 'check_sd_readonly',
+                  'check_sd_errors', 'check_oom_kill', 'check_clock_unsynced', 'check_dns_failure',
+                  'check_tunnel_down', 'check_database_down', 'check_buttons_service_down', 'check_video_corrupted', 'check_upload_stuck', 'check_config_drift', 'check_unexpected_reboot', 'check_shinobi_log_errors']
+        for name in names[8:]:
+            p = patch.object(obs, name, return_value=[]); p.start(); self.addCleanup(p.stop)
+        with patch.object(obs, 'get_serial', return_value='pilot'), patch.object(obs, '_recent_presses', return_value={}), \
+             patch.object(obs, 'build_snapshot', return_value={}), patch.object(obs, 'collect_journal', return_value=([], [])), \
+             patch.object(obs, 'ship_journal'), \
+             patch.object(obs, '_post_status', return_value=(200, {})) as post, patch.object(obs, '_maybe_autoheal') as heal:
             obs._cycle()
             post.assert_called_once()
             heal.assert_not_called()
