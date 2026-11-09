@@ -20,6 +20,10 @@ class Base(unittest.TestCase):
         self.spool = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.spool, True)
         p = patch.object(obs, 'SPOOL_DIR', self.spool); p.start(); self.addCleanup(p.stop)
+        # sem cache entre chamadas nos testes de check (o ciclo limpa o cache)
+        p = patch.object(obs, '_local_get_cached', side_effect=lambda path: obs._local_get(path))
+        p.start(); self.addCleanup(p.stop)
+        p = patch.object(obs, '_cycle_cache', {}); p.start(); self.addCleanup(p.stop)
 
 
 class Snapshot(Base):
@@ -139,7 +143,7 @@ class Checks(Base):
             self.assertEqual(obs.check_shinobi_8080()[0]['type'], 'shinobi_port_dead')
 
     def test_memory_needs_two_cycles(self):
-        with patch.object(obs, '_meminfo_mb', return_value=(200, 900)), \
+        with patch.object(obs, '_meminfo_mb', return_value=(150, 900)), patch.object(obs, 'guard_act'), \
              patch.object(obs, '_ffmpeg_rss_mb', return_value=[{'pid': 1, 'rssMb': 950, 'monitor': 'q1_camera01'}]):
             self.assertEqual(obs.check_memory_pressure(), [])
             types = sorted(a['type'] for a in obs.check_memory_pressure())

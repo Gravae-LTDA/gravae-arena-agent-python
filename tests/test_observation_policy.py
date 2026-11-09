@@ -34,7 +34,7 @@ class ObservationPolicy(unittest.TestCase):
             p = patch.object(obs, name, return_value=[]); p.start(); self.addCleanup(p.stop)
         names += ['check_undervoltage', 'check_high_temperature', 'check_disk_full', 'check_sd_readonly',
                   'check_sd_errors', 'check_oom_kill', 'check_clock_unsynced', 'check_dns_failure',
-                  'check_tunnel_down', 'check_database_down', 'check_buttons_service_down', 'check_video_corrupted']
+                  'check_tunnel_down', 'check_database_down', 'check_buttons_service_down', 'check_video_corrupted', 'check_upload_stuck', 'check_config_drift', 'check_unexpected_reboot', 'check_shinobi_log_errors']
         for name in names[8:]:
             p = patch.object(obs, name, return_value=[]); p.start(); self.addCleanup(p.stop)
         with patch.object(obs, 'get_serial', return_value='pilot'), patch.object(obs, '_recent_presses', return_value={}), \
