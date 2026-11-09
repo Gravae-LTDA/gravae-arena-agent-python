@@ -298,8 +298,10 @@ class MemoryGuard(Base):
         p = [{'pid': 9, 'rssMb': 500, 'monitor': 'q1_camera01'}]
         self.assertEqual(obs.guard_target(400, 900, p)['pid'], 9)           # Pi 3: 500 MB já é ação
         self.assertIsNone(obs.guard_target(2000, 3800, p))                   # Pi 4: ainda não
-        self.assertEqual(obs.guard_target(100, 900, [{'pid': 9, 'rssMb': 200, 'monitor': None}], top_is_ffmpeg=True)['pid'], 9)
-        self.assertIsNone(obs.guard_target(100, 900, [{'pid': 9, 'rssMb': 200, 'monitor': None}], top_is_ffmpeg=False))
+        self.assertEqual(obs.guard_target(100, 900, [{'pid': 9, 'rssMb': 200, 'monitor': 'm1'}], top_is_ffmpeg=True)['pid'], 9)
+        self.assertIsNone(obs.guard_target(100, 900, [{'pid': 9, 'rssMb': 200, 'monitor': 'm1'}], top_is_ffmpeg=False))
+        # sem mid de stream do Shinobi nunca é alvo
+        self.assertIsNone(obs.guard_target(100, 900, [{'pid': 9, 'rssMb': 900, 'monitor': None}], top_is_ffmpeg=True))
 
     def test_trend_projection(self):
         t0 = 0
@@ -342,7 +344,7 @@ class MemoryGuard(Base):
         # 60s depois ainda no limite ⇒ pm2 restart camera
         still = [{'pid': 5000, 'rssMb': 600, 'monitor': 'q1_camera01'}]
         with patch.object(obs, '_meminfo_mb', return_value=(80, 900)), patch.object(obs, '_scan_ffmpeg_pids', return_value=[5000]), \
-             patch.object(obs, '_pid_info', side_effect=lambda pid: still[0]), patch.object(obs, '_restart_camera', return_value=True) as rc, \
+             patch.object(obs, '_pid_info', side_effect=lambda pid, gk=None: still[0]), patch.object(obs, '_restart_camera', return_value=True) as rc, \
              patch.object(obs.time, 'sleep'):
             r = obs.guard_tick(now=10_061.0)
         self.assertEqual(r, 'restarted')
@@ -361,9 +363,13 @@ class MemoryGuard(Base):
     def test_cooldown_and_recurring_keeps_protecting(self):
         obs._state['autoheal'] = True
         self.assertEqual(self._act(now=1.0)[0], 'killed')
+        self.assertEqual(self._act(now=30.0)[0], 'verifying')     # cooldown do aparelho
+        obs._guard['pending'] = None                               # verificação de 60s passou
         self.assertEqual(self._act(now=300.0)[0], 'cooldown')
         self.assertEqual(self._act(now=700.0)[0], 'killed')
+        obs._guard['pending'] = None
         self.assertEqual(self._act(now=1400.0)[0], 'killed')
+        obs._guard['pending'] = None
         obs.drain_guard_events()
         with patch.object(obs, '_leak_config', return_value={'mid': 'q1_camera01', 'wall_clock_timestamp_ignore': '1'}):
             res, kill = self._act(now=2100.0)
@@ -374,6 +380,7 @@ class MemoryGuard(Base):
         self.assertEqual(sorted(types), ['ffmpeg_leak_recurring', 'memory_guard_action'])
         rec = [e for e in evs if e['type'] == 'ffmpeg_leak_recurring'][0]
         self.assertEqual(rec['evidence']['config']['wall_clock_timestamp_ignore'], '1')
+        obs._guard['pending'] = None
         self.assertEqual(self._act(now=2400.0)[0], 'cooldown')   # cooldown de 10 min vale também
         with patch.object(obs, '_leak_config', return_value=None):
             self.assertEqual(self._act(now=2800.0)[0], 'killed_recurring')
@@ -450,10 +457,10 @@ class Budget(Base):
         for c in cheap:
             self.assertLessEqual(len(per.get(c, [])), 3, (c, per.get(c)))
             self.assertEqual(sorted(per.get(c, [])), ['journalctl', 'systemctl'])
-        # ciclo de rede: +2 pings (em thread)
-        self.assertEqual(sorted(per[4]), ['journalctl', 'ping', 'ping', 'systemctl'])
+        # ciclo de rede: +1 ping no gateway (em thread); internet por TCP, sem processo
+        self.assertEqual(sorted(per[4]), ['journalctl', 'ping', 'systemctl'])   # gateway ICMP; internet é TCP
         # ciclo 1: rede + 1 SQL de upload + 1 SQL do config_drift (sem streams ⇒ 0 ffprobe)
-        self.assertEqual(sorted(per[1]), ['journalctl', 'mysql', 'mysql', 'ping', 'ping', 'systemctl'])
+        self.assertEqual(sorted(per[1]), ['journalctl', 'mysql', 'mysql', 'ping', 'systemctl'])
         # ciclo 14: só upload (drift só 1×/hora; rede nos ciclos 1, 4, 7…)
         self.assertEqual(sorted(per[14]), ['journalctl', 'mysql', 'systemctl'])
         # SD: ≤1 escrita a cada 2 ciclos (~90s)

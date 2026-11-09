@@ -30,7 +30,8 @@ Agent de monitoramento e controle para Raspberry Pi nas arenas Gravae/Replayme.
   - Com load acima do nº de núcleos ou RAM livre abaixo de 350 MB, pula as camadas caras.
   - Estado gravado no SD a cada ~90 s.
   - O snapshot leva `obsCpuMs`, `obsRssMb`, `obsSkipped`, `tz` e `bootId`.
-- Heartbeat com 2 tentativas de 10 s. Após 10 respostas 401 seguidas (modo desligado no OPS), a Pi desliga a observação.
+- Heartbeat com 2 tentativas de 10 s. Após 40 respostas 401 seguidas (~30 min, modo desligado no OPS), a Pi desliga a observação. O guardião de memória continua ativo.
+- Nada sai da Pi com segredo: API key, groupKey, tokens e senhas são trocados por `***` no journal e nas evidências.
 
 ### Correções 4.0.4
 

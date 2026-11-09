@@ -128,13 +128,26 @@ class Checks(Base):
             self.assertEqual(obs.check_monitor_died(), [])
             self.assertEqual(obs.check_monitor_died()[0]['dedupKey'], 'monitor_died:m1')
 
-    def test_service_down_reprobes(self):
+    def test_service_down_confirms_on_two_reads_one_call_per_cycle(self):
         down = {'services': {'camera': False, 'buttons': True}}
         up = {'services': {'camera': True, 'buttons': True}}
-        with patch.object(obs.time, 'sleep'), patch.object(obs, '_local_get', side_effect=[down, up]):
-            self.assertEqual(obs.check_service_down(), [])
-        with patch.object(obs.time, 'sleep'), patch.object(obs, '_local_get', side_effect=[down, down]):
-            self.assertEqual(obs.check_service_down()[0]['dedupKey'], 'service_down:camera')
+        with patch.object(obs, '_cyc', 1), patch.object(obs, '_svc_cache', {'out': []}), \
+             patch.object(obs, '_local_get', side_effect=[down, up]) as get:
+            self.assertEqual(obs.check_service_down(), [])        # 1ª leitura
+            obs._cyc = 2                                          # par, mas há anomalia aberta: lê
+            self.assertEqual(obs.check_service_down(), [])        # voltou: nada
+            self.assertEqual(get.call_count, 2)
+        with patch.object(obs, '_cyc', 1), patch.object(obs, '_svc_cache', {'out': []}), \
+             patch.object(obs, '_local_get', side_effect=[down, down]) as get:
+            obs.check_service_down()
+            obs._cyc = 2
+            out = obs.check_service_down()
+        self.assertEqual(out[0]['dedupKey'], 'service_down:camera')
+        with patch.object(obs, '_cyc', 4), patch.object(obs, '_svc_cache', {'out': []}), \
+             patch.object(obs, '_local_get') as get:
+            obs._local_seen.clear(); obs._consecutive.clear()
+            self.assertEqual(obs.check_service_down(), [])        # ciclo par sem anomalia: nem consulta
+            get.assert_not_called()
 
     def test_shinobi_port_reprobes(self):
         with patch.object(obs.time, 'sleep'), patch.object(obs, '_shinobi_port_ok', side_effect=[False, True]):
@@ -246,9 +259,9 @@ class Lifecycle(Base):
         self.assertIn('snapshot', body)
         self.assertEqual(hb.call_args.kwargs, {'timeout': obs.HB_TIMEOUT, 'attempts': 2})
 
-    def test_ten_consecutive_401_disable_locally(self):
+    def test_forty_consecutive_401_disable_locally(self):
         with patch.object(obs, 'disable') as dis:
-            for _ in range(9):
+            for _ in range(39):
                 self._cycle_with(401)
             dis.assert_not_called()
             self._cycle_with(401)
@@ -256,10 +269,10 @@ class Lifecycle(Base):
 
     def test_401_counter_resets_on_success(self):
         with patch.object(obs, 'disable') as dis:
-            for _ in range(9):
+            for _ in range(39):
                 self._cycle_with(401)
             self._cycle_with(200)
-            for _ in range(9):
+            for _ in range(39):
                 self._cycle_with(401)
             dis.assert_not_called()
 

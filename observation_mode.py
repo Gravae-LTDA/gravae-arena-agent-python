@@ -89,7 +89,7 @@ MSG_MAX_CHARS = 500
 POST_MAX_CHUNKS = 10
 POST_MAX_BYTES = 256 * 1024
 HB_TIMEOUT = 10                       # heartbeat: 2 tentativas de 10s (não estoura o ciclo)
-HB_401_DISABLE = 10                   # OPS recusou 10 heartbeats seguidos ⇒ modo desligado no OPS
+HB_401_DISABLE = 40                   # ~30 min de 401 seguidos ⇒ modo desligado no OPS (o guardião segue)
 TEMP_WARN_C = 75
 TEMP_CRIT_C = 80
 DISK_CRIT_PCT = 5
@@ -107,7 +107,7 @@ NET_EVERY_CYCLES = 3          # pings (thread em segundo plano, nunca bloqueia)
 UPLOAD_EVERY_CYCLES = 13      # ~10 min: consulta de vídeos parados (1 SQL)
 SAVE_EVERY_CYCLES = 2         # estado no SD a cada ~90s (mudança crítica salva na hora)
 SEQ_RESTART_GAP = 1000        # seq pula isto no boot do módulo (estado salvo em lote)
-BACKOFF_MEM_MB = 350          # abaixo disto (ou load1 > núcleos) só roda o essencial
+BACKOFF_MEM_FRACTION = 0.12   # RAM livre abaixo de 12% do total (ou load1 > núcleos) ⇒ só o essencial
 WATCHED_UNITS = ("cloudflared", "mariadb", "mysql", "gravae-buttons", "gravae-phoenix")
 
 # Vídeo corrompido. Mesmo layout que o phoenix_daemon (EmptyCutWatchdog /
@@ -143,6 +143,14 @@ _video_floor = None  # não sonda vídeo anterior ao início da observação
 _ffprobe_missing = False
 _loaded = False
 _cycle_cache = {}   # respostas locais reaproveitadas dentro do mesmo ciclo
+_svc_cache = {"out": []}
+CYCLE_BUDGET_SEC = 40   # teto do ciclo inteiro; o que não couber vai pro ciclo seguinte
+_deadline = 0.0
+_pending_reports = []   # anomalias que não couberam no prazo (sobretudo as de aviso único)
+PENDING_REPORTS_MAX = 100
+_journal_backoff_until = 0.0
+JOURNAL_BACKOFF_SEC = 1800
+LASTPRESS_MAX_AGE = 7 * 86400
 _press_log = []     # (ts, gpio, monitor) dos [PRESS] dos últimos minutos (do journal do ciclo)
 _ionice = None
 _cost = {"cpuMs": None, "skipped": 0}
@@ -169,15 +177,25 @@ def load_state():
     return _state
 
 
+_save_lock = threading.Lock()
+
+
 def save_state():
-    try:
-        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-        tmp = STATE_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(_state, f)
-        os.replace(tmp, STATE_PATH)
-    except Exception as e:
-        _log(f"save_state falhou: {e}")
+    """Grava o estado (thread do HTTP e do ciclo podem chamar ao mesmo tempo:
+    serializa e usa um tmp único por thread)."""
+    with _save_lock:
+        tmp = "%s.tmp.%d.%d" % (STATE_PATH, os.getpid(), threading.get_ident())
+        try:
+            os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(_state, f)
+            os.replace(tmp, STATE_PATH)
+        except Exception as e:
+            _log(f"save_state falhou: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _sign(secret, raw):
@@ -228,9 +246,16 @@ def _local_get_cached(path):
     return _cycle_cache[key]
 
 
+def _remaining(cap):
+    """Timeout limitado pelo que sobra do prazo do ciclo (fora de ciclo: `cap`)."""
+    if not _deadline:
+        return cap
+    return max(0.5, min(cap, _deadline - time.time()))
+
+
 def _local_get(path):
     try:
-        with urllib.request.urlopen("http://localhost:8888" + path, timeout=8) as r:
+        with urllib.request.urlopen("http://localhost:8888" + path, timeout=_remaining(8)) as r:
             return json.loads(r.read().decode())
     except Exception:
         return None
@@ -260,6 +285,52 @@ def _shinobi_creds():
         return d.get("shinobiApiKey"), d.get("shinobiGroupKey")
     except Exception:
         return None, None
+
+
+# ---------------------------------------------------------------- segredos
+# Nada que sai da Pi (journal, evidência) pode levar API key, groupKey, token ou
+# senha. Valores exatos vêm do device.json; o resto por padrão.
+_SECRET_RES = (
+    (re.compile(r"(?i)\b(key|apikey|api_key|token|auth_token|access_token|password|passwd|pass|pwd|secret|MYSQL_PWD)"
+                r"(\s*[=:]\s*)(\"?)[^\s&\"',;}]+"), r"\1\2\3***"),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer ***"),
+    (re.compile(r"(?i)\"(password|pass|token|auth_token|apiKey|api_key|secret|shinobiApiKey)\"\s*:\s*\"[^\"]*\""),
+     r'"\1":"***"'),
+    # http://host:8080/<apikey>/motion|monitor|videos/... (API key do Shinobi no caminho)
+    (re.compile(r"(?i)((?:https?://)?[A-Za-z0-9.\-]+:\d+/)([A-Za-z0-9_\-]{10,})(/(?:motion|monitor|videos|events|"
+                r"configureMonitor|api|mp4|jpeg|hls|flv|mjpeg|embed|timelapse)\b)"), r"\1***\3"),
+)
+_secret_cache = {"ts": 0.0, "values": []}
+
+
+def _secret_values():
+    now = time.time()
+    if now - _secret_cache["ts"] < 300:
+        return _secret_cache["values"]
+    vals = set()
+    try:
+        with open(DEVICE_PATH) as fh:
+            d = json.load(fh)
+        for k, v in d.items():
+            if isinstance(v, str) and len(v) >= 8 and re.search(r"(?i)key|token|secret|pass", k):
+                vals.add(v)
+    except Exception:
+        pass
+    if isinstance(_state.get("secret"), str) and len(_state["secret"]) >= 8:
+        vals.add(_state["secret"])
+    _secret_cache.update(ts=now, values=sorted(vals, key=len, reverse=True))
+    return _secret_cache["values"]
+
+
+def redact(text):
+    if not text:
+        return text
+    for v in _secret_values():
+        if v in text:
+            text = text.replace(v, "***")
+    for rx, sub in _SECRET_RES:
+        text = rx.sub(sub, text)
+    return text
 
 
 # ---------------------------------------------------------------- presses
@@ -328,7 +399,7 @@ def _forget_unseen(prefix, keys_seen):
 def _shinobi_port_ok():
     try:
         req = urllib.request.Request("http://127.0.0.1:8080/", method="GET")
-        with urllib.request.urlopen(req, timeout=6) as r:
+        with urllib.request.urlopen(req, timeout=_remaining(6)) as r:
             return r.status == 200
     except Exception:
         return False
@@ -341,6 +412,8 @@ def check_shinobi_8080():
     out = []
     if _shinobi_port_ok():
         return out
+    if _deadline and _deadline - time.time() < REPROBE_SEC + 7:
+        return out   # sem tempo para re-testar neste ciclo: confere no próximo
     time.sleep(REPROBE_SEC)
     if _shinobi_port_ok():
         return out
@@ -353,32 +426,41 @@ def check_shinobi_8080():
     return out
 
 
-def _down_services(fresh=False):
-    st = _local_get("/phoenix/status") if fresh else _local_get_cached("/phoenix/status")
+def _down_services():
+    st = _local_get_cached("/phoenix/status")
     if not st:
         return None
     return {name for name, ok in (st.get("services", {}) or {}).items() if ok is False}
 
 
+def _service_anomaly_open():
+    return any(k.startswith("service_down:") for k in list(_local_seen) + list(_consecutive))
+
+
 def check_service_down():
-    """Serviço caído segundo o Phoenix. Re-consulta após ~5s e só reporta o que
-    continua caído (restart do pm2 aparecia como 'caído' por 1 amostra)."""
-    out = []
+    """Serviço caído segundo o Phoenix. /phoenix/status roda `pm2 jlist` no
+    servidor HTTP do próprio agent: no máximo 1 consulta por ciclo, e só a cada
+    2 ciclos quando está tudo bem. Confirma em 2 leituras seguidas (com algo
+    caído, lê todo ciclo)."""
+    if _cyc % 2 == 0 and not _service_anomaly_open():
+        return list(_svc_cache["out"])
     down = _down_services()
-    if not down:
-        return out
-    time.sleep(REPROBE_SEC)
-    again = _down_services(fresh=True)
-    if again is None:
-        return out
-    for name in sorted(down & again):
-        out.append({
-            "type": "service_down", "severity": "critical",
-            "detail": f"serviço {name} caído",
-            "evidence": {"service": name, "reprobed": True},
-            "dedupKey": f"service_down:{name}",
-        })
-    return out
+    if down is None:
+        return list(_svc_cache["out"])
+    out, seen = [], set()
+    for name in sorted(down):
+        key = f"service_down:{name}"
+        seen.add(key)
+        if _confirm(key, True):
+            out.append({
+                "type": "service_down", "severity": "critical",
+                "detail": f"serviço {name} caído",
+                "evidence": {"service": name, "readsDown": _local_seen.get(key)},
+                "dedupKey": key,
+            })
+    _forget_unseen("service_down:", seen)
+    _svc_cache["out"] = out
+    return list(out)
 
 
 def check_press_without_video(presses, tolerance=20):
@@ -635,7 +717,9 @@ def _meminfo_mb():
 
 
 def _proc_list():
-    """Uma varredura do /proc por ciclo (sem ps). Detalha só node e ffmpeg."""
+    """Uma varredura do /proc por ciclo (sem ps). Guarda os ffmpeg e os node do
+    Shinobi. O camera.js é achado pelo cmdline: o pm2 troca o título do
+    processo e o comm pode não ser 'node'."""
     key = ("procs",)
     if key in _cycle_cache:
         return _cycle_cache[key]
@@ -648,10 +732,11 @@ def _proc_list():
         try:
             with open("/proc/%s/comm" % pid) as fh:
                 comm = fh.read().strip()
-            if comm not in ("ffmpeg", "node"):
-                continue
             with open("/proc/%s/cmdline" % pid, "rb") as fh:
-                argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\x00") if a]
+                raw = fh.read()
+            if comm != "ffmpeg" and b"camera.js" not in raw and comm != "node":
+                continue
+            argv = [a.decode("utf-8", "replace") for a in raw.split(b"\x00") if a]
             rss = uid = None
             with open("/proc/%s/status" % pid) as fh:
                 for line in fh:
@@ -660,7 +745,7 @@ def _proc_list():
                     elif line.startswith("Uid:"):
                         uid = int(line.split()[1])
             item = {"pid": int(pid), "comm": comm, "argv": argv, "rssMb": rss, "uid": uid}
-            if comm == "node":
+            if comm != "ffmpeg":
                 try:
                     item["cwd"] = os.readlink("/proc/%s/cwd" % pid)
                 except OSError:
@@ -679,8 +764,11 @@ def _ffmpeg_rss_mb():
     for p in _proc_list():
         if p["comm"] != "ffmpeg" or p["rssMb"] is None:
             continue
-        m = re.search(r"[A-Za-z0-9]+_camera[0-9]+", " ".join(p["argv"]))
-        out.append({"pid": p["pid"], "rssMb": p["rssMb"], "monitor": m.group(0) if m else None})
+        mid = stream_mid(p["argv"])
+        if not mid:
+            m = re.search(r"[A-Za-z0-9]+_camera[0-9]+", " ".join(p["argv"]))
+            mid = m.group(0) if m else None
+        out.append({"pid": p["pid"], "rssMb": p["rssMb"], "monitor": mid})
     return out
 
 
@@ -693,29 +781,75 @@ def mem_thresholds(total_mb):
 
 
 _guard = {"pids": [], "kills": {}, "lastKill": {}, "pending": None, "events": [], "rss": {},
-          "recurReported": {}}
-_guard_lock = threading.Lock()
+          "recurReported": {}, "watch": False}
+_guard_lock = threading.Lock()   # eventos (cycle drena, guard enfileira)
+_act_lock = threading.Lock()     # decisão + kill: um ator por vez
+_guard_stop = threading.Event()  # o guardião não para com disable()
 _guard_thread = None
-_MON_RE = re.compile(r"[A-Za-z0-9]+_camera[0-9]+")
+GUARD_EVENTS_MAX = 50
 
 
-def _pid_info(pid):
-    """{pid, rssMb, monitor} de um ffmpeg pelo /proc; None se já morreu."""
+def _read_ppid(pid):
     try:
+        with open("/proc/%d/stat" % pid) as fh:
+            raw = fh.read()
+        return int(raw[raw.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            return [a.decode("utf-8", "replace") for a in fh.read().split(b"\x00") if a]
+    except OSError:
+        return []
+
+
+def _under_shinobi(pid, depth=5):
+    """Algum ancestral (até 5 níveis) é o camera.js/singleCamera.js do Shinobi."""
+    cur = pid
+    for _ in range(depth):
+        cur = _read_ppid(cur)
+        if not cur or cur <= 1:
+            return False
+        if any(os.path.basename(a) in ("camera.js", "singleCamera.js") for a in _cmdline(cur)):
+            return True
+    return False
+
+
+def stream_mid(argv, gk=None):
+    """mid do ffmpeg de stream ao vivo do Shinobi: o cmdline escreve em
+    /streams/<groupKey>/<mid>/. Gravação de corte, ffmpeg do agent/device-client
+    e testes não têm esse caminho."""
+    for a in argv:
+        m = re.search(r"/streams/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)(/|$)", a)
+        if m and (gk is None or m.group(1) == gk):
+            return m.group(2)
+    return None
+
+
+def _pid_info(pid, gk=None):
+    """{pid, rssMb, monitor} de um ffmpeg de stream do Shinobi; None se morreu
+    ou não é alvo (sem /streams/<gk>/<mid> ou fora da árvore do camera.js)."""
+    try:
+        with open("/proc/%d/comm" % pid) as fh:
+            if fh.read().strip() != "ffmpeg":
+                return None
         rss = None
         with open("/proc/%d/status" % pid) as fh:
             for line in fh:
                 if line.startswith("VmRSS:"):
                     rss = int(line.split()[1]) // 1024
                     break
-        with open("/proc/%d/cmdline" % pid, "rb") as fh:
-            cmd = fh.read().replace(b"\x00", b" ").decode("utf-8", "replace")
     except (OSError, ValueError):
         return None
     if rss is None:
         return None
-    m = _MON_RE.search(cmd)
-    return {"pid": pid, "rssMb": rss, "monitor": m.group(0) if m else None}
+    mid = stream_mid(_cmdline(pid), gk)
+    if not mid or not _under_shinobi(pid):
+        return None
+    return {"pid": pid, "rssMb": rss, "monitor": mid}
 
 
 def _scan_ffmpeg_pids():
@@ -764,9 +898,10 @@ def _top_rss_is_ffmpeg():
 
 
 def guard_target(avail, total, procs, top_is_ffmpeg=None):
-    """ffmpeg que deve ser derrubado agora, ou None.
-    Age quando um ffmpeg passa de max(450 MB, 35% da RAM), ou quando a RAM
-    disponível cai abaixo de 12% e o maior processo da Pi é um ffmpeg."""
+    """ffmpeg que deve ser derrubado agora, ou None. `procs` só contém ffmpeg de
+    stream do Shinobi (ver _pid_info). Age quando um passa de max(450 MB, 35% da
+    RAM), ou quando a RAM livre cai abaixo de 12% e o maior processo é ffmpeg."""
+    procs = [p for p in procs or [] if p.get("monitor")]
     if not procs:
         return None
     th = mem_thresholds(total)
@@ -788,12 +923,23 @@ def _guard_policy():
 def _queue(ev):
     with _guard_lock:
         _guard["events"].append(ev)
+        del _guard["events"][:-GUARD_EVENTS_MAX]
 
 
 def drain_guard_events():
     with _guard_lock:
         ev, _guard["events"] = _guard["events"], []
     return ev
+
+
+def _prune_guard(now):
+    for d in ("lastKill", "recurReported"):
+        for k in [k for k, t in _guard[d].items() if now - t > GUARD_RECUR_WINDOW]:
+            del _guard[d][k]
+    for k in list(_guard["kills"]):
+        _guard["kills"][k] = [t for t in _guard["kills"][k] if now - t <= GUARD_RECUR_WINDOW]
+        if not _guard["kills"][k]:
+            del _guard["kills"][k]
 
 
 def _leak_config(monitor):
@@ -846,8 +992,8 @@ def _kill_pid(pid):
 
 
 def _action_event(action, target, avail, total, freed, extra=None):
-    mon = target.get("monitor") or "pid %s" % target.get("pid")
-    ev = {"monitor": target.get("monitor"), "pid": target.get("pid"), "rssMb": target.get("rssMb"),
+    mon = target.get("monitor")
+    ev = {"monitor": mon, "pid": target.get("pid"), "rssMb": target.get("rssMb"),
           "memAvailMb": avail, "memTotalMb": total, "action": action, "freedMb": freed}
     ev.update(extra or {})
     return {
@@ -861,25 +1007,46 @@ def _action_event(action, target, avail, total, freed, extra=None):
 
 
 def guard_act(target, avail, total, now=None):
-    """Age (ou só reporta, com a política de autoheal desligada) sobre o ffmpeg alvo."""
+    """Age (ou só reporta, com a política de autoheal desligada) sobre o ffmpeg
+    alvo. Chamado só pela thread do guardião (um ator, sob _act_lock)."""
     now = now or time.time()
-    mon = target.get("monitor") or "pid %s" % target.get("pid")
-    if not _guard_policy():
-        _queue({
-            "type": "ffmpeg_memory_leak", "severity": "high",
-            "detail": "ffmpeg de %s com %s MB e RAM em %s/%s MB — risco de OOM travar a Pi (autoheal desligado: só aviso)"
-                      % (mon, target.get("rssMb"), avail, total),
-            "evidence": {"monitor": target.get("monitor"), "pid": target.get("pid"), "rssMb": target.get("rssMb"),
-                         "memAvailMb": avail, "memTotalMb": total, "autoheal": False},
-            "dedupKey": "ffmpeg_memory_leak:%s" % (target.get("monitor") or "device"),
-        })
-        return "reported"
-    kills = [t for t in _guard["kills"].get(mon, []) if now - t <= GUARD_RECUR_WINDOW]
-    _guard["kills"][mon] = kills
-    recurring = len(kills) >= GUARD_RECUR_KILLS
+    mon = target.get("monitor")
+    if not mon:
+        return "no_target"
+    with _act_lock:
+        _prune_guard(now)
+        if not _guard_policy():
+            _queue({
+                "type": "ffmpeg_memory_leak", "severity": "high",
+                "detail": "ffmpeg de %s com %s MB e RAM em %s/%s MB — risco de OOM travar a Pi (autoheal desligado: só aviso)"
+                          % (mon, target.get("rssMb"), avail, total),
+                "evidence": {"monitor": mon, "pid": target.get("pid"), "rssMb": target.get("rssMb"),
+                             "memAvailMb": avail, "memTotalMb": total, "autoheal": False},
+                "dedupKey": "ffmpeg_memory_leak:%s" % mon,
+            })
+            return "reported"
+        if _guard["pending"]:
+            return "verifying"   # cooldown do aparelho: espera a verificação de 60s
+        last = _guard["lastKill"].get(mon)
+        if last is not None and now - last < GUARD_KILL_COOLDOWN:
+            return "cooldown"
+        kills = _guard["kills"].get(mon, [])
+        recurring = len(kills) >= GUARD_RECUR_KILLS
+        _log("memory-guard: RAM %s/%s MB, ffmpeg de %s (pid %s) com %s MB — derrubando (SIGTERM→SIGKILL)"
+             % (avail, total, mon, target.get("pid"), target.get("rssMb")))
+        _kill_pid(int(target["pid"]))     # mata PRIMEIRO; evidência depois
+        time.sleep(3)
+        after, _ = _meminfo_mb()
+        freed = (after - avail) if (after is not None and avail is not None) else None
+        kills.append(now)
+        _guard["kills"][mon] = kills
+        _guard["lastKill"][mon] = now
+        _guard["pending"] = {"ts": now, "target": target}
+        _log("memory-guard: ffmpeg de %s derrubado, liberou %s MB" % (mon, freed))
+        _queue(_action_event("kill_ffmpeg", target, avail, total, freed))
     if recurring:
-        # Recorrente é problema de configuração, mas a proteção NÃO para: a Pi
-        # não pode travar por OOM. Escala no máximo 1× a cada 2 h por monitor.
+        # Recorrente é configuração, mas a proteção NÃO para: a Pi não pode
+        # travar por OOM. Escala no máximo 1× a cada 2 h por monitor.
         last_rep = _guard["recurReported"].get(mon)
         if last_rep is None or now - last_rep >= GUARD_RECUR_WINDOW:
             _guard["recurReported"][mon] = now
@@ -887,33 +1054,22 @@ def guard_act(target, avail, total, now=None):
                 "type": "ffmpeg_leak_recurring", "severity": "high",
                 "detail": "ffmpeg de %s vazou memória %d vezes em 2 h — o guardião continua derrubando, "
                           "mas é configuração do monitor" % (mon, len(kills)),
-                "evidence": {"monitor": target.get("monitor"), "pid": target.get("pid"), "rssMb": target.get("rssMb"),
+                "evidence": {"monitor": mon, "pid": target.get("pid"), "rssMb": target.get("rssMb"),
                              "killsIn2h": len(kills), "memAvailMb": avail, "memTotalMb": total,
-                             "config": _leak_config(target.get("monitor"))},
+                             "config": _leak_config(mon)},
                 "dedupKey": "ffmpeg_leak_recurring:%s:%d" % (mon, int(now // GUARD_RECUR_WINDOW)),
             })
-    last = _guard["lastKill"].get(mon)
-    if last is not None and now - last < GUARD_KILL_COOLDOWN:
-        return "cooldown"
-    _log("memory-guard: RAM %s/%s MB, ffmpeg de %s (pid %s) com %s MB — derrubando (SIGTERM→SIGKILL)"
-         % (avail, total, mon, target.get("pid"), target.get("rssMb")))
-    _kill_pid(int(target["pid"]))
-    time.sleep(3)
-    after, _ = _meminfo_mb()
-    freed = (after - avail) if (after is not None and avail is not None) else None
-    kills.append(now)
-    _guard["kills"][mon] = kills
-    _guard["lastKill"][mon] = now
-    _guard["pending"] = {"ts": now, "target": target}
-    _log("memory-guard: ffmpeg de %s derrubado, liberou %s MB" % (mon, freed))
-    _queue(_action_event("kill_ffmpeg", target, avail, total, freed))
-    return "killed_recurring" if recurring else "killed"
+        return "killed_recurring"
+    return "killed"
 
 
 def _current_ffmpeg(pids=None):
+    """ffmpeg de stream do Shinobi. Sem `pids`, varre o /proc na hora (o
+    guardião não depende da lista do último ciclo)."""
+    _, gk = _shinobi_creds()
     procs = []
-    for pid in (pids if pids is not None else (_guard["pids"] or _scan_ffmpeg_pids())):
-        info = _pid_info(pid)
+    for pid in (pids if pids is not None else _scan_ffmpeg_pids()):
+        info = _pid_info(pid, gk)
         if info:
             procs.append(info)
     return procs
@@ -922,9 +1078,10 @@ def _current_ffmpeg(pids=None):
 def _guard_verify(avail, total, now):
     """60s após derrubar: se ainda no limite, pm2 restart camera (com cooldown)."""
     global _last_autoheal
-    pend = _guard["pending"]
-    _guard["pending"] = None
-    procs = _current_ffmpeg(_scan_ffmpeg_pids())
+    with _act_lock:
+        pend = _guard["pending"]
+        _guard["pending"] = None
+    procs = _current_ffmpeg()
     if not guard_target(avail, total, procs):
         return "recovered"
     if not _guard_policy():
@@ -943,15 +1100,19 @@ def _guard_verify(avail, total, now):
 
 
 def guard_tick(now=None):
-    """Via rápida (a cada 10s): só /proc/meminfo; lê os ffmpeg apenas quando a
-    RAM disponível está abaixo da linha de aviso. Nunca abre processo."""
+    """Via rápida (a cada 10s): só /proc/meminfo. Varre os ffmpeg (no /proc,
+    sem abrir processo) só quando a RAM está abaixo da linha de aviso ou o
+    ciclo viu um ffmpeg grande. Única thread que derruba processo."""
     now = now or time.time()
     avail, total = _meminfo_mb()
     if avail is None:
         return "noread"
-    if _guard["pending"] and now - _guard["pending"]["ts"] >= GUARD_VERIFY_SEC:
-        return _guard_verify(avail, total, now)
-    if avail >= mem_thresholds(total)["warnAvail"]:
+    pend = _guard["pending"]
+    if pend:
+        if now - pend["ts"] >= GUARD_VERIFY_SEC:
+            return _guard_verify(avail, total, now)
+        return "verifying"
+    if avail >= mem_thresholds(total)["warnAvail"] and not _guard.get("watch"):
         return "ok"
     target = guard_target(avail, total, _current_ffmpeg())
     if not target:
@@ -960,7 +1121,7 @@ def guard_tick(now=None):
 
 
 def _guard_loop():
-    while not _stop.wait(GUARD_TICK_SEC):
+    while not _guard_stop.wait(GUARD_TICK_SEC):
         try:
             guard_tick()
         except Exception as e:
@@ -1066,10 +1227,9 @@ def check_memory_pressure(now=None):
                 "dedupKey": "ffmpeg_memory_leak:%s" % (p["monitor"] or "device"),
             })
 
-    # linha de ação: o guardião age (ou só avisa, sem autoheal)
-    target = guard_target(avail, total, procs) if avail is not None else None
-    if target:
-        guard_act(target, avail, total, now)
+    # Quem age é só a thread do guardião; o ciclo avisa que há ffmpeg grande
+    # para ela olhar os processos mesmo com RAM folgada (Pi de 4–8 GB).
+    _guard["watch"] = bool(worst and worst["rssMb"] >= th["warnRss"])
     out.extend(drain_guard_events())
     return out
 
@@ -1687,7 +1847,7 @@ def check_trigger_rejected():
         if not (refused or bad_code):
             continue
         mon = m.group(1) if m else "desconhecido"
-        per_mon.setdefault(mon, []).append(msg[:200])
+        per_mon.setdefault(mon, []).append(redact(msg)[:200])
     bucket = _bucket(600)
     return [{
         "type": "trigger_rejected", "severity": "critical",
@@ -1730,7 +1890,34 @@ def _mysql(sql, timeout=8):
     return [[_mysql_unescape(c) for c in line.split("\t")] for line in r.stdout.splitlines() if line]
 
 
-def _stuck_local_files(gk, now):
+MEDIA_MODE_FILES = ("/var/lib/gravae-device-client/media-mode.json", "/etc/gravae/media-mode.json")
+
+
+def _media_mode():
+    """'DIRECT' ou 'LEGACY'. Em DIRECT o upload é da fila própria
+    (direct_upload_queue) e o Videos.status do Shinobi não significa nada."""
+    for path in MEDIA_MODE_FILES:
+        try:
+            with open(path) as fh:
+                if (json.load(fh) or {}).get("mode") == "DIRECT":
+                    return "DIRECT"
+        except Exception:
+            continue
+    return "LEGACY"
+
+
+def _record_mode_mids():
+    """Monitores em mode=record gravam contínuo; os arquivos deles não são
+    cortes que a fila sobe."""
+    mons = _local_get_cached("/phoenix/monitors") or {}
+    out = set()
+    for mo in (mons.get("monitors", []) or []):
+        if mo.get("mode") == "record":
+            out.update(x for x in (mo.get("mid"), mo.get("name")) if x)
+    return out
+
+
+def _stuck_local_files(gk, now, skip=()):
     old, sample = [], []
     for base in VIDEO_DIRS:
         root = os.path.join(base, gk)
@@ -1739,6 +1926,8 @@ def _stuck_local_files(gk, now):
         except OSError:
             continue
         for mon in mons:
+            if mon in skip:
+                continue
             d = os.path.join(root, mon)
             try:
                 names = os.listdir(d)
@@ -1761,19 +1950,26 @@ def _stuck_local_files(gk, now):
 
 def check_upload_stuck(run=True):
     """Vídeo com conteúdo parado na Pi: a fila puxa e apaga em minutos.
-    Videos status=1 (não lido) com tamanho real há >20 min, ou mp4 >0 byte há
-    >30 min na pasta. `run` (camada de ~10 min) faz 1 SQL + 1 varredura de
-    pasta; nos outros ciclos repete o último resultado (anomalia persistente)."""
+    LEGACY: a fila (gravae-watcher) puxa os Videos com status != 2; status=1 com
+    tamanho real há >20 min é vídeo que não subiu. DIRECT: a fila própria apaga
+    o mp4 local só depois do upload confirmado, então vale só o arquivo >0 byte
+    há >30 min na pasta. Monitores em mode=record ficam de fora. `run` (camada
+    de ~10 min) faz 1 SQL + 1 varredura; nos outros ciclos repete o resultado."""
     if not run:
         return list(_upload_cache["out"])
     _, gk = _shinobi_creds()
     out = []
     if gk and _KEY_RE.fullmatch(gk):
         now = time.time()
-        rows = _mysql(
-            "SELECT mid, time, TIMESTAMPDIFF(MINUTE, time, NOW()) FROM Videos "
-            f"WHERE ke='{gk}' AND status=1 AND size>0 AND time < NOW() - INTERVAL {UPLOAD_DB_STUCK_MIN} MINUTE "
-            "AND time > NOW() - INTERVAL 2 DAY ORDER BY time LIMIT 200") or []
+        mode = _media_mode()
+        skip = _record_mode_mids()
+        rows = []
+        if mode == "LEGACY":
+            rows = _mysql(
+                "SELECT mid, time, TIMESTAMPDIFF(MINUTE, time, NOW()) FROM Videos "
+                f"WHERE ke='{gk}' AND status=1 AND size>0 AND time < NOW() - INTERVAL {UPLOAD_DB_STUCK_MIN} MINUTE "
+                "AND time > NOW() - INTERVAL 2 DAY ORDER BY time LIMIT 200") or []
+            rows = [r for r in rows if r and r[0] not in skip]
         db_count = len(rows)
         db_oldest = 0
         try:
@@ -1781,12 +1977,12 @@ def check_upload_stuck(run=True):
         except (ValueError, IndexError):
             pass
         db_sample = [f"{r[0]} {r[1]}" for r in rows[:5] if len(r) >= 2]
-        files, fsample = _stuck_local_files(gk, now)
+        files, fsample = _stuck_local_files(gk, now, skip)
         if db_count >= 2 or len(files) >= 2:
             out.append({
                 "type": "upload_stuck", "severity": "high",
                 "detail": f"vídeos parados na Pi sem subir (banco: {db_count}, pasta: {len(files)})",
-                "evidence": {"dbUnread": db_count, "dbOldestMin": db_oldest, "dbSample": db_sample,
+                "evidence": {"mediaMode": mode, "dbUnread": db_count, "dbOldestMin": db_oldest, "dbSample": db_sample,
                              "localFiles": len(files),
                              "localOldestMin": int(max(files) / 60) if files else 0,
                              "localSample": fsample},
@@ -1850,7 +2046,7 @@ def check_shinobi_log_errors():
             if m:
                 kinds.add(m.group(0).upper().replace(" ", "_"))
                 if len(hits) < 5:
-                    hits.append(line.strip()[:300])
+                    hits.append(redact(line.strip())[:300])
     if not hits:
         return []
     return [{
@@ -1862,12 +2058,13 @@ def check_shinobi_log_errors():
 
 
 def _camera_js_procs():
+    """Processos principais do Shinobi: argumento cujo nome é exatamente
+    camera.js (os workers singleCamera.js não contam)."""
     out = []
     for p in _proc_list():
-        argv = p["argv"]
-        if p["comm"] != "node" or len(argv) < 2:
+        if p["comm"] == "ffmpeg":
             continue
-        if any(os.path.basename(a) == "camera.js" for a in argv[1:]):
+        if any(os.path.basename(a) == "camera.js" for a in p["argv"]):
             out.append({"pid": p["pid"], "uid": p["uid"], "cwd": p.get("cwd")})
     return out
 
@@ -1894,9 +2091,46 @@ def _boot_id():
         return None
 
 
+PHOENIX_REBOOT_STATE = "/var/log/gravae/reboot_state.json"
+EXPECTED_REBOOT_MARKER = "/var/lib/gravae/expected-reboot"
+
+
+def _agent_initiated_reboot(uptime_sec, now=None):
+    """O próprio sistema pediu o reboot? Phoenix grava o horário em
+    reboot_state.json antes de `systemctl reboot` (escalonamento offline); outros
+    fluxos podem tocar /var/lib/gravae/expected-reboot. Vale se foi até 20 min
+    antes do boot atual."""
+    now = now or time.time()
+    if uptime_sec is None:
+        return False
+    boot = now - uptime_sec
+    try:
+        mt = os.path.getmtime(EXPECTED_REBOOT_MARKER)
+        if boot - 1200 <= mt <= boot + 60:
+            try:
+                os.remove(EXPECTED_REBOOT_MARKER)
+            except OSError:
+                pass
+            return True
+    except OSError:
+        pass
+    try:
+        with open(PHOENIX_REBOOT_STATE) as fh:
+            stamps = json.load(fh).get("timestamps") or []
+        for st in stamps[-5:]:
+            t = datetime.fromisoformat(str(st)).timestamp()   # hora local, como o Phoenix grava
+            if boot - 1200 <= t <= boot + 60:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def check_unexpected_reboot(snap):
     """A Pi reiniciou desde a última checagem. Junta as últimas linhas do boot
-    anterior (journal persistente) e diz se foi desligamento limpo."""
+    anterior e diz se foi desligamento limpo. Raspberry Pi OS guarda o journal
+    em RAM por padrão: sem o boot anterior, o motivo fica desconhecido (medium).
+    Reboot pedido pelo próprio sistema (Phoenix/update) não é reportado."""
     bid = snap.get("bootId") or _boot_id()
     if not bid:
         return []
@@ -1904,16 +2138,27 @@ def check_unexpected_reboot(snap):
     _state["bootId"] = bid
     if not prev or prev == bid:
         return []
+    if _agent_initiated_reboot(snap.get("uptimeSec")):
+        _log("reboot pedido pelo próprio sistema (Phoenix/update) — não reporto")
+        return []
     code, out = _run(["journalctl", "-b", "-1", "-n", "40", "--no-pager", "-o", "short-iso"], timeout=10)
-    lines = [l[:300] for l in (out or "").splitlines() if l and not l.startswith("-- ")] if code == 0 else []
-    clean = any(_CLEAN_SHUTDOWN_RE.search(l) for l in lines) if lines else None
+    lines = [redact(l)[:300] for l in (out or "").splitlines() if l and not l.startswith("-- ")] if code == 0 else []
     thr = parse_throttled(snap.get("throttled") and f"throttled={snap['throttled']}")
+    uv = bool(thr & 0x10000) if thr is not None else None
+    if not lines:
+        sev, clean = "medium", None
+        detail = "a Pi reiniciou — motivo desconhecido (journal não persistente)"
+    else:
+        clean = any(_CLEAN_SHUTDOWN_RE.search(l) for l in lines)
+        sev = "medium" if clean else "high"
+        detail = "a Pi reiniciou" + (" (desligamento limpo)" if clean else
+                                     " sem desligamento limpo — queda de energia/travamento")
+    if uv:
+        detail += "; houve subtensão desde o boot"
     return [{
-        "type": "unexpected_reboot", "severity": "medium" if clean else "high",
-        "detail": "a Pi reiniciou" + (" (desligamento limpo)" if clean else
-                                      " sem desligamento limpo — queda de energia/travamento"),
+        "type": "unexpected_reboot", "severity": sev, "detail": detail,
         "evidence": {"previousBootId": prev, "bootId": bid, "cleanShutdown": clean,
-                     "undervoltageSinceBoot": bool(thr & 0x10000) if thr is not None else None,
+                     "journalPersistent": bool(lines), "undervoltageSinceBoot": uv,
                      "uptimeSec": snap.get("uptimeSec"), "previousBootLastLines": lines[-40:]},
         "dedupKey": f"unexpected_reboot:{bid}",
     }]
@@ -1949,18 +2194,34 @@ def _ping(host, res, key):
     res[key] = parse_ping(out) if out else (None, None)
 
 
+def tcp_probe(host="1.1.1.1", port=443, tries=3, timeout=1.0):
+    """(perda %, conexão média ms) por TCP — ICMP costuma ser bloqueado na
+    internet das arenas, TCP 443 não."""
+    ok, times = 0, []
+    for _ in range(tries):
+        t0 = time.time()
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                ok += 1
+                times.append((time.time() - t0) * 1000)
+        except OSError:
+            pass
+    loss = 100.0 * (tries - ok) / tries
+    return loss, (round(sum(times) / len(times), 1) if times else None)
+
+
 def _ping_worker():
     res = {}
     gw = _default_gateway()
-    for key, host in (("gw", gw), ("net", "1.1.1.1")):
-        if host:
-            _ping(host, res, key)
+    if gw:
+        _ping(gw, res, "gw")
+    res["net"] = tcp_probe()
     _net["result"] = (gw, res)
     _net["fresh"] = True
 
 
 def start_ping_round():
-    """Dispara os pings numa thread e volta na hora. O resultado é lido pelo
+    """Dispara as medições numa thread e volta na hora. O resultado é lido pelo
     check no ciclo seguinte; uma rodada pendurada não abre outra."""
     t = _net.get("thread")
     if t is not None and t.is_alive():
@@ -1971,22 +2232,30 @@ def start_ping_round():
     return True
 
 
-def check_network_degraded():
-    """Perda de pacote no gateway (≥34%) ou na internet (≥50%), ou latência da
-    internet >400ms, em 3 medições seguidas (uma a cada 3 ciclos)."""
+def check_network_degraded(hb_ok=False):
+    """Perda no gateway (≥34%, ICMP) ou na internet (≥50%, TCP 443), ou conexão
+    à internet >400ms, em 3 medições seguidas (uma a cada 3 ciclos).
+    Gateway que nunca respondeu ICMP é ignorado (roteador que bloqueia ping).
+    Se o heartbeat saiu neste ciclo, a internet não está fora."""
     if not _net.get("fresh"):
         return list(_net.get("last_out") or [])
     _net["fresh"] = False
     gw, res = _net["result"]
     gl, _ = res.get("gw", (None, None))
     nl, nr = res.get("net", (None, None))
+    if gl is not None and gl < 100:
+        _net["gwEverAnswered"] = True
+    if not _net.get("gwEverAnswered"):
+        gl = None
+    if nl is not None and nl >= 100 and hb_ok:
+        nl = None
     bad = (gl is not None and gl >= 34) or (nl is not None and nl >= 50) or (nr is not None and nr > 400)
     out = []
     if _confirm("network_degraded", bad, need=NET_CONFIRM):
         out = [{
             "type": "network_degraded", "severity": "medium",
             "detail": "rede instável na arena (perda de pacote/latência alta)",
-            "evidence": {"gateway": gw, "gatewayLossPct": gl, "internetLossPct": nl, "internetRttMs": nr},
+            "evidence": {"gateway": gw, "gatewayLossPct": gl, "internetLossPct": nl, "internetConnectMs": nr},
             "dedupKey": "network_degraded",
         }]
     _net["last_out"] = out
@@ -2268,7 +2537,7 @@ def _entry_msg(e):
             m = bytes(m).decode("utf-8", "replace")
         except Exception:
             m = ""
-    return (m or "")[:MSG_MAX_CHARS]
+    return redact(m or "")[:MSG_MAX_CHARS]
 
 
 def parse_journal(stdout):
@@ -2393,14 +2662,22 @@ def ship_journal(new_chunks, serial, secret, ops, deadline, online=True):
     """Envia spool (mais antigo primeiro) + chunks novos. O que não sair fica no
     spool em disco — é o que mostra o que aconteceu enquanto a Pi estava sem
     internet."""
+    global _journal_backoff_until
+    if time.time() < _journal_backoff_until:
+        spool_write(list(new_chunks))   # OPS ainda sem a rota: nem relê o spool
+        return False
     pending_spool = spool_read()
     pending_new = list(new_chunks)
     sent_any = False
-    while online and (pending_spool or pending_new) and time.time() < deadline:
+    while online and (pending_spool or pending_new) and time.time() < deadline - 1:
         batch = _batch(pending_spool + pending_new)
         code, body = _post_status("/api/observation/journal",
                                   {"obsVersion": OBS_VERSION, "chunks": batch},
-                                  serial, secret, ops, timeout=10, attempts=1)
+                                  serial, secret, ops, timeout=max(1, min(10, deadline - time.time())), attempts=1)
+        if code in (404, 410):
+            _journal_backoff_until = time.time() + JOURNAL_BACKOFF_SEC
+            _log("OPS sem /api/observation/journal (HTTP %s) — journal fica no spool por 30 min" % code)
+            break
         if code != 200 or not isinstance(body, dict) or "acceptedSeq" not in body:
             break
         try:
@@ -2428,7 +2705,9 @@ def _tiers(snap):
         "video": True,
     }
     load, mem = snap.get("load1"), snap.get("memAvailMb")
-    tight = (load is not None and load > (os.cpu_count() or 4)) or (mem is not None and mem < BACKOFF_MEM_MB)
+    total = snap.get("memTotalMb")
+    tight = (load is not None and load > (os.cpu_count() or 4)) or (
+        mem is not None and total and mem < BACKOFF_MEM_FRACTION * total)
     if tight:
         skipped = sum(1 for v in want.values() if v)
         return {k: False for k in want}, skipped
@@ -2446,14 +2725,55 @@ def _cpu_now():
     return t
 
 
+def _cleanup_last_press(now=None):
+    """Tira do lastPress monitor que não existe mais no Shinobi e aperto com
+    mais de 7 dias (alimentam o gpio_idle_24h)."""
+    now = now or time.time()
+    lp = _state.get("lastPress") or {}
+    mons = _local_get_cached("/phoenix/monitors") or {}
+    known = set()
+    for mo in (mons.get("monitors", []) or []):
+        known.update(x for x in (mo.get("mid"), mo.get("name")) if x)
+    changed = False
+    for k in list(lp):
+        try:
+            old = now - float(lp[k]) > LASTPRESS_MAX_AGE
+        except (TypeError, ValueError):
+            old = True
+        if old or (known and k not in known):
+            del lp[k]
+            changed = True
+    return changed
+
+
+def _send_reports(found, serial, secret, ops, online):
+    """Envia as anomalias dentro do prazo do ciclo. O que não couber fica para
+    o próximo ciclo (sem duplicar dedupKey)."""
+    global _pending_reports
+    queue = list(_pending_reports)
+    keys = {a["dedupKey"] for a in queue}
+    queue += [a for a in found if a["dedupKey"] not in keys]
+    left = []
+    for i, a in enumerate(queue):
+        rem = _deadline - time.time() if _deadline else 30
+        if not online or rem < 2:
+            left = queue[i:]
+            break
+        _post("/api/observation/report", a, serial, secret, ops,
+              timeout=max(1, min(10, rem - 1)), attempts=2 if rem > 22 else 1)
+    _pending_reports = left[-PENDING_REPORTS_MAX:]
+    return len(queue) - len(left)
+
+
 def _cycle():
-    global _cyc, _hb_401, _kernel_lines, _cycle_lines, _dirty
+    global _cyc, _hb_401, _kernel_lines, _cycle_lines, _dirty, _deadline
     _cyc += 1
     _cycle_cache.clear()
     cpu0 = _cpu_now()
     started = time.time()
     interval = int(_state.get("interval") or DEFAULT_INTERVAL)
-    deadline = started + max(10, interval - 5)
+    deadline = started + min(CYCLE_BUDGET_SEC, max(10, interval - 5))
+    _deadline = deadline
     serial = get_serial()
     secret = _state.get("secret")
     ops = _state.get("opsUrl")
@@ -2501,6 +2821,8 @@ def _cycle():
             if rec["last"] > float(lp.get(mon, 0)):
                 lp[mon] = rec["last"]
                 _dirty = True
+    if _cleanup_last_press():
+        _dirty = True
 
     if tiers["net"]:
         start_ping_round()   # resultado entra no check do ciclo seguinte
@@ -2539,7 +2861,7 @@ def _cycle():
         (check_database_down, (snap,)),
         (check_buttons_service_down, (snap,)),
         (check_phoenix_down, (snap,)),
-        (check_network_degraded, ()),
+        (check_network_degraded, (online,)),
         # camadas caras (repetem o último resultado quando não rodam)
         (check_upload_stuck, (tiers["upload"],)),
         (check_config_drift, (tiers["drift"],)),
@@ -2561,10 +2883,9 @@ def _cycle():
         _consecutive[dk] = _consecutive.get(dk, 0) + 1
         a["consecutiveCount"] = _consecutive[dk]
         a["firstSeenAt"] = datetime.now(timezone.utc).isoformat()
-        # Sem internet não adianta reportar (o watchdog do OPS já vê o offline);
-        # a anomalia continua no próximo ciclo e o journal guarda o contexto.
-        if online and time.time() < deadline:
-            _post("/api/observation/report", a, serial, secret, ops, timeout=10, attempts=2)
+    # Sem internet não adianta reportar (o watchdog do OPS já vê o offline); o
+    # que não sair agora (offline ou fora do prazo) tenta no próximo ciclo.
+    _send_reports(found, serial, secret, ops, online)
     for dk in list(_consecutive):
         if dk not in seen:
             del _consecutive[dk]
@@ -2590,6 +2911,7 @@ def _cycle():
         save_state()
         _dirty = False
     _cost["cpuMs"] = int((_cpu_now() - cpu0) * 1000)
+    _deadline = 0.0
     _cost["skipped"] = skipped
 
 
@@ -2614,6 +2936,15 @@ def _loop():
         _stop.wait(interval)
 
 
+# Sobrevivem a ativar/desativar/retomar: sem eles o reboot nunca é detectado
+# (bootId), logs do Shinobi seriam relidos (pm2Offsets) e o journal reenviado.
+CARRY_KEYS = ("bootId", "_savedBootId", "pm2Offsets", "journalCursor", "journalSeq", "lastPress", "guard")
+
+
+def _carry():
+    return {k: _state[k] for k in CARRY_KEYS if k in _state}
+
+
 def enable(secret, ops_url, interval=DEFAULT_INTERVAL, until=None, autoheal=True, mode=None):
     global _thread, _state, _loaded
     if type(autoheal) is not bool:
@@ -2622,14 +2953,13 @@ def enable(secret, ops_url, interval=DEFAULT_INTERVAL, until=None, autoheal=True
         raise ValueError("mode must be 'semana' or 'fixo'")
     with _lock:
         _loaded = True
-        keep = _state if _state.get("enabled") else {}
-        _state = {"enabled": True, "secret": secret, "opsUrl": ops_url,
-                  "interval": int(interval or DEFAULT_INTERVAL), "until": until,
-                  "lastPress": keep.get("lastPress", {}), "autoheal": autoheal, "mode": mode,
-                  # cursor/seq da caixa preta sobrevivem a re-ativações (o OPS
-                  # descarta seq já aceito; zerar perderia o journal).
-                  "journalCursor": keep.get("journalCursor") or _state.get("journalCursor"),
-                  "journalSeq": max(int(keep.get("journalSeq") or 0), int(_state.get("journalSeq") or 0))}
+        carry = _carry()
+        _state = dict(carry)
+        _state.update({"enabled": True, "secret": secret, "opsUrl": ops_url,
+                       "interval": int(interval or DEFAULT_INTERVAL), "until": until,
+                       "autoheal": autoheal, "mode": mode,
+                       # o guardião de memória fica ligado nesta Pi daqui em diante
+                       "guard": True})
         save_state()
         _stop.clear()
         if _thread is None or not _thread.is_alive():
@@ -2644,8 +2974,11 @@ def disable():
     global _state, _loaded
     with _lock:
         _loaded = True
-        # Mantém o seq da caixa preta: uma nova ativação continua a numeração.
-        _state = {"enabled": False, "journalSeq": int(_state.get("journalSeq") or 0)}
+        # Mantém cursor/seq/boot/offsets e a política de autoheal: o guardião de
+        # memória continua protegendo a Pi mesmo com a observação desligada.
+        carry = _carry()
+        carry["autoheal"] = _state.get("autoheal", True)
+        _state = dict(carry, enabled=False)
         save_state()
         _stop.set()
     _log("desativado")
@@ -2654,6 +2987,8 @@ def disable():
 
 def resume_if_enabled():
     load_state()
+    if _state.get("guard"):
+        _start_guard()   # proteção de memória independe do modo estar ligado
     if _state.get("enabled") and _state.get("secret") and _state.get("opsUrl"):
         enable(_state["secret"], _state["opsUrl"], int(_state.get("interval") or DEFAULT_INTERVAL),
                _state.get("until"), _state.get("autoheal", True), mode=_state.get("mode"))
