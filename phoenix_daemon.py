@@ -38,7 +38,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-VERSION = "1.18.1"
+VERSION = "1.19.0"
 LOG_DIR = Path("/var/log/gravae")
 LOG_FILE = LOG_DIR / "phoenix.log"
 ALERT_DB = LOG_DIR / "alerts.db"
@@ -2627,6 +2627,131 @@ class ConnectivitySentinel:
 
         return False
 
+# === Tunnel Readiness Watchdog ===
+class TunnelReadinessWatchdog:
+    """Reinicia o cloudflared quando a internet está boa mas o túnel não sobe.
+
+    O ConnectivitySentinel só olha a internet (ping/TCP por IP). Se ela está ok,
+    ele nunca escala, nem quando o cloudflared está preso sem nenhuma conexão
+    com a borda. Caso real: Summer Caminho das Árvores, 14/11 11h → 16/11 10h.
+    A internet voltou de uma queda, mas o cloudflared ficou 47h tentando o
+    mesmo endereço (DNS da operadora devolvendo lixo/IPv6). Speedtest dava
+    64 Mbps e a arena aparecia offline no OPS. Ao religar a Pi, o túnel
+    conectou de primeira, então um restart do serviço teria resolvido.
+
+    Fonte da verdade: o /ready das métricas locais do cloudflared
+    (127.0.0.1:20241-20245), que responde readyConnections. Se o endpoint não
+    responde (versão sem métricas, serviço parado), não age, porque o
+    ServiceGuardian já cuida de serviço parado.
+    """
+
+    METRICS_PORTS = (20241, 20242, 20243, 20244, 20245)
+    NOT_READY_MINUTES = 10      # internet ok + túnel com 0 conexões por 10 min → restart
+    RESTART_COOLDOWN_MINUTES = 15
+    MAX_RESTARTS_PER_DAY = 6
+
+    def __init__(self):
+        self._not_ready_since = None   # time.monotonic()
+        self._last_restart = None      # time.monotonic()
+        self._restarts = []            # time.monotonic() dos restarts nas últimas 24h
+        self._port = None
+
+    def _fetch_ready(self, port):
+        """(http_status, readyConnections) ou None se a porta não responde."""
+        import urllib.request
+        import urllib.error
+        url = f"http://127.0.0.1:{port}/ready"
+        try:
+            with urllib.request.urlopen(url, timeout=3) as r:
+                body = r.read().decode("utf-8", "replace")
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+        except Exception:
+            return None
+        try:
+            ready = int(json.loads(body).get("readyConnections", 0))
+        except Exception:
+            ready = 0
+        return status, ready
+
+    def ready_connections(self):
+        """Número de conexões prontas, ou None se não deu para medir."""
+        ports = ([self._port] if self._port else []) + [p for p in self.METRICS_PORTS if p != self._port]
+        for port in ports:
+            res = self._fetch_ready(port)
+            if res is None:
+                continue
+            self._port = port
+            status, ready = res
+            return ready if status == 200 else 0
+        return None
+
+    def _cloudflared_active(self):
+        try:
+            r = subprocess.run(["systemctl", "is-active", "cloudflared"],
+                               capture_output=True, text=True, timeout=5)
+            return r.stdout.strip() == "active"
+        except Exception:
+            return False
+
+    def _restart(self):
+        try:
+            subprocess.run(["systemctl", "restart", "cloudflared"], capture_output=True, timeout=30)
+            return True
+        except Exception as e:
+            log.error(f"[tunnel-watchdog] restart cloudflared falhou: {e}")
+            return False
+
+    def check(self, internet_online, now=None):
+        """Retorna True se reiniciou o cloudflared nesta rodada."""
+        now = time.monotonic() if now is None else now
+        if DIRECT_CONNECTION or not internet_online:
+            # Sem internet quem escala é o ConnectivitySentinel.
+            self._not_ready_since = None
+            return False
+        if not self._cloudflared_active():
+            self._not_ready_since = None
+            return False
+
+        ready = self.ready_connections()
+        if ready is None or ready > 0:
+            self._not_ready_since = None
+            return False
+
+        if self._not_ready_since is None:
+            self._not_ready_since = now
+            log.warning("[tunnel-watchdog] internet ok mas cloudflared com 0 conexões prontas")
+            return False
+
+        stuck_min = (now - self._not_ready_since) / 60
+        if stuck_min < self.NOT_READY_MINUTES:
+            return False
+        if self._last_restart is not None and (now - self._last_restart) / 60 < self.RESTART_COOLDOWN_MINUTES:
+            return False
+        self._restarts = [t for t in self._restarts if now - t < 86400]
+        if len(self._restarts) >= self.MAX_RESTARTS_PER_DAY:
+            if int(stuck_min) % 60 == 0:
+                log.warning(f"[tunnel-watchdog] túnel fora há {stuck_min:.0f} min, teto de restarts do dia atingido")
+            return False
+
+        log.warning(f"[tunnel-watchdog] túnel sem conexão há {stuck_min:.0f} min com internet ok - reiniciando cloudflared")
+        ok = self._restart()
+        self._last_restart = now
+        self._restarts.append(now)
+        alerts.add(
+            "tunnel_stuck_restarted",
+            "warning",
+            f"Internet ok mas túnel Cloudflare sem conexão há {stuck_min:.0f} min - cloudflared reiniciado",
+            {"stuck_minutes": round(stuck_min, 1), "restart_ok": ok},
+        )
+        return True
+
+
 # NetworkRecovery REMOVED in v1.9.0 - modifying network config is too dangerous.
 # Phoenix will NEVER touch dhcpcd.conf or switch between DHCP/static IP.
 # DHCP fallback ADDED in v1.11.0 with safety: backup+restore, kill switch, 1 attempt per cycle.
@@ -2941,6 +3066,7 @@ class WebhookSender:
         "connectivity_lost": ("device_offline", "cloudflared"),
         "connectivity_restored": ("service_up", "cloudflared"),
         "connectivity_action": ("service_down", "cloudflared"),
+        "tunnel_stuck_restarted": ("service_down", "cloudflared"),
         "monitor_status_change": ("monitor_offline", "camera"),
         "monitor_recovered": ("service_up", "camera"),
         "temperature_critical": ("resource_warning", "temperature"),
@@ -3180,6 +3306,7 @@ class PhoenixDaemon:
         self.running = True
         self.service_guardian = ServiceGuardian()
         self.connectivity = ConnectivitySentinel()
+        self.tunnel_watchdog = TunnelReadinessWatchdog()
         self.resources = ResourceMonitor()
         self.webhook = WebhookSender()
         self.watchdog = HardwareWatchdog()
@@ -3318,6 +3445,7 @@ class PhoenixDaemon:
         last_service_check = 0
         last_rtsp_heal = 0
         last_connectivity_check = 0
+        last_tunnel_check = 0
         last_resource_check = 0
         last_monitor_check = 0
         last_shinobi_epipe_check = 0
@@ -3369,6 +3497,14 @@ class PhoenixDaemon:
                     elif not prev_online and self.connectivity.is_online:
                         offline_tracker.mark_online()
                     last_connectivity_check = now
+
+                # Túnel preso com internet ok (a cada 2 min)
+                if now - last_tunnel_check >= 120:
+                    try:
+                        self.tunnel_watchdog.check(self.connectivity.is_online)
+                    except Exception as e:
+                        log.debug(f"Tunnel watchdog error: {e}")
+                    last_tunnel_check = now
 
                 # Shinobi monitor check (every 5 minutes, only when online)
                 if now - last_monitor_check >= 300 and self.connectivity.is_online:
