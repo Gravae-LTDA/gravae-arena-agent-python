@@ -30,6 +30,9 @@ import urllib.request
 DETECTOR_URL = os.environ.get("HANDS_UP_URL", "http://127.0.0.1:8090")
 SERVICO = "gravae-hands-up"
 DIR_PADRAO = "/opt/hands-up-detector"
+
+#: Ajustes do detector repassados como estao vindos do OPS (`/hands-up/apply`).
+CHAVES_AJUSTE = ("gatilho", "espera_ia_s", "dur_gesto")
 REPO = "https://github.com/Gravae-Tecnologia/hands-up-detector"
 
 # Curto de proposito: o OPS espera esta chamada dentro de um request HTTP dele.
@@ -141,6 +144,20 @@ def aplica(config):
         passos.append({"ativo": config["ativo"], "ok": ok})
         if not ok:
             return {"ok": False, "erro": r.get("erro"), "passos": passos}
+
+    # Ajustes do detector que o OPS escolhe: gatilho (manual|ia), quanto tempo
+    # seguir processando depois do ultimo aviso de pessoa da camera e quantos
+    # segundos de mao levantada disparam. Antes so `ativo`, quadras e cameras
+    # passavam - estes eram engolidos com resposta "ok" e o painel achava que
+    # tinha aplicado (Arena X, 18/11/2026). Vao num POST so: o detector grava
+    # as chaves que conhece e valida gatilho/espera (erro volta no passo).
+    ajustes = {k: config[k] for k in CHAVES_AJUSTE if config.get(k) is not None}
+    if ajustes:
+        ok, r = _http("/api/config", ajustes)
+        passo = dict(ajustes, ok=ok)
+        if not ok and isinstance(r, dict) and r.get("erro"):
+            passo["erro"] = r["erro"]
+        passos.append(passo)
 
     for quadra, valor in (config.get("quadras") or {}).items():
         ok, _ = _http("/api/config", {"quadra": quadra, "valor": bool(valor)})
